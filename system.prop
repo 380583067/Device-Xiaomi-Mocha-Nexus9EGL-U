@@ -1,0 +1,122 @@
+# ADB
+persist.service.adb.enable=1
+persist.service.debuggable=1
+persist.sys.usb.config=mtp,adb
+persist.sys.root_access=2
+ro.debuggable=1
+setenforce=0
+
+# AptX
+persist.bt.enableAptXHD=true
+persist.service.btui.use_aptx=1
+persist.vendor.bt.a2dp_offload_cap=sbc-aptx-aptxtws-aptxhd-aac-ldac
+persist.vendor.btstack.a2dp_offload_cap=sbc-aptx-aptxtws-aptxhd-aac-ldac
+
+# Apexd
+ro.apex.enabled=false
+
+# BPF
+ro.kernel.ebpf.supported=false
+
+# BT
+ro.boot.btmacaddr=03:16:6c:79:29:82
+
+# DIDIM
+persist.tegra.didim.enable=1
+persist.tegra.didim.video=5
+persist.tegra.didim.normal=3
+
+# DRM
+drm.service.enabled=true
+
+# Fastbootd
+ro.fastbootd.available=true
+
+# Forçar uso dos drivers Tegra
+ro.hardware.egl=tegra
+ro.hardware.gralloc=tegra
+ro.hardware.hwcomposer=tegra
+
+# Graphics
+ro.opengles.version=196610
+ro.sf.lcd_density=320
+ro.input.noresample=1
+ro.zygote.disable_gl_preload=true
+ro.surface_flinger.max_frame_buffer_acquired_buffers=3
+persist.tegra.compositor=surfaceflinger
+persist.tegra.decompression=cde-client
+persist.vendor.tegra.composite.policy=composite-yuv
+persist.sys.ui.hw=true
+debug.sf.hw=1
+debug.egl.hw=1
+#debug.hwc.force_gpu=1
+debug.sf.latch_unsignaled=1
+debug.sf.enable_gl_backpressure=1
+debug.hwui.use_buffer_age=false
+debug.renderengine.backend=gles
+
+# Lineage genuine
+persist.lineage.nofool=true
+
+# LMKD options
+ro.lmk.low=1001
+ro.lmk.medium=800
+ro.lmk.critical=0
+ro.lmk.critical_upgrade=false
+ro.lmk.upgrade_pressure=100
+ro.lmk.downgrade_pressure=100
+ro.lmk.kill_heaviest_task=true
+ro.lmk.kill_timeout_ms=100
+ro.lmk.use_minfree_levels=true
+
+# OMX
+persist.tegra.nvmmlite=1
+persist.media.treble_omx=false
+
+# We are using old omx blobs
+media.stagefright.less-secure=true
+media.stagefright.legacyencoder=true
+
+# PBC
+pbc.enabled=0
+pbc.log=0
+pbc.board_power_threshold=20000
+pbc.low_polling_freq_threshold=1000
+pbc.rails=cpu,core,dram,gpu
+pbc.cpu.power=/sys/bus/i2c/devices/7-0045/power1_input
+pbc.cpu.cap=/dev/cpu_freq_max
+pbc.cpu.cap.af=/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+pbc.core.power=/sys/bus/i2c/devices/7-0043/power1_input
+pbc.dram.power=/sys/bus/i2c/devices/7-0049/power1_input
+pbc.gpu.power=/sys/bus/i2c/devices/7-004b/power1_input
+pbc.gpu.cap=/dev/gpu_freq_max
+pbc.gpu.cap.af=/sys/devices/platform/host1x/gk20a.0/devfreq/gk20a.0/available_frequencies
+
+# Radio
+ro.radio.noril=yes
+
+# SoC
+ro.soc.manufacturer=NVIDIA
+ro.soc.model=T124
+
+# Storage
+ro.sys.sdcardfs=true
+
+# Wifi
+persist.debug.wfd.enable=1
+wifi.interface=wlan0
+ap.interface=wlan0
+persist.wlan.ti.calibrated=0
+
+# Don't write binary XML files
+persist.sys.binary_xml=false
+
+# Disable oem unlock
+ro.oem_unlock_supported=false
+
+# Increase watchdog timeout multiplier to workaround ANRs
+ro.hw_timeout_multiplier=6
+
+# Zygote
+zygote.critical_window.minute=10
+
