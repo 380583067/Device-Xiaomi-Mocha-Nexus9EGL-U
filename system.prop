@@ -1,25 +1,28 @@
-# ADB
-persist.service.adb.enable=1
-persist.service.debuggable=1
-persist.sys.usb.config=mtp,adb
-persist.sys.root_access=2
-ro.debuggable=1
-setenforce=0
+
+ro.apex.enabled=false
+ro.apex.updater.enabled=false
+ro.art.use.apex=false
 
 # AptX
 persist.bt.enableAptXHD=true
 persist.service.btui.use_aptx=1
 persist.vendor.bt.a2dp_offload_cap=sbc-aptx-aptxtws-aptxhd-aac-ldac
 persist.vendor.btstack.a2dp_offload_cap=sbc-aptx-aptxtws-aptxhd-aac-ldac
-
-# Apexd
-ro.apex.enabled=false
+persist.audio.force_volume_scale=1
 
 # BPF
 ro.kernel.ebpf.supported=false
+persist.net.bpf.stats=0
+ro.net.bpf.enabled=false
 
 # BT
 ro.boot.btmacaddr=03:16:6c:79:29:82
+persist.bluetooth.gd.enabled=false
+persist.bluetooth.core.enabled=false
+persist.bluetooth.turn_off_bt_main_thread=true
+
+# Charger
+persist.sys.chgdisabled=0
 
 # DIDIM
 persist.tegra.didim.enable=1
@@ -32,14 +35,14 @@ drm.service.enabled=true
 # Fastbootd
 ro.fastbootd.available=true
 
-# Forçar uso dos drivers Tegra
+# Tegra GPU Driver
 ro.hardware.egl=tegra
 ro.hardware.gralloc=tegra
 ro.hardware.hwcomposer=tegra
 
 # Graphics
 ro.opengles.version=196610
-ro.sf.lcd_density=320
+ro.sf.lcd_density=256
 ro.input.noresample=1
 ro.zygote.disable_gl_preload=true
 ro.surface_flinger.max_frame_buffer_acquired_buffers=3
@@ -49,7 +52,6 @@ persist.vendor.tegra.composite.policy=composite-yuv
 persist.sys.ui.hw=true
 debug.sf.hw=1
 debug.egl.hw=1
-#debug.hwc.force_gpu=1
 debug.sf.latch_unsignaled=1
 debug.sf.enable_gl_backpressure=1
 debug.hwui.use_buffer_age=false
@@ -58,18 +60,19 @@ debug.renderengine.backend=gles
 # Lineage genuine
 persist.lineage.nofool=true
 
-# LMKD options
+# LMKD Memory Tuning
 ro.lmk.low=1001
 ro.lmk.medium=800
+ro.lmk.high=400
 ro.lmk.critical=0
-ro.lmk.critical_upgrade=false
-ro.lmk.upgrade_pressure=100
-ro.lmk.downgrade_pressure=100
-ro.lmk.kill_heaviest_task=true
-ro.lmk.kill_timeout_ms=100
+ro.lmk.critical_upgrade=1
+ro.lmk.upgrade_pressure=80
+ro.lmk.downgrade_pressure=65
+ro.lmk.kill_heaviest_task=1
+ro.lmk.kill_timeout_ms=500
 ro.lmk.use_minfree_levels=true
 
-# OMX
+# OMX Only (No Codec2)
 persist.tegra.nvmmlite=1
 persist.media.treble_omx=false
 
@@ -77,7 +80,7 @@ persist.media.treble_omx=false
 media.stagefright.less-secure=true
 media.stagefright.legacyencoder=true
 
-# PBC
+# PBC Power Monitor (Disabled)
 pbc.enabled=0
 pbc.log=0
 pbc.board_power_threshold=20000
@@ -107,16 +110,17 @@ persist.debug.wfd.enable=1
 wifi.interface=wlan0
 ap.interface=wlan0
 persist.wlan.ti.calibrated=0
+persist.wifi.disable_onboot_scan=true
 
-# Don't write binary XML files
+# Binary xml off
 persist.sys.binary_xml=false
 
-# Disable oem unlock
+# Disable unlock
 ro.oem_unlock_supported=false
 
-# Increase watchdog timeout multiplier to workaround ANRs
-ro.hw_timeout_multiplier=6
-
-# Zygote
-zygote.critical_window.minute=10
+# artd
+persist.sys.locale=en-US
+ro.product.locale=en-US
+ro.product.locale.language=en
+ro.product.locale.region=US
 

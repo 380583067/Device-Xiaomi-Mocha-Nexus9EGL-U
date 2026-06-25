@@ -3,6 +3,7 @@ subdirs = [
     "hidl",
     "tinyalsa",
     "health",
+    "init",
     "hardware",
 ]
 

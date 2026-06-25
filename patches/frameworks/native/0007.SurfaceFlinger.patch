@@ -1,0 +1,14 @@
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 4c352b6aad..9cd192bd4a 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -392,7 +392,8 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
+     mIsUserBuild = strcmp(value, "user") == 0;
+ 
+     mDebugFlashDelay = base::GetUintProperty("debug.sf.showupdates"s, 0u);
+-
++     property_get("debug.sf.disable_hwc", value, "0");
++     mDebugDisableHWC = atoi(value);
+     // DDMS debugging deprecated (b/120782499)
+     property_get("debug.sf.ddms", value, "0");
+     int debugDdms = atoi(value);

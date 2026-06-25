@@ -1,0 +1,21 @@
+diff --git a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+index 37021716c..b50f2443b 100644
+--- a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
++++ b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+@@ -2513,7 +2513,16 @@ Error HWC2On1Adapter::setAllDisplays() {
+         if (mHwc1Contents[hwc1Id] == nullptr) {
+             continue;
+         }
++        
+ 
++        auto numLayers = mHwc1Contents[hwc1Id]->numHwLayers;
++
++        auto& clientTargetLayer = mHwc1Contents[hwc1Id]->hwLayers[numLayers - 1];
++        if (clientTargetLayer.compositionType == HWC_FRAMEBUFFER_TARGET && clientTargetLayer.acquireFenceFd != -1) {
++            close(clientTargetLayer.acquireFenceFd);
++            clientTargetLayer.acquireFenceFd = -1;
++        }
++        
+         auto displayId = mHwc1DisplayMap[hwc1Id];
+         auto& display = mDisplays[displayId];
+         auto retireFenceFd = mHwc1Contents[hwc1Id]->retireFenceFd;

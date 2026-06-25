@@ -16,13 +16,17 @@
 
 # Path
 LOCAL_PATH := device/xiaomi/mocha
-BOARD_VENDOR := mocha
+
+# apex
+USE_CXX_STL := libc++_shared
+TARGET_USES_LEGACY_ICU := true
 
 # Allow duplicate rules to override them
 BUILD_BROKEN_DUP_RULES := true
 
 # Audio
 USE_XML_AUDIO_POLICY_CONF:= 1
+USE_CUSTOM_AUDIO_POLICY  := 1
 BOARD_USES_GENERIC_AUDIO := false
 BOARD_USES_ALSA_AUDIO    := true
 BOARD_USES_TINYHAL_AUDIO := true
@@ -33,15 +37,14 @@ TARGET_CPU_ABI2 := armeabi
 TARGET_ARCH := arm
 TARGET_ARCH_VARIANT := armv7-a-neon
 TARGET_CPU_VARIANT := cortex-a15
+TARGET_CPU_SMP := true
 TARGET_NOT_USE_GZIP_RECOVERY_RAMDISK := true
-
-# Binder API
-TARGET_USES_64_BIT_BINDER := true
 
 # Bluetooth
 BOARD_HAVE_BLUETOOTH := true
 BOARD_HAVE_BLUETOOTH_BCM := true
 BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(LOCAL_PATH)/bluetooth
+BOARD_BLUETOOTH_HIDL_GD := false
 
 # Board
 TARGET_BOARD_PLATFORM := tegra
@@ -67,14 +70,13 @@ ifeq ($(HOST_OS),linux)
 endif
 WITH_DEXPREOPT_BOOT_IMG_AND_SYSTEM_SERVER_ONLY := true
 
+# Disable blkio cgroup (Tegra124 kernel missing)
+BUILD_BROKEN_CGROUP_BLKIOS := true
+
 # ELF
 BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
 BUILD_BROKEN_PREBUILT_ELF_FILES := true
 LOCAL_CHECK_ELF_FILES := false
-RELAX_USES_LIBRARY_CHECK=true
-
-# FM
-BOARD_HAVE_BCM_FM := false
 
 # FS
 BOARD_CACHEIMAGE_FILE_SYSTEM_TYPE := ext4
@@ -84,13 +86,12 @@ TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_USES_MKE2FS := true
 
 # Graphics display
-TARGET_SCREEN_DENSITY := 320
+TARGET_SCREEN_DENSITY := 256
 
 # Graphics
 USE_OPENGL_RENDERER := true
-NUM_FRAMEBUFFER_SURFACE_BUFFERS := 3
-BOARD_DISABLE_TRIPLE_BUFFERED_DISPLAY_SURFACES := true
-TARGET_DISABLE_POSTRENDER_CLEANUP := true
+TARGET_RUNNING_WITHOUT_SYNC_FRAMEWORK := true
+TARGET_FORCE_HWC_FOR_VIRTUAL_DISPLAYS := true
 SF_VSYNC_EVENT_PHASE_OFFSET_NS := 5000000
 VSYNC_EVENT_PHASE_OFFSET_NS := 7500000
 
@@ -117,6 +118,9 @@ EXTENDED_FONT_FOOTPRINT := true
 TARGET_INIT_VENDOR_LIB := libinit_mocha
 TARGET_RECOVERY_DEVICE_MODULES := libinit_mocha
 
+# Vendor Init
+TARGET_LIBINIT_DEFINES_FILE := $(LOCAL_PATH)/init/init_mocha.cpp
+
 # Iptables
 TARGET_IPTABLES_BACKEND := legacy
 
@@ -124,7 +128,7 @@ TARGET_IPTABLES_BACKEND := legacy
 BOARD_DISABLE_NETD_ADVANCED_RULES := true
 
 # Kernel
-BOARD_KERNEL_CMDLINE := vpr_resize androidboot.selinux=permissive vmalloc=400M
+BOARD_KERNEL_CMDLINE := vpr_resize androidboot.selinux=permissive vmalloc=400M androidboot.hardware=tn8 fsck.mode=skip
 BOARD_KERNEL_BASE := 0x10000000
 BOARD_RAMDISK_OFFSET := 0x02000000
 BOARD_KERNEL_PAGESIZE := 2048
@@ -133,7 +137,6 @@ TARGET_KERNEL_SOURCE := kernel/xiaomi/mocha
 TARGET_KERNEL_CONFIG := tegra12_android_defconfig
 BOARD_KERNEL_IMAGE_NAME := zImage
 BOARD_KERNEL_SEPARATED_DT := true
-#BUILD_BROKEN_ENFORCE_SYSPROP_OWNER := true
 BOARD_MKBOOTIMG_ARGS := --ramdisk_offset $(BOARD_RAMDISK_OFFSET) --tags_offset $(BOARD_KERNEL_TAGS_OFFSET)
 BOARD_CUSTOM_BOOTIMG := true
 BOARD_CUSTOM_BOOTIMG_MK := $(LOCAL_PATH)/mkbootimg.mk
@@ -158,15 +161,21 @@ TARGET_LIGHTHAL_VARIANT := tegra
 # Malloc
 MALLOC_SVELTE := true
 
+# OTA mocha
+TARGET_RELEASETOOLS_EXTENSIONS := device/xiaomi/mocha/releasetools
+
 # Memfd
 TARGET_HAS_MEMFD_BACKPORT := true
 
 # Offmode Charging
+HEALTHD_ENABLE_TRICOLOR_LED := true
+BOARD_CHARGER_ENABLE_SUSPEND := true
+BOARD_CHARGER_SHOW_PERCENTAGE := true
 BOARD_CHARGER_DISABLE_INIT_BLANK := true
-BACKLIGHT_PATH := "/sys/class/backlight/lcd-backlight/brightness"
-RED_LED_PATH := "/sys/class/leds/red/brightness"
-GREEN_LED_PATH := "/sys/class/leds/green/brightness"
-BLUE_LED_PATH := "/sys/class/leds/blue/brightness"
+BACKLIGHT_PATH := /sys/devices/platform/tegra12-i2c.0/i2c-0/0-002c/backlight/lcd-backlight/brightness
+RED_LED_PATH := /sys/class/leds/red/brightness
+GREEN_LED_PATH := /sys/class/leds/green/brightness
+BLUE_LED_PATH := /sys/class/leds/blue/brightness
 
 # Per-application sizes for shader cache
 MAX_EGL_CACHE_SIZE := 4194304
@@ -180,6 +189,7 @@ TARGET_SYSTEM_PROP += device/xiaomi/mocha/system.prop
 TARGET_PRODUCT_PROP += device/xiaomi/mocha/product.prop
 
 # Recovery
+LZMA_RAMDISK_TARGETS := recovery
 TARGET_RECOVERY_DEVICE_DIRS += device/xiaomi/mocha
 TARGET_RECOVERY_FSTAB := device/xiaomi/mocha/initfiles/fstab.tn8
 BOARD_NO_SECURE_DISCARD := true
@@ -191,29 +201,22 @@ BOARD_OVERRIDE_RS_CPU_VARIANT_32 := cortex-a15
 # SELinux
 SELINUX_IGNORE_NEVERALLOWS := true
 include device/nvidia/sepolicy/sepolicy.mk
-BOARD_SEPOLICY_DIRS += \
-                       device/xiaomi/mocha/sepolicy/mocha
+BOARD_SEPOLICY_DIRS += $(LOCAL_PATH)/sepolicy/mocha
 
-BOARD_SEPOLICY_M4DEFS += \
-    hal_perf_default=vendor_hal_perf_default \
-    hal_perf_hwservice=vendor_hal_perf_hwservice \
-    hal_perf_default_exec=vendor_hal_perf_default_exec
-                      
 # SHIMS
 TARGET_LD_SHIM_LIBS := \
     /system/vendor/lib/hw/hwcomposer.tegra.so|libshim_camera.so \
     /system/vendor/lib/libnvcap_video.so|libshim_camera.so \
     /system/vendor/lib/libnvgr.so|libshim_atomic.so \
-    /system/vendor/lib/libnvomxadaptor.so|libnvomxadaptor_shim.so 
+    /system/vendor/lib/libnvomxadaptor.so|libnvomxadaptor_shim.so \
+	/system/lib/libshim_zw.so|/system/lib/libbase.so \
+	/system/lib/libshim_zw.so|/system/lib/libc++.so
 
 # ThermalHAL
 TARGET_THERMALHAL_VARIANT := tegra
 
 # WEBGL in WebKit
 ENABLE_WEBGL := true
-
-# Use unified vendor
-TARGET_TEGRA_VARIANT := shield
 
 # Wifi related defines
 BOARD_WPA_SUPPLICANT_DRIVER      := NL80211
@@ -231,7 +234,7 @@ WIFI_HIDL_UNIFIED_SUPPLICANT_SERVICE_RC_ENTRY := true
 
                
 # Zygote whitelist extra paths
-ZYGOTE_WHITELIST_PATH_EXTRA := \"/dev/nvhost-ctrl\",\"/dev/nvmap\",
+ZYGOTE_WHITELIST_PATH_EXTRA := \"/dev/nvhost-ctrl\",\"/dev/nvmap\"
 
 # Security patch level
-VENDOR_SECURITY_PATCH := 2022-04-05
+VENDOR_SECURITY_PATCH := 2025-04-05
