@@ -16,7 +16,7 @@
 
 #define LOG_TAG "tiny_hal_config"
 /*#define LOG_NDEBUG 0*/
-//#undef NDEBUG
+/*#undef NDEBUG*/
 
 #include <stddef.h>
 #include <errno.h>
@@ -36,7 +36,6 @@ typedef struct effect_interface_s **effect_handle_t;
 #include <hardware/audio.h>
 
 #include <tinyalsa/asoundlib.h>
-
 #include <expat.h>
 
 #include <tinyhal/audio_config.h>
@@ -335,7 +334,7 @@ static int ctl_open(struct config_mgr *cm, struct ctl *pctl)
         /* Update tinyalsa with any new controls that have been added
          * and try again
          */
-//        mixer_update_ctls(cm->mixer);
+        mixer_add_new_ctls(cm->mixer);
         ctl = mixer_get_ctl_by_name(cm->mixer, pctl->name);
     }
 
@@ -1079,7 +1078,9 @@ static const struct parse_device device_table[] = {
     {"mic",         AUDIO_DEVICE_IN_BUILTIN_MIC},
     {"back mic",    AUDIO_DEVICE_IN_BACK_MIC},
     {"voice",       AUDIO_DEVICE_IN_VOICE_CALL},
-    {"aux",         AUDIO_DEVICE_IN_AUX_DIGITAL}
+    {"aux",         AUDIO_DEVICE_IN_AUX_DIGITAL},
+    {"fm",          AUDIO_DEVICE_OUT_FM},
+    {"fm_in",       AUDIO_DEVICE_IN_FM_TUNER}
 };
 
 static const char *predefined_path_name_table[] = {

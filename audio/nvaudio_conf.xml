@@ -16,7 +16,7 @@
   <!ELEMENT voice-call (pcm_config, device, path)>
   <!ELEMENT device (path)>
   <!ELEMENT path (ctl)>
-
+  <!ELEMENT alsa_device EMPTY>
   <!ATTLIST alsa_device name (music|voice|aux|voice-call|bt-voice-call) #REQUIRED>
   <!ATTLIST alsa_device card_id CDATA #REQUIRED>
   <!ATTLIST alsa_device card_name CDATA #REQUIRED>
@@ -31,9 +31,9 @@
   <!ATTLIST pcm_config stop_threshold CDATA #IMPLIED>
   <!ATTLIST pcm_config silence_threshold CDATA #IMPLIED>
   <!ATTLIST pcm_config avail_min CDATA #IMPLIED>
-
+  <!ELEMENT device EMPTY>
   <!ATTLIST device name (speaker|headphone|earpiece|bt-sco|aux|builtin-mic|headset-mic|bt-sco-mic|voice-call|bt-voice-call|fm-tx|fm-rx) #REQUIRED>
-
+  <!ELEMENT path EMPTY>
   <!ATTLIST path name CDATA #IMPLIED>
   <!ELEMENT param EMPTY>
   <!ATTLIST param name CDATA #REQUIRED>
@@ -48,7 +48,7 @@
 
 <AudioConfigs>
   <alsa_device name="music"
-               card_id="1"
+               card_id="-1"
                card_name="tegrart5671"
                device_id="0">
     <pcm_config rate="48000"
@@ -404,7 +404,7 @@
   </alsa_device>
 
   <alsa_device name ="aux"
-             card_id="0"
+             card_id="-1"
              card_name="Tegra"
              device_id="3">
     <pcm_config rate="48000"
