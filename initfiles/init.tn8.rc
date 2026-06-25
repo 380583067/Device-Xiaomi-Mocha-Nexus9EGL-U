@@ -26,12 +26,15 @@ on post-fs-data
     chmod 0644 /sys/devices/platform/host1x/tegradc.0/color_filter
     chmod 0644 /sys/devices/platform/host1x/tegradc.0/color_filter_rgb
 
+    chown system system /dev/sysmatdrv
+    chmod 0660 /dev/sysmatdrv
+
 on init
     # Mount a tmpfs into /mnt/tmp for hosting nvram, phs shared memory
     mkdir /mnt/tmp 0770 system system
     mount tmpfs tmpfs /mnt/tmp mode=0775,gid=1003
 
-    setprop sys.esrd.powermon_path /sys/bus/i2c/devices/1-0040/iio_device
+    setprop sys.esrd.powermon_path /sys/bus/i2c/devices/1-0008/iio_device
     setprop sys.esrd.powermon_channel 0
     setprop sys.esrd.min_esr 95
     setprop sys.esrd.max_esr 160
@@ -79,4 +82,3 @@ on property:sys.boot_completed=1
 
 on property:apexd.status=ready
     mount none /system/etc/swcodec/ld.config.txt /apex/com.android.media.swcodec/etc/ld.config.txt bind
-

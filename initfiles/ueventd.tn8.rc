@@ -21,6 +21,11 @@
 /dev/torch*     0660    media   camera
 /dev/video0     0660    media   camera
 /dev/video1     0660    media   camera
+# V4L2 sub-devices (sensor, focuser, ISP, etc.) — used by V4L2 camera HAL
+/dev/v4l-subdev* 0660   media   camera
+# Media controller — HAL walks /dev/media0 to discover the sensor↔focuser
+# pairing via MEDIA_IOC_ENUM_ENTITIES / MEDIA_IOC_ENUM_LINKS.
+/dev/media*     0660   media   camera
 /dev/mipi-cal   0660    media   camera
 /dev/spdif*     0660    system  audio
 /dev/adf*       0660    system  system
@@ -40,7 +45,8 @@
 /dev/nvhost-ctrl-isp.1 0660   media  camera
 /dev/nvhost-ctrl       0666   root   root
 /dev/nvhost-gpu        0666   root   root
-/dev/nvmap             0666   root   root
+/dev/tegra_dc*         0666   system     graphics
+/dev/nvhost*           0666   root       graphics
 /dev/nvhost-vic        0666   root   root
 /dev/nvhost-gpu        0666   root   root
 /dev/nvhost-tsec       0666   root   root
@@ -50,8 +56,8 @@
 /dev/nvhost-dbg-gpu    0666   root   root
 /dev/nvhost-prof-gpu   0666   root   root
 /dev/tlk_device 0660    system  drmrpc
-# for FM V4L2 Radio
-/dev/radio      0666    system  radio
+# for FM V4L2 Radio — kernel creates /dev/radio0, not /dev/radio
+/dev/radio*     0660    system  radio
 /dev/mpu        0640    system  system
 /dev/mpuirq     0640    system  system
 /dev/accelirq   0640    system  system
@@ -59,6 +65,7 @@
 /dev/touch      0660    system  system
 /dev/ion        0666    system  system
 /dev/timerinfo  0440    system  system
+/dev/adf*       0660    media   graphics
 /dev/cpu_freq_min	0660	system	system
 /dev/cpu_freq_max	0660	system	system
 /dev/gpu_freq_min	0660	system	system
@@ -76,6 +83,9 @@
 /sys/devices/platform/ozwpan/usb*	mode	0660	system	system
 /dev/ttyTHS1	0664	root	system
 /dev/ttyTHS2	0660	bluetooth	bluetooth
+# BCM4354 BT chardev exposed by drivers/bluetooth/broadcom/bt_protocol_driver
+# (CONFIG_BT_PROTOCOL_DRIVER=y). libbt-vendor opens this directly.
+/dev/brcm_bt_drv	0660	bluetooth	bluetooth
 # pmqos
 /dev/constraint_cpu_freq 0660 root system
 /dev/constraint_gpu_freq 0660 root system
@@ -198,6 +208,14 @@
 
 # Begin Immersion changes
 /dev/tspdrv               0660   system       system
+
+# BT
+/sys/devices/platform/bluedroid_pm.0/rfkill/rfkill0  state  0660    bluetooth    bluetooth
+/sys/devices/platform/bluedroid_pm.0/rfkill/rfkill0  type   0660    bluetooth    bluetooth
+
+# backlight
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-002c/backlight/lcd-backlight   brightness    0660   system   system
+
 # End Immersion changes
 
 #for sensor-hub
@@ -400,88 +418,88 @@
 
 
 # for Invensense sensor permissions
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* accel_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* accel_fifo_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* accel_matrix 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* accel_rate 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* batchmode_timeout 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* batchmode_wake_fifo_full_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* dev 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* dmp_event_int_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* dmp_firmware 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* dmp_int_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* dmp_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* event_accel_motion 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* event_pedometer 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* event_smd 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* firmware_loaded 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* flush_batch 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* gyro_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* gyro_fifo_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* gyro_matrix 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* gyro_rate 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_scale 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_self_test_scale 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_x_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_x_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_x_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_y_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_y_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_y_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_z_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_z_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_accel_z_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_scale 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_self_test_scale 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_x_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_x_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_x_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_y_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_y_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_y_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_z_calibbias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_z_dmp_bias 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* in_anglvel_z_offset 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* master_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* motion_lpa_freq 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* motion_lpa_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* motion_lpa_threshold 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* name 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* ped_q_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* ped_q_rate 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_counter 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_int_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_int_thresh 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_step_thresh 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_steps 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* pedometer_time 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* power_state 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* reg_dump 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* sampling_frequency 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* sampling_frequency_available 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* secondary_name 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* self_test 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* self_test_samples 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* self_test_threshold 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* six_axes_q_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* six_axes_q_rate 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* six_axes_q_value 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* smd_delay_threshold 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* smd_delay_threshold2 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* smd_enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* smd_threshold 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* step_detector_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* step_indicator_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* temperature 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* three_axes_q_on 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* three_axes_q_rate 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* buffer/enable 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* buffer/length 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* scan_elements/in_timestamp_en 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* scan_elements/in_timestamp_index 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* scan_elements/in_timestamp_type 0660 system system
-/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0068/iio:device* trigger/current_trigger 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* accel_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* accel_fifo_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* accel_matrix 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* accel_rate 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* batchmode_timeout 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* batchmode_wake_fifo_full_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* dev 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* dmp_event_int_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* dmp_firmware 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* dmp_int_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* dmp_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* event_accel_motion 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* event_pedometer 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* event_smd 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* firmware_loaded 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* flush_batch 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* gyro_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* gyro_fifo_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* gyro_matrix 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* gyro_rate 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_scale 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_self_test_scale 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_x_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_x_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_x_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_y_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_y_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_y_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_z_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_z_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_accel_z_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_scale 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_self_test_scale 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_x_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_x_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_x_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_y_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_y_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_y_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_z_calibbias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_z_dmp_bias 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* in_anglvel_z_offset 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* master_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* motion_lpa_freq 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* motion_lpa_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* motion_lpa_threshold 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* name 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* ped_q_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* ped_q_rate 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_counter 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_int_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_int_thresh 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_step_thresh 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_steps 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* pedometer_time 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* power_state 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* reg_dump 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* sampling_frequency 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* sampling_frequency_available 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* secondary_name 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* self_test 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* self_test_samples 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* self_test_threshold 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* six_axes_q_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* six_axes_q_rate 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* six_axes_q_value 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* smd_delay_threshold 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* smd_delay_threshold2 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* smd_enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* smd_threshold 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* step_detector_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* step_indicator_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* temperature 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* three_axes_q_on 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* three_axes_q_rate 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* buffer/enable 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* buffer/length 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* scan_elements/in_timestamp_en 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* scan_elements/in_timestamp_index 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* scan_elements/in_timestamp_type 0660 system system
+/sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/iio:device* trigger/current_trigger 0660 system system
 
 # didim
 /sys/devices/platform/host1x/tegradc.0	smartdimmer/aggressiveness	0660 root graphics
