@@ -4,7 +4,7 @@ echo $1
 rootdirectory="$PWD"
 # ---------------------------------
 
-dirs="frameworks/av" 
+dirs="frameworks/av frameworks/base hardware/interfaces packages/modules/Connectivity"
 
 # red + nocolor
 RED='\033[0;31m'

@@ -1,0 +1,58 @@
+diff --git a/services/core/java/com/android/server/power/PowerManagerService.java b/services/core/java/com/android/server/power/PowerManagerService.java
+index 2f8d9b795630..64a8d2632297 100644
+--- a/services/core/java/com/android/server/power/PowerManagerService.java
++++ b/services/core/java/com/android/server/power/PowerManagerService.java
+@@ -6118,14 +6118,14 @@ public final class PowerManagerService extends SystemService
+             }
+ 
+             if (eventTime > now) {
+-                Slog.wtf(TAG, "Event cannot be newer than the current time ("
++                /*Slog.wtf(TAG, "Event cannot be newer than the current time ("
+                         + "now=" + now
+                         + ", eventTime=" + eventTime
+                         + ", displayId=" + displayId
+                         + ", event=" + PowerManager.userActivityEventToString(event)
+                         + ", flags=" + flags
+-                        + ")");
+-                return;
++                        + ")");*/
++                //return;
+             }
+ 
+             final int uid = Binder.getCallingUid();
+@@ -6157,7 +6157,7 @@ public final class PowerManagerService extends SystemService
+             final long now = mClock.uptimeMillis();
+             if (eventTime > now) {
+                 Slog.e(TAG, "Event time " + eventTime + " cannot be newer than " + now);
+-                throw new IllegalArgumentException("event time must not be in the future");
++                //throw new IllegalArgumentException("event time must not be in the future");
+             }
+ 
+             mContext.enforceCallingOrSelfPermission(
+@@ -6218,7 +6218,7 @@ public final class PowerManagerService extends SystemService
+             final long now = mClock.uptimeMillis();
+             if (eventTime > now) {
+                 Slog.e(TAG, "Event time " + eventTime + " cannot be newer than " + now);
+-                throw new IllegalArgumentException("event time must not be in the future");
++                //throw new IllegalArgumentException("event time must not be in the future");
+             }
+ 
+             mContext.enforceCallingOrSelfPermission(
+@@ -7060,7 +7060,7 @@ public final class PowerManagerService extends SystemService
+             final long now = mClock.uptimeMillis();
+             if (eventTime > mClock.uptimeMillis()) {
+                 Slog.e(TAG, "Event time " + eventTime + " cannot be newer than " + now);
+-                throw new IllegalArgumentException("event time must not be in the future");
++                //throw new IllegalArgumentException("event time must not be in the future");
+             }
+ 
+             mContext.enforceCallingOrSelfPermission(
+@@ -7228,7 +7228,7 @@ public final class PowerManagerService extends SystemService
+         final long now = mClock.uptimeMillis();
+         if (eventTime > now) {
+             Slog.e(TAG, "Event time " + eventTime + " cannot be newer than " + now);
+-            throw new IllegalArgumentException("event time must not be in the future");
++            //throw new IllegalArgumentException("event time must not be in the future");
+         }
+ 
+         mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DEVICE_POWER,

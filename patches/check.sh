@@ -1,7 +1,7 @@
 #!/bin/sh
 
 rootdirectory="$PWD"
-dirs="frameworks/av"
+dirs="frameworks/av frameworks/base hardware/interfaces packages/modules/Connectivity"
 
 
 RED='\033[0;31m'
