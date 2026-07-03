@@ -1,7 +1,5 @@
-
-ro.apex.enabled=false
+# apex
 ro.apex.updater.enabled=false
-ro.art.use.apex=false
 
 # AptX
 persist.bt.enableAptXHD=true
@@ -16,10 +14,8 @@ persist.net.bpf.stats=0
 ro.net.bpf.enabled=false
 
 # BT
-ro.boot.btmacaddr=03:16:6c:79:29:82
+ro.bt.bdaddr_path=/vendor/etc/mocha_btmacaddr.txt
 persist.bluetooth.gd.enabled=false
-persist.bluetooth.core.enabled=false
-persist.bluetooth.turn_off_bt_main_thread=true
 
 # Charger
 persist.sys.chgdisabled=0
@@ -45,7 +41,7 @@ ro.opengles.version=196610
 ro.sf.lcd_density=256
 ro.input.noresample=1
 ro.zygote.disable_gl_preload=true
-ro.surface_flinger.max_frame_buffer_acquired_buffers=3
+ro.surface_flinger.max_frame_buffer_acquired_buffers=2
 persist.tegra.compositor=surfaceflinger
 persist.tegra.decompression=cde-client
 persist.vendor.tegra.composite.policy=composite-yuv
@@ -110,17 +106,9 @@ persist.debug.wfd.enable=1
 wifi.interface=wlan0
 ap.interface=wlan0
 persist.wlan.ti.calibrated=0
-persist.wifi.disable_onboot_scan=true
 
 # Binary xml off
 persist.sys.binary_xml=false
 
 # Disable unlock
 ro.oem_unlock_supported=false
-
-# artd
-persist.sys.locale=en-US
-ro.product.locale=en-US
-ro.product.locale.language=en
-ro.product.locale.region=US
-

@@ -2,7 +2,7 @@ on boot
 
     exec_start init-btloader-sh
 
-# Power management settings
+	# Power management settings
     write /sys/devices/system/cpu/cpuquiet/tegra_cpuquiet/no_lp 0
 
     # Enable power gating of fast CPU's
@@ -31,8 +31,8 @@ on boot
     write /sys/devices/system/cpu/cpufreq/smartmax/touch_poke_freq 1326000
     write /sys/devices/system/cpu/cpufreq/smartmax/input_boost_duration 45000
 
-    chown system system /sys/devices/tegradc.0/enable
-    chown system system /sys/devices/tegradc.1/enable
+    chown system system /sys/devices/platform/host1x/tegradc.0/enable
+    chown system system /sys/devices/platform/host1x/tegradc.1/enable
     chown system system /sys/devices/platform/host1x/nvavp/boost_sclk
     chown system system /sys/class/input/input1/enabled
     chown system system /sys/class/input/input2/enabled
@@ -74,26 +74,14 @@ on property:sys.boot_completed=1
     write /sys/block/mmcblk1/queue/read_ahead_kb 128
     write /sys/block/mmcblk1/queue/rq_affinity 0
 
-  # override cpuset cpus to 0-3, mems to 0
-    write /dev/cpuset/foreground/cpus 0-3
-    write /dev/cpuset/foreground/mems 0
-    write /dev/cpuset/foreground/boost/cpus 0-3
-    write /dev/cpuset/foreground/boost/mems 0
-    write /dev/cpuset/background/cpus 0-3
-    write /dev/cpuset/background/mems 0
-    write /dev/cpuset/system-background/cpus 0-3
-    write /dev/cpuset/system-background/mems 0
-    write /dev/cpuset/top-app/cpus 0-3
-    write /dev/cpuset/top-app/mems 0
-
 on init
     # Mount a tmpfs into /mnt/tmp for hosting nvram, phs shared memory
     mkdir /mnt/tmp 0770 system system
     mount tmpfs tmpfs /mnt/tmp mode=0775,gid=1003
 
 
-# Loads real wifi and bt mac from /dev/block/mmcblk0p15
-service conn_wifi /system/vendor/bin/conn_init -op
+# Loads real wifi and bt mac from /dev/block/platform/sdhci-tegra.3/by-name/BKB
+    service conn_wifi /vendor/bin/conn_init -op
     class main
     user root
     group root
@@ -109,12 +97,3 @@ service conn_wifi /system/vendor/bin/conn_init -op
 
 on property:ro.vendor.bt.bdaddr_path=*
     setprop ro.bt.bdaddr_path ${ro.vendor.bt.bdaddr_path}
-
-# iptables
-service netd /system/bin/netd
-    class core
-    socket netd stream 660 root system
-    socket dnsproxyd stream 660 root inet
-    socket mdns stream 660 root system
-    socket fwmarkd stream 660 root inet
-

@@ -31,8 +31,8 @@ on boot
     
     setprop wifi.interface wlan0
 
-  on post-fs-data
-    mkdir /data/vendor/wifi 0770 wifi wifi
+on post-fs-data
+    mkdir /data/vendor/wifi 0771 wifi wifi
     mkdir /data/vendor/wifi/sockets 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
@@ -43,11 +43,3 @@ service dns_masq /system/bin/dnsmasq --no-daemon --no-resolv --no-poll --dhcp-op
     group dhcp wifi system
     disabled
     oneshot
-
-# brcm-uim-sysfs (BT/FM/ANT+) — polls /sys/devices/platform/bcm_ldisc/install
-# and attaches N_BRCM_HCI ldisc on demand. Persistent daemon, idles in poll()
-# until something opens /dev/radio0 or the BT char device.
-service uim /system/vendor/bin/brcm-uim-sysfs
-    class late_start
-    user root
-    group bluetooth bluetooth net_bt

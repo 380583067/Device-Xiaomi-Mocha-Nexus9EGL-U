@@ -49,9 +49,9 @@ PRODUCT_PACKAGES += \
 
 # Audio configuration
 PRODUCT_COPY_FILES += \
-    frameworks/av/services/audiopolicy/config/a2dp_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/a2dp_audio_policy_configuration.xml \
-    frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/bluetooth_audio_policy_configuration.xml \
+    frameworks/av/services/audiopolicy/config/a2dp_in_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/a2dp_in_audio_policy_configuration.xml \
     frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
+    frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/bluetooth_audio_policy_configuration.xml \
     frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml \
     frameworks/av/services/audiopolicy/config/r_submix_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/r_submix_audio_policy_configuration.xml \
     frameworks/av/services/audiopolicy/config/usb_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/usb_audio_policy_configuration.xml
@@ -84,8 +84,8 @@ PRODUCT_PROPERTY_OVERRIDES += \
 
 # Camera
 PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/camera/nvcamera.conf:system/etc/nvcamera.conf \
-    $(LOCAL_PATH)/camera/model_frontal.xml:system/vendor/etc/model_frontal.xml
+    $(LOCAL_PATH)/camera/nvcamera.conf:$(TARGET_COPY_OUT_VENDOR)/etc/nvcamera.conf \
+    $(LOCAL_PATH)/camera/model_frontal.xml:$(TARGET_COPY_OUT_VENDOR)/etc/model_frontal.xml
 
 PRODUCT_PACKAGES += \
     camera.device@1.0-impl \
@@ -94,14 +94,12 @@ PRODUCT_PACKAGES += \
 
 # Comm Permissions
 PRODUCT_COPY_FILES += \
-    frameworks/native/data/etc/handheld_core_hardware.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/handheld_core_hardware.xml \
-    frameworks/native/data/etc/android.hardware.sensor.proximity.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.proximity.xml \
     frameworks/native/data/etc/android.software.sip.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.sip.xml \
     frameworks/native/data/etc/android.software.sip.voip.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.sip.voip.xml
 
 # Configstore HAL
 PRODUCT_PACKAGES += \
-    disable_configstore
+    android.hardware.configstore@1.1-service
 
 # ChargerTile
 PRODUCT_PACKAGES += \
@@ -110,11 +108,11 @@ PRODUCT_PACKAGES += \
 
 # Charging LED
 PRODUCT_COPY_FILES += \
-    device/xiaomi/mocha/initfiles/charger_led.sh:system/bin/charger_led.sh
+    $(LOCAL_PATH)/initfiles/charger_led.sh:system/bin/charger_led.sh
 
 # DRM HAL
 PRODUCT_PACKAGES += \
-    android.hardware.drm@1.0-impl \
+    android.hardware.drm@1.0-impl:32 \
     android.hardware.drm@1.0-service \
     android.hardware.drm-service.clearkey \
     libprotobuf-cpp-full-3.9.1-vendorcompat
@@ -130,7 +128,7 @@ PRODUCT_COPY_FILES += \
 PRODUCT_PACKAGES += \
     fastbootd
 
-# FM Radio (Broadcom) - Disabled, missing dependencies
+# FM Radio (Broadcom)
 PRODUCT_PACKAGES += \
     android.hardware.broadcastradio@1.0-impl \
     FMRadio \
@@ -147,7 +145,7 @@ TARGET_TEGRA_VERSION := t124
 PRODUCT_PACKAGES += \
     android.hardware.graphics.allocator@2.0-impl \
     android.hardware.graphics.allocator@2.0-service \
-    android.hardware.graphics.composer@2.2-service \
+    android.hardware.graphics.composer@2.1-service \
     android.hardware.graphics.mapper@2.0-impl-2.1 \
     android.hardware.renderscript@1.0-impl
 
@@ -166,7 +164,8 @@ PRODUCT_PACKAGES += \
     hwservicemanager \
     android.hidl.allocator@1.0-service \
     android.hidl.base@1.0 \
-    android.hidl.manager@1.0
+    android.hidl.manager@1.0 \
+    android.hidl.manager-V1.0-java \
 
 # Binder
 PRODUCT_PACKAGES += \
@@ -188,12 +187,6 @@ PRODUCT_PACKAGES += \
     tegra-kbc.kl \
     Vendor_0955_Product_7210.kl
 
-# Limit dex2oat threads to improve thermals
-PRODUCT_PROPERTY_OVERRIDES += \
-    dalvik.vm.dex2oat-threads=4 \
-    dalvik.vm.image-dex2oat-threads=4 \
-	pm.dexopt.install=quicken
-
 # Keymaster
 PRODUCT_PACKAGES += \
     android.hardware.keymaster@4.1-service
@@ -207,12 +200,6 @@ PRODUCT_PACKAGES += \
 PRODUCT_PACKAGES += \
     android.hardware.media.omx@1.0-service \
     libstagefrighthw
-
-# SoftwareRenderer
-PRODUCT_PACKAGES += libstagefright
-SOONG_CONFIG_NAMESPACES += stagefright
-SOONG_CONFIG_stagefright += disable_software_renderer
-SOONG_CONFIG_stagefright_disable_software_renderer := true
 
 # Media nvidia
 PRODUCT_COPY_FILES += \
@@ -232,16 +219,23 @@ PRODUCT_PACKAGES += \
 
 # Modules
 PRODUCT_COPY_FILES += \
-	$(LOCAL_PATH)/prebuilt/modules/baseband_usb_chr.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/baseband_usb_chr.ko \
-	$(LOCAL_PATH)/prebuilt/modules/gspca_main.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/gspca_main.ko \
-	$(LOCAL_PATH)/prebuilt/modules/mbt8897.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/mbt8897.ko \
-	$(LOCAL_PATH)/prebuilt/modules/raw_ip_net.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/raw_ip_net.ko \
-	$(LOCAL_PATH)/prebuilt/modules/sd8897.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/sd8897.ko \
-	$(LOCAL_PATH)/prebuilt/modules/sd8897mlan.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/sd8897mlan.ko \
-	$(LOCAL_PATH)/prebuilt/modules/tcrypt.ko:$(TARGET_COPY_OUT_VENDOR)/lib/modules/tcrypt.ko \
-	$(LOCAL_PATH)/prebuilt/modules/modules.alias:$(TARGET_COPY_OUT_VENDOR)/lib/modules/modules.alias \
-	$(LOCAL_PATH)/prebuilt/modules/modules.dep:$(TARGET_COPY_OUT_VENDOR)/lib/modules/modules.dep \
-	$(LOCAL_PATH)/prebuilt/modules/modules.softdep:$(TARGET_COPY_OUT_VENDOR)/lib/modules/modules.softdep
+	$(LOCAL_PATH)/prebuilt/modules/baseband_usb_chr.ko:system/lib/modules/baseband_usb_chr.ko \
+	$(LOCAL_PATH)/prebuilt/modules/gspca_main.ko:system/lib/modules/gspca_main.ko \
+	$(LOCAL_PATH)/prebuilt/modules/mbt8897.ko:system/lib/modules/mbt8897.ko \
+	$(LOCAL_PATH)/prebuilt/modules/raw_ip_net.ko:system/lib/modules/raw_ip_net.ko \
+	$(LOCAL_PATH)/prebuilt/modules/sd8897.ko:system/lib/modules/sd8897.ko \
+	$(LOCAL_PATH)/prebuilt/modules/sd8897mlan.ko:system/lib/modules/sd8897mlan.ko \
+	$(LOCAL_PATH)/prebuilt/modules/tcrypt.ko:system/lib/modules/tcrypt.ko \
+	$(LOCAL_PATH)/prebuilt/modules/modules.alias:system/lib/modules/modules.alias \
+	$(LOCAL_PATH)/prebuilt/modules/modules.dep:system/lib/modules/modules.dep \
+	$(LOCAL_PATH)/prebuilt/modules/modules.softdep:system/lib/modules/modules.softdep
+
+# Net
+PRODUCT_PACKAGES += \
+    android.system.net.netd@1.0 \
+    libandroid_net \
+    libnl \
+    netutils-wrapper-1.0
 
 # NVIDIA
 PRODUCT_COPY_FILES += \
@@ -256,7 +250,7 @@ PRODUCT_COPY_FILES += \
 # OMX(SOFTWARE)
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
-    debug.stagefright.ccodec=2
+    debug.stagefright.ccodec=0
 
 # Overlay
 DEVICE_PACKAGE_OVERLAYS += \
@@ -281,10 +275,6 @@ PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.location.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.xml \
     frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
     frameworks/native/data/etc/android.hardware.opengles.aep.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.opengles.aep.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.compute-0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.compute.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.version-1_1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml \
-    frameworks/native/data/etc/android.software.vulkan.deqp.level-2020-03-01.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.vulkan.deqp.level.xml \
     frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.accelerometer.xml \
     frameworks/native/data/etc/android.hardware.sensor.compass.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.compass.xml \
     frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.gyroscope.xml \
@@ -317,10 +307,6 @@ PRODUCT_PACKAGES += \
     android.hardware.power@1.0-impl \
     android.hardware.power@1.0-service \
     android.hardware.power.stats@1.0-service.mock
-
-PRODUCT_COPY_FILES += \
-    system/core/libprocessgroup/profiles/cgroups_28.json:$(TARGET_COPY_OUT_VENDOR)/etc/cgroups.json \
-    system/core/libprocessgroup/profiles/task_profiles_28.json:$(TARGET_COPY_OUT_VENDOR)/etc/task_profiles.json
 
 # Ramdisk
 PRODUCT_PACKAGES += \
@@ -382,7 +368,8 @@ PRODUCT_PROPERTY_OVERRIDES += \
 # Vibrator
 PRODUCT_PACKAGES += \
 	android.hardware.vibrator@1.0-impl \
-    android.hardware.vibrator@1.0-service
+    android.hardware.vibrator@1.0-service \
+    android.hardware.vibrator@1.3
 
 # Vendor seccomp policy files for media components:
 PRODUCT_COPY_FILES += \
@@ -390,7 +377,6 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/seccomp/mediaextractor.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediaextractor.policy
 
 # VNDK
-BOARD_VNDK_VERSION := current
 PRODUCT_TARGET_VNDK_VERSION := 34
 VNDK_SP_LIBRARIES := \
     com.android.vndk.current
@@ -404,11 +390,9 @@ $(call inherit-product-if-exists, hardware/broadcom/wlan/bcmdhd/config/config-bc
 $(call inherit-product-if-exists, hardware/broadcom/wlan/bcmdhd/firmware/bcm4354/device-bcm.mk)
 
 PRODUCT_PACKAGES += \
-    android.hardware.wifi@1.0-service-lazy \
+    android.hardware.wifi@1.0-service \
     hostapd \
     conn_init \
-    wificond \
-    libwpa_client \
     wpa_supplicant \
     wpa_supplicant.conf
 

@@ -14,10 +14,10 @@ LOCAL_MODULE := libshim_atomic
 LOCAL_MODULE_CLASS := SHARED_LIBRARIES
 LOCAL_CFLAGS := -O3 -Wno-unused-variable -Wno-unused-parameter
 LOCAL_C_INCLUDES += system/core/libcutils/include
-LOCAL_PROPRIETARY_MODULE := true
-BUILD_BROKEN_VNDK_USAGE := true
+
 include $(BUILD_SHARED_LIBRARY)
 
+# libs
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := stdio_vsnprintf.cpp
 LOCAL_C_INCLUDES := \
@@ -29,9 +29,10 @@ LOCAL_SHARED_LIBRARIES := liblog
 LOCAL_MODULE := libs
 LOCAL_MODULE_TAGS := optional
 LOCAL_LDFLAGS_arm += -Wl,--version-script,$(LOCAL_PATH)/stdio_vsnprintf.arm.map
-BUILD_BROKEN_VNDK_USAGE := true
+
 include $(BUILD_SHARED_LIBRARY)
 
+# libshim_zw
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := zygote_whitelist.cpp
 LOCAL_C_INCLUDES := frameworks/base/core/jni \
@@ -42,7 +43,7 @@ endif
 LOCAL_SHARED_LIBRARIES := liblog libbase
 LOCAL_MODULE := libshim_zw
 LOCAL_MODULE_TAGS := optional
-BUILD_BROKEN_VNDK_USAGE := true
+
 include $(BUILD_SHARED_LIBRARY)
 
 # libnvomxadaptor_shim
@@ -52,16 +53,14 @@ LOCAL_SHARED_LIBRARIES := libui libgui libstagefright_foundation
 LOCAL_C_INCLUDES := frameworks/native/include frameworks/av/include frameworks/av/media/ndk/include
 LOCAL_CFLAGS := -Wno-unused-private-field
 LOCAL_MODULE := libnvomxadaptor_shim
-LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)
 LOCAL_MODULE_TAGS := optional
-BUILD_BROKEN_VNDK_USAGE := true
 LOCAL_PRIVATE_PLATFORM_APIS := true
+
 LOCAL_VENDOR_MODULE := false
 include $(BUILD_SHARED_LIBRARY)
 
 # libshim_camera
 include $(CLEAR_VARS)
-
 LOCAL_SRC_FILES := \
     camera_shim.cpp
 
@@ -75,8 +74,6 @@ LOCAL_C_INCLUDES := \
 LOCAL_MODULE := libshim_camera
 LOCAL_MODULE_TAGS := optional
 LOCAL_MULTILIB := 32
-LOCAL_VENDOR_MODULE := false
-LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)
-BUILD_BROKEN_VNDK_USAGE := true
 LOCAL_PRIVATE_PLATFORM_APIS := true
+LOCAL_VENDOR_MODULE := false
 include $(BUILD_SHARED_LIBRARY)

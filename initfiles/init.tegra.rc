@@ -14,7 +14,6 @@ service watchdogd /system/bin/watchdogd 10 20
     user root
     group root system
     seclabel u:r:watchdogd:s0
-    oneshot
 
 # BPF
 service bpfloader /system/bin/bpfloader
@@ -26,54 +25,22 @@ on early-init
     chmod 0775 /sys/fs/bpf
     setprop bpf.progs_loaded 1
     mount debugfs debugfs /sys/kernel/debug mode=0755
-    chmod 0775 /sys/fs/cgroup
-    mount tmpfs none /sys/fs/cgroup mode=0755
-    mkdir /sys/fs/cgroup/uid_0 0750 root root
-    mkdir /sys/fs/cgroup/blkio 0755 root root
-    mount cgroup none /sys/fs/cgroup/blkio cgroup=blkio
-    mkdir /sys/fs/cgroup/cpu 0755 root root
-    mount cgroup none /sys/fs/cgroup/cpu cgroup=cpu
-    mkdir /sys/fs/cgroup/cpuacct 0755 root root
-    mount cgroup none /sys/fs/cgroup/cpuacct cgroup=cpuacct
-    mkdir /sys/fs/cgroup/memory 0755 root root
-    mount cgroup none /sys/fs/cgroup/memory cgroup=memory
-    mkdir /sys/fs/cgroup/devices 0755 root root
-    mount cgroup none /sys/fs/cgroup/devices cgroup=devices
-    mkdir /sys/fs/cgroup/freezer 0755 root root
-    mount cgroup none /sys/fs/cgroup/freezer cgroup=freezer
-    mkdir /sys/fs/cgroup/cpuset 0755 root root
-    mount cgroup none /sys/fs/cgroup/cpuset cgroup=cpuset
-    mkdir /sys/fs/cgroup/cpuset/surfaceflinger 0750 root root
-    write /sys/fs/cgroup/cpuset/surfaceflinger/cpus 0-3
-    write /sys/fs/cgroup/cpuset/surfaceflinger/mems 0
-
-    chown system system /sys/fs/cgroup/cpuset/surfaceflinger/tasks
-
-    mkdir /acct/uid 0755 root root encryption=Require
 
 on init
-
-    write /sys/fs/cgroup/memory/memory.move_charge_at_immigrate 1
-    chown root system /sys/fs/cgroup/memory/tasks
-    chmod 0660 /sys/fs/cgroup/memory/tasks
-    mkdir /sys/fs/cgroup/memory/sw 0750 root system
-    write /sys/fs/cgroup/memory/sw/memory.swappiness 100
-    write /sys/fs/cgroup/memory/sw/memory.move_charge_at_immigrate 1
-    chown root system /sys/fs/cgroup/memory/sw/tasks
-    chmod 0660 /sys/fs/cgroup/memory/sw/tasks
-    mkdir /sys/fs/cgroup/memory/bg 0750 root system
-    write /sys/fs/cgroup/memory/bg/memory.move_charge_at_immigrate 1
-    chown root system /sys/fs/cgroup/memory/bg/tasks
-    chmod 0660 /sys/fs/cgroup/memory/bg/tasks
-
+    mkdir /dev/camera 0755 media camera
     mkdir /mnt/media_rw/sdcard1 0700 media_rw media_rw
     mkdir /storage/sdcard1 0700 root sdcard_r
 
-    # Mount and bind audio_policy_configuration.xml in /vendor
-    mount none /vendor/etc/audio_policy_configuration.xml /vendor/etc/audio/audio_policy_configuration.xml bind
-
     # Support legacy paths
     symlink /sdcard /mnt/sdcard
+    #symlink /sdcard /storage/sdcard0
+
+    # create directory for mounting usb drives
+    # mkdir /mnt/media_rw/usbdrive 0700 media_rw media_rw
+    # mkdir /storage/usbdrive 0700 root root
+    # symlink /mnt/media_rw/usbdrive /storage/usbdrive
+    # symlink /mnt/media_rw/usbdrive /usbdrive
+
     # create directory for mounting calibration partition
     mkdir /mnt/vendor/factory 0666 system system
     mkdir /mnt/vendor/wifi_config 0666 system system
@@ -88,15 +55,6 @@ on fs
     mount pstore pstore /sys/fs/pstore
 
 on post-fs-data
-	# nvgpu shims
-    export LD_PRELOAD "/system/lib/libshim_zw.so"
-
-    # Audio_policy_configuration
-    chmod 0644 /vendor/etc/audio_policy_configuration.xml
-    chmod 0644 /vendor/etc/audio.mocha.xml
-    chown root root /vendor/etc/audio_policy_configuration.xml
-    chown root root /vendor/etc/audio.mocha.xml
-
     # We chown/chmod /mnt/usercalib again so because mount is run as root + defaults
     chown system system /usercalib
     chmod 0771 /usercalib
@@ -111,11 +69,18 @@ on post-fs-data
     restorecon_recursive /usercalib
 
     mkdir /data/vendor/dhcp 0770 dhcp dhcp
+    
     mkdir /data/vendor/hwc 0771 system graphics
+    
     mkdir /data/vendor/mediadrm 0770 mediadrm mediadrm
-    mkdir /data/vendor/nvcam 0700 cameraserver camera
+
+    # create directory for camera calibration data
+    mkdir /mnt/factory/camera 0666 system system
+
+    # create directory for camera cached data
+    mkdir /data/nvcam 0700 media camera
+
     chown dhcp dhcp /data/vendor/dhcp
-    mkdir /data/vendor/mediaserver 0770 media media
 
     # Set indication (checked by vold) that we have finished this action
     setprop vold.post_fs_data_done 1
@@ -130,6 +95,28 @@ on post-fs-data
 import /vendor/etc/init/hw/init.hdcp.rc
 
 on boot
+    # Relabel GPU nodes
+    restorecon /dev/nvmap
+    restorecon /dev/nvhost-as-gpu
+    restorecon /dev/nvhost-ctrl
+    restorecon /dev/nvhost-ctrl-gpu
+    restorecon /dev/nvhost-gpu
+    restorecon /dev/nvhost-vic
+    restorecon /dev/tegra-throughput
+    restorecon /dev/tegra_dc_ctrl
+    restorecon /dev/tegra_dc_0
+    restorecon /dev/tegra_dc_1
+    restorecon /sys/devices/platform/host1x/54200000.dc/enable
+    restorecon /sys/devices/platform/host1x/54240000.dc/enable
+    restorecon /sys/devices/platform/tegra12-i2c.0/i2c-0/0-002c/backlight/lcd-backlight/brightness
+    restorecon /sys/devices/platform/tegra12-i2c.0/i2c-0/0-002c/backlight/lcd-backlight/max_brightness
+
+    # Relabel cgroups
+    restorecon_recursive /dev/stune
+
+    # Relabel power management nodes
+    restorecon /sys/devices/system/cpu/cpuquiet/tegra_cpuquiet/no_lp
+    restorecon /sys/module/cpuidle_t11x/parameters/cpu_power_gating_in_idle
     
     # charger
     chown system system /sys/devices/platform/tegra12-i2c.0/i2c-1/1-006b/disabled_by_user

@@ -16,6 +16,7 @@
 
 # Path
 LOCAL_PATH := device/xiaomi/mocha
+BOARD_VENDOR := Xiaomi
 
 # apex
 USE_CXX_STL := libc++_shared
@@ -43,6 +44,7 @@ TARGET_NOT_USE_GZIP_RECOVERY_RAMDISK := true
 # Bluetooth
 BOARD_HAVE_BLUETOOTH := true
 BOARD_HAVE_BLUETOOTH_BCM := true
+BCM_BLUETOOTH_MANTA_BUG := true
 BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := $(LOCAL_PATH)/bluetooth
 BOARD_BLUETOOTH_HIDL_GD := false
 
@@ -60,7 +62,7 @@ TARGET_BOOTANIMATION_HALF_RES := true
 #TARGET_HAS_LEGACY_CAMERA_HAL1 := true
 #TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true
 
-# dexpre-opt
+# Dexpreopt
 ifeq ($(HOST_OS),linux)
   ifneq ($(TARGET_BUILD_VARIANT),eng)
       WITH_DEXPREOPT ?= true
@@ -70,13 +72,12 @@ ifeq ($(HOST_OS),linux)
 endif
 WITH_DEXPREOPT_BOOT_IMG_AND_SYSTEM_SERVER_ONLY := true
 
-# Disable blkio cgroup (Tegra124 kernel missing)
-BUILD_BROKEN_CGROUP_BLKIOS := true
-
 # ELF
 BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
 BUILD_BROKEN_PREBUILT_ELF_FILES := true
-LOCAL_CHECK_ELF_FILES := false
+
+# FM
+BOARD_HAVE_BCM_FM := false
 
 # FS
 BOARD_CACHEIMAGE_FILE_SYSTEM_TYPE := ext4
@@ -89,9 +90,11 @@ TARGET_USES_MKE2FS := true
 TARGET_SCREEN_DENSITY := 256
 
 # Graphics
+TARGET_USES_GRALLOC1 := true
 USE_OPENGL_RENDERER := true
-TARGET_RUNNING_WITHOUT_SYNC_FRAMEWORK := true
-TARGET_FORCE_HWC_FOR_VIRTUAL_DISPLAYS := true
+NUM_FRAMEBUFFER_SURFACE_BUFFERS := 2
+BOARD_DISABLE_TRIPLE_BUFFERED_DISPLAY_SURFACES := true
+TARGET_DISABLE_POSTRENDER_CLEANUP := true
 SF_VSYNC_EVENT_PHASE_OFFSET_NS := 5000000
 VSYNC_EVENT_PHASE_OFFSET_NS := 7500000
 
@@ -126,6 +129,8 @@ TARGET_IPTABLES_BACKEND := legacy
 
 # Netd
 BOARD_DISABLE_NETD_ADVANCED_RULES := true
+TARGET_USES_LEGACY_NETD := true
+BUILD_BROKEN_BPF_KERNEL := true
 
 # Kernel
 BOARD_KERNEL_CMDLINE := vpr_resize androidboot.selinux=permissive vmalloc=400M androidboot.hardware=tn8 fsck.mode=skip
@@ -232,7 +237,7 @@ WIFI_DRIVER_FW_PATH_PARAM        := "/sys/module/bcmdhd/parameters/firmware_path
 #WIFI_DRIVER_MODULE_NAME          := "bcmdhd"
 WIFI_HIDL_UNIFIED_SUPPLICANT_SERVICE_RC_ENTRY := true
 
-               
+                       
 # Zygote whitelist extra paths
 ZYGOTE_WHITELIST_PATH_EXTRA := \"/dev/nvhost-ctrl\",\"/dev/nvmap\"
 

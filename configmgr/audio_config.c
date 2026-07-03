@@ -36,6 +36,7 @@ typedef struct effect_interface_s **effect_handle_t;
 #include <hardware/audio.h>
 
 #include <tinyalsa/asoundlib.h>
+
 #include <expat.h>
 
 #include <tinyhal/audio_config.h>
@@ -1078,9 +1079,7 @@ static const struct parse_device device_table[] = {
     {"mic",         AUDIO_DEVICE_IN_BUILTIN_MIC},
     {"back mic",    AUDIO_DEVICE_IN_BACK_MIC},
     {"voice",       AUDIO_DEVICE_IN_VOICE_CALL},
-    {"aux",         AUDIO_DEVICE_IN_AUX_DIGITAL},
-    {"fm",          AUDIO_DEVICE_OUT_FM},
-    {"fm_in",       AUDIO_DEVICE_IN_FM_TUNER}
+    {"aux",         AUDIO_DEVICE_IN_AUX_DIGITAL}
 };
 
 static const char *predefined_path_name_table[] = {
