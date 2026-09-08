@@ -34,10 +34,13 @@ on boot
 on post-fs-data
     mkdir /data/vendor/wifi 0771 wifi wifi
     mkdir /data/vendor/wifi/sockets 0770 wifi wifi
+    mkdir /data/vendor/wifi/hostapd 0770 wifi wifi
+    mkdir /data/vendor/wifi/hostapd/ctrl 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa 0770 wifi wifi
     mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
+    mkdir /data/vendor/wifi/wpa_supplicant 0770 wifi wifi
         
-service dns_masq /system/bin/dnsmasq --no-daemon --no-resolv --no-poll --dhcp-option-force=43,ANDROID_METERED --dhcp-range=192.168.42.2,192.168.42.254,1h &
+service dns_masq /system/bin/dnsmasq --no-daemon --no-resolv --no-poll --dhcp-option-force=43,ANDROID_METERED --dhcp-range=192.168.42.2,192.168.42.254,1h
     class main
     user dhcp
     group dhcp wifi system

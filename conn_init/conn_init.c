@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <log/log.h>
+#include <cutils/log.h>
 #include <cutils/properties.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -27,8 +27,8 @@
 #define BT_MAC_PROP "ro.bt.bdaddr_path"
 #define BT_MAC_PROP1 "persist.service.bdroid.bdaddr"
 #define BT_MAC_PROP2 "ro.boot.btmacaddr"
-#define WIFI_MAC_FILE "/vendor/etc/mocha_macaddr.txt"
-#define BT_MAC_FILE "/vendor/etc/mocha_btmacaddr.txt"
+#define WIFI_MAC_FILE "/data/misc/wifi/mocha_macaddr.txt"
+#define BT_MAC_FILE "/data/misc/bluetooth/mocha_btmacaddr.txt"
 #define BT_MAC_TAG "XIAOMIBT!"
 #define WIFI_MAC_TAG "XIAOMIWF!"
 

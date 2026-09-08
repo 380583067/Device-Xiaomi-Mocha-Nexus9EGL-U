@@ -6,7 +6,7 @@
 # documentation without an express license agreement from NVIDIA Corporation
 # is strictly prohibited.
 
-on early-init
+on post-fs-data
     # create /oem symbol link
     symlink /system/vendor/oem /oem
     chmod 0755 /oem
@@ -22,6 +22,7 @@ on early-init
     chmod 0755 /gl
     chown root system /gl
 
+on early-init
     write /sys/bus/i2c/devices/i2c-2/clock_rate 100000
     write /sys/bus/i2c/devices/i2c-2/retry_count 3
     write /sys/bus/i2c/devices/i2c-2/timeout 500000
@@ -88,22 +89,17 @@ service charger /system/bin/charger
     capabilities SYS_BOOT
     seclabel u:r:charger:s0
 
+service charger_led /system/bin/sh /system/bin/charger_led.sh
+    class charger
+    user root
+    group root
+    oneshot
+
 on charger
-	chmod 0755 /system/bin/charger_led.sh
+    start charger_led
 
-    exec - root root -- /system/bin/sh /system/bin/charger_led.sh &
-
-    write /sys/devices/system/cpu/cpu1/online 1
-    write /sys/devices/system/cpu/cpu2/online 1
-    write /sys/devices/system/cpu/cpu3/online 1
-    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 'powersave'
-    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor 'powersave'
-    write /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor 'powersave'
-    write /sys/devices/system/cpu/cpu3/cpufreq/scaling_governor 'powersave'
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 300000
-    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_min_freq 300000
-    write /sys/devices/system/cpu/cpu2/cpufreq/scaling_min_freq 300000
-    write /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq 300000
     write /sys/devices/system/cpu/cpu1/online 0
     write /sys/devices/system/cpu/cpu2/online 0
     write /sys/devices/system/cpu/cpu3/online 0

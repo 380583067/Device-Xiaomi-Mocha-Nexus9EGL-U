@@ -21,11 +21,6 @@
 /dev/torch*     0660    media   camera
 /dev/video0     0660    media   camera
 /dev/video1     0660    media   camera
-# V4L2 sub-devices (sensor, focuser, ISP, etc.) — used by V4L2 camera HAL
-/dev/v4l-subdev* 0660   media   camera
-# Media controller — HAL walks /dev/media0 to discover the sensor↔focuser
-# pairing via MEDIA_IOC_ENUM_ENTITIES / MEDIA_IOC_ENUM_LINKS.
-/dev/media*     0660   media   camera
 /dev/mipi-cal   0660    media   camera
 /dev/spdif*     0660    system  audio
 /dev/adf*       0660    system  system
@@ -56,8 +51,8 @@
 /dev/nvhost-dbg-gpu    0666   root   root
 /dev/nvhost-prof-gpu   0666   root   root
 /dev/tlk_device 0660    system  drmrpc
-# for FM V4L2 Radio — kernel creates /dev/radio0, not /dev/radio
-/dev/radio*     0660    system  radio
+# for FM V4L2 Radio
+/dev/radio      0666    system  radio
 /dev/mpu        0640    system  system
 /dev/mpuirq     0640    system  system
 /dev/accelirq   0640    system  system
@@ -83,9 +78,6 @@
 /sys/devices/platform/ozwpan/usb*	mode	0660	system	system
 /dev/ttyTHS1	0664	root	system
 /dev/ttyTHS2	0660	bluetooth	bluetooth
-# BCM4354 BT chardev exposed by drivers/bluetooth/broadcom/bt_protocol_driver
-# (CONFIG_BT_PROTOCOL_DRIVER=y). libbt-vendor opens this directly.
-/dev/brcm_bt_drv	0660	bluetooth	bluetooth
 # pmqos
 /dev/constraint_cpu_freq 0660 root system
 /dev/constraint_gpu_freq 0660 root system
@@ -107,9 +99,6 @@
 /sys/devices/platform/host1x gk20a.0/elpg_enable 0664 system system
 /sys/devices/platform/host1x gk20a.0/blcg_enable 0664 system system
 /sys/devices/platform/host1x tegradc.0/enable 0664 system system
-/sys/devices/platform/host1x/tegradc.0/color_filter_rgb 0660 system system
-/sys/devices/platform/host1x/tegradc.0/color_filter 0660 system system
-
 # sensors
 /dev/iio:device*	0660	system	system
 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-00*	enable	0660	system	system

@@ -8,7 +8,7 @@
 
 import /vendor/etc/init/hw/init.comms.rc
 
-# Thie yields each tegra wdt expiration to be at 30 secs and fourth expiration for reboot at 120 secs.
+# This yields each tegra wdt expiration to be at 30 secs and fourth expiration for reboot at 120 secs.
 service watchdogd /system/bin/watchdogd 10 20
     class core
     user root
@@ -29,11 +29,10 @@ on early-init
 on init
     mkdir /dev/camera 0755 media camera
     mkdir /mnt/media_rw/sdcard1 0700 media_rw media_rw
-    mkdir /storage/sdcard1 0700 root sdcard_r
 
     # Support legacy paths
-    symlink /sdcard /mnt/sdcard
-    #symlink /sdcard /storage/sdcard0
+    # symlink /sdcard /mnt/sdcard
+    # symlink /sdcard /storage/sdcard0
 
     # create directory for mounting usb drives
     # mkdir /mnt/media_rw/usbdrive 0700 media_rw media_rw
@@ -50,11 +49,15 @@ on init
 
     start watchdogd
 
-on fs
-    # mount console ramooops
-    mount pstore pstore /sys/fs/pstore
+    # Use Keymaster 0 HAL
+    setprop ro.hardware.keystore tegra
 
 on post-fs-data
+    mkdir /mnt/factory 0771 system system
+    mkdir /mnt/factory/wifi 0770 system system
+
+    mkdir /storage/sdcard1 0700 root sdcard_r
+
     # We chown/chmod /mnt/usercalib again so because mount is run as root + defaults
     chown system system /usercalib
     chmod 0771 /usercalib

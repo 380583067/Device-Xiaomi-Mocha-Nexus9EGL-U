@@ -58,7 +58,7 @@ on fs
     mount_all  /vendor/etc/fstab.tn8
     swapon_all /vendor/etc/fstab.tn8
 
-on property:dev.bootcomplete=1
+on property:sys.boot_completed=1
     start vendor.init_renderer
 
 service vendor.init_renderer /vendor/bin/init.renderer.sh
