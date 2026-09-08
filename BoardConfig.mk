@@ -63,14 +63,8 @@ TARGET_BOOTANIMATION_HALF_RES := true
 #TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true
 
 # Dexpreopt
-ifeq ($(HOST_OS),linux)
-  ifneq ($(TARGET_BUILD_VARIANT),eng)
-      WITH_DEXPREOPT ?= true
-      WITH_DEXPREOPT_DEBUG_INFO := false
-      USE_DEX2OAT_DEBUG := false
-  endif
-endif
-WITH_DEXPREOPT_BOOT_IMG_AND_SYSTEM_SERVER_ONLY := true
+WITH_DEXPREOPT := true
+WITH_DEXPREOPT_BOOT_IMG_AND_SYSTEM_SERVER_ONLY := false
 
 # ELF
 BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
@@ -102,6 +96,7 @@ VSYNC_EVENT_PHASE_OFFSET_NS := 7500000
 TARGET_ADDITIONAL_GRALLOC_10_USAGE_BITS := 0x2000U | 0x02000000U
 
 # HIDL Manifest
+PRODUCT_ENFORCE_VINTF_MANIFEST_OVERRIDE := true
 DEVICE_MANIFEST_FILE := $(LOCAL_PATH)/manifest.xml
 DEVICE_MATRIX_FILE := $(LOCAL_PATH)/compatibility_matrix.xml
 DEVICE_FRAMEWORK_COMPATIBILITY_MATRIX_FILE := \
@@ -133,7 +128,7 @@ TARGET_USES_LEGACY_NETD := true
 BUILD_BROKEN_BPF_KERNEL := true
 
 # Kernel
-BOARD_KERNEL_CMDLINE := vpr_resize androidboot.selinux=permissive vmalloc=400M androidboot.hardware=tn8 fsck.mode=skip
+BOARD_KERNEL_CMDLINE := vpr_resize androidboot.selinux=permissive vmalloc=400M androidboot.hardware=tn8
 BOARD_KERNEL_BASE := 0x10000000
 BOARD_RAMDISK_OFFSET := 0x02000000
 BOARD_KERNEL_PAGESIZE := 2048
@@ -194,7 +189,6 @@ TARGET_SYSTEM_PROP += device/xiaomi/mocha/system.prop
 TARGET_PRODUCT_PROP += device/xiaomi/mocha/product.prop
 
 # Recovery
-LZMA_RAMDISK_TARGETS := recovery
 TARGET_RECOVERY_DEVICE_DIRS += device/xiaomi/mocha
 TARGET_RECOVERY_FSTAB := device/xiaomi/mocha/initfiles/fstab.tn8
 BOARD_NO_SECURE_DISCARD := true
@@ -210,12 +204,9 @@ BOARD_SEPOLICY_DIRS += $(LOCAL_PATH)/sepolicy/mocha
 
 # SHIMS
 TARGET_LD_SHIM_LIBS := \
-    /system/vendor/lib/hw/hwcomposer.tegra.so|libshim_camera.so \
-    /system/vendor/lib/libnvcap_video.so|libshim_camera.so \
-    /system/vendor/lib/libnvgr.so|libshim_atomic.so \
-    /system/vendor/lib/libnvomxadaptor.so|libnvomxadaptor_shim.so \
-	/system/lib/libshim_zw.so|/system/lib/libbase.so \
-	/system/lib/libshim_zw.so|/system/lib/libc++.so
+    /system/vendor/lib/hw/hwcomposer.tegra.so|libshims_ui.so \
+    /system/vendor/lib/libnvcap_video.so|libshims_ui.so \
+    /system/vendor/lib/libnvgr.so|libshim_atomic.so
 
 # ThermalHAL
 TARGET_THERMALHAL_VARIANT := tegra
@@ -236,8 +227,7 @@ WIFI_DRIVER_FW_PATH_PARAM        := "/sys/module/bcmdhd/parameters/firmware_path
 #WIFI_DRIVER_MODULE_ARG           := "iface_name=wlan0"
 #WIFI_DRIVER_MODULE_NAME          := "bcmdhd"
 WIFI_HIDL_UNIFIED_SUPPLICANT_SERVICE_RC_ENTRY := true
-
-                       
+               
 # Zygote whitelist extra paths
 ZYGOTE_WHITELIST_PATH_EXTRA := \"/dev/nvhost-ctrl\",\"/dev/nvmap\"
 

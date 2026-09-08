@@ -1,12 +1,5 @@
 LOCAL_PATH:= $(call my-dir)
 
-PROTOBUF_SYMLINK := $(TARGET_OUT_VENDOR)/lib/libprotobuf-cpp-lite-3.9.1.so
-$(PROTOBUF_SYMLINK):
-	$(hide) mkdir -p $(TARGET_OUT_VENDOR)/lib
-	$(hide) ln -sf /system/lib/libprotobuf-cpp-lite.so $@
-
-ALL_DEFAULT_INSTALLED_MODULES += $(PROTOBUF_SYMLINK)
-
 # libshim_atomic
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := atomic.cpp
@@ -44,36 +37,4 @@ LOCAL_SHARED_LIBRARIES := liblog libbase
 LOCAL_MODULE := libshim_zw
 LOCAL_MODULE_TAGS := optional
 
-include $(BUILD_SHARED_LIBRARY)
-
-# libnvomxadaptor_shim
-include $(CLEAR_VARS)
-LOCAL_SRC_FILES := libnvomxadaptor_shim.cpp
-LOCAL_SHARED_LIBRARIES := libui libgui libstagefright_foundation
-LOCAL_C_INCLUDES := frameworks/native/include frameworks/av/include frameworks/av/media/ndk/include
-LOCAL_CFLAGS := -Wno-unused-private-field
-LOCAL_MODULE := libnvomxadaptor_shim
-LOCAL_MODULE_TAGS := optional
-LOCAL_PRIVATE_PLATFORM_APIS := true
-
-LOCAL_VENDOR_MODULE := false
-include $(BUILD_SHARED_LIBRARY)
-
-# libshim_camera
-include $(CLEAR_VARS)
-LOCAL_SRC_FILES := \
-    camera_shim.cpp
-
-LOCAL_SHARED_LIBRARIES := \
-    libgui \
-    libui
-
-LOCAL_C_INCLUDES := \
-    frameworks/native/include
-
-LOCAL_MODULE := libshim_camera
-LOCAL_MODULE_TAGS := optional
-LOCAL_MULTILIB := 32
-LOCAL_PRIVATE_PLATFORM_APIS := true
-LOCAL_VENDOR_MODULE := false
 include $(BUILD_SHARED_LIBRARY)

@@ -36,6 +36,24 @@
         </interface>
     </hal>
     <hal format="hidl">
+        <name>android.hardware.camera.provider</name>
+        <transport arch="32">passthrough</transport>
+        <version>2.4</version>
+        <interface>
+            <name>ICameraProvider</name>
+            <instance>legacy/0</instance>
+        </interface>
+     </hal>
+    <hal format="hidl">
+        <name>android.hardware.camera</name>
+        <transport arch="32">passthrough</transport>
+        <version>1.0</version>
+        <interface>
+            <name>ICamera</name>
+            <instance>default</instance>
+        </interface>
+     </hal>
+    <hal format="hidl">
         <name>android.hardware.configstore</name>
         <transport>hwbinder</transport>
         <version>1.1</version>
@@ -47,7 +65,7 @@
     <hal format="hidl">
         <name>android.hardware.drm</name>
         <transport>hwbinder</transport>
-        <version>1.0</version>
+        <version>1.3</version>
         <interface>
             <name>ICryptoFactory</name>
             <instance>widevine</instance>
@@ -87,6 +105,7 @@
     <hal format="hidl">
         <name>android.hardware.graphics.mapper</name>
         <transport arch="32">passthrough</transport>
+        <impl level="generic"></impl>
         <version>2.1</version>
         <interface>
             <name>IMapper</name>

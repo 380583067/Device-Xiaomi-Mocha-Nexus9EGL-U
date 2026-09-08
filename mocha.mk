@@ -22,6 +22,10 @@ $(call inherit-product-if-exists, vendor/xiaomi/mocha/consolemode-blobs.mk)
 # API
 PRODUCT_PACKAGES += $(PRODUCT_PACKAGES_SHIPPING_API_LEVEL_34)
 
+# APEX
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/configs/ld.config.txt:$(TARGET_COPY_OUT_SYSTEM)/etc/swcodec/ld.config.txt
+
 # Audio
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/audio/audio.mocha.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio.mocha.xml \
@@ -74,13 +78,17 @@ PRODUCT_PACKAGES += \
     android.hardware.bluetooth@1.0-impl \
     android.hardware.bluetooth@1.0-service
 
+# TEGRA_BT
 PRODUCT_PROPERTY_OVERRIDES += \
     bluetooth.profile.asha.central.enabled=true \
     bluetooth.profile.a2dp.source.enabled=true \
     bluetooth.profile.avrcp.target.enabled=true \
     bluetooth.profile.gatt.enabled=true \
     bluetooth.profile.hid.host.enabled=true \
-	persist.bluetooth.turn_off_bt_main_thread=true
+	persist.bluetooth.turn_off_bt_main_thread=true \
+    ro.bluetooth.request.master=true \
+    ro.bluetooth.remote.autoconnect=true \
+    bluetooth.a2dp.sink.enabled=false
 
 # Camera
 PRODUCT_COPY_FILES += \
@@ -89,8 +97,8 @@ PRODUCT_COPY_FILES += \
 
 PRODUCT_PACKAGES += \
     camera.device@1.0-impl \
-    camera.device@3.2-impl \
     android.hardware.camera.provider@2.4-impl \
+    camera.tegra
 
 # Comm Permissions
 PRODUCT_COPY_FILES += \
@@ -112,13 +120,7 @@ PRODUCT_COPY_FILES += \
 
 # DRM HAL
 PRODUCT_PACKAGES += \
-    android.hardware.drm@1.0-impl:32 \
-    android.hardware.drm@1.0-service \
-    android.hardware.drm-service.clearkey \
-    libprotobuf-cpp-full-3.9.1-vendorcompat
-
-PRODUCT_COPY_FILES += \
-    prebuilts/vndk/v29/arm/arch-arm-armv7-a-neon/shared/vndk-core/libprotobuf-cpp-full.so:$(TARGET_COPY_OUT_VENDOR)/lib/libprotobuf-cpp-full-v29.so
+    android.hardware.drm-service.clearkey
 
 # Display Device Config
 PRODUCT_COPY_FILES += \
@@ -130,11 +132,7 @@ PRODUCT_PACKAGES += \
 
 # FM Radio (Broadcom)
 PRODUCT_PACKAGES += \
-    android.hardware.broadcastradio@1.0-impl \
-    FMRadio \
-    libfmjni \
-    libfmradio.v4l2-fm \
-    brcm-uim-sysfs
+    android.hardware.broadcastradio@1.0-impl
 
 # Graphics
 PRODUCT_AAPT_CONFIG += xlarge large
@@ -151,12 +149,10 @@ PRODUCT_PACKAGES += \
 
 # Shims
 PRODUCT_PACKAGES += \
-    libnvomxadaptor_shim \
-    libshim_atomic \
-    libshim_camera \
+    libs \
     libshim_zw \
-    libs
-
+    libshim_atomic \
+    libshims_ui
 
 # HIDL
 PRODUCT_ENFORCE_VINTF_MANIFEST_OVERRIDE := true
@@ -204,9 +200,6 @@ PRODUCT_PACKAGES += \
 # Media nvidia
 PRODUCT_COPY_FILES += \
     frameworks/av/media/libstagefright/data/media_codecs_google_audio.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_audio.xml \
-    frameworks/av/media/libstagefright/data/media_codecs_google_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_c2.xml \
-    frameworks/av/media/libstagefright/data/media_codecs_google_c2_audio.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_c2_audio.xml \
-    frameworks/av/media/libstagefright/data/media_codecs_google_c2_video.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_c2_video.xml \
     frameworks/av/media/libstagefright/data/media_codecs_google_video.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_google_video.xml \
     $(LOCAL_PATH)/media/media_codecs.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs.xml \
     $(LOCAL_PATH)/media/media_profiles_V1_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_profiles_V1_0.xml \
@@ -275,6 +268,10 @@ PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.location.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.xml \
     frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
     frameworks/native/data/etc/android.hardware.opengles.aep.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.opengles.aep.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.compute-0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.compute.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.version-1_1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml \
+    frameworks/native/data/etc/android.software.vulkan.deqp.level-2020-03-01.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.vulkan.deqp.level.xml \
     frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.accelerometer.xml \
     frameworks/native/data/etc/android.hardware.sensor.compass.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.compass.xml \
     frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.gyroscope.xml \
@@ -373,8 +370,8 @@ PRODUCT_PACKAGES += \
 
 # Vendor seccomp policy files for media components:
 PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/seccomp/mediacodec.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediacodec.policy \
-    $(LOCAL_PATH)/seccomp/mediaextractor.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediaextractor.policy
+    $(LOCAL_PATH)/seccomp/mediacodec-seccomp.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediacodec-seccomp.policy \
+    $(LOCAL_PATH)/seccomp/mediaextractor-seccomp.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/mediaextractor-seccomp.policy
 
 # VNDK
 PRODUCT_TARGET_VNDK_VERSION := 34
@@ -390,9 +387,12 @@ $(call inherit-product-if-exists, hardware/broadcom/wlan/bcmdhd/config/config-bc
 $(call inherit-product-if-exists, hardware/broadcom/wlan/bcmdhd/firmware/bcm4354/device-bcm.mk)
 
 PRODUCT_PACKAGES += \
-    android.hardware.wifi@1.0-service \
+    android.hardware.wifi@1.0-service.legacy \
     hostapd \
     conn_init \
+    wificond \
+    libwifi-hal-bcm \
+    libwpa_client \
     wpa_supplicant \
     wpa_supplicant.conf
 

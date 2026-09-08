@@ -5,10 +5,5 @@ subdirs = [
     "health",
     "init",
     "hardware",
+    "shims",
 ]
-
-cc_library_shared {
-    name: "libldacBT_bco",
-    vendor_available: true,
-    srcs: [],
-}
