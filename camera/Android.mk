@@ -2,34 +2,40 @@ LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 
+# New Mocha Camera HAL (HAL3)
 LOCAL_SRC_FILES := \
-    CameraWrapper.cpp \
-    Camera3Wrapper.cpp
+    MochaCameraHAL.cpp \
+    CameraPipeline.cpp \
+    JpegEncoder.cpp \
+    isp/DemosaicNEON.cpp \
+    isp/ColorConvNEON.cpp
 
-LOCAL_STATIC_LIBRARIES := libbase libarect
 LOCAL_SHARED_LIBRARIES := \
-    libhardware liblog  libcamera_client libutils libgui libhidltransport libcamera_metadata libsensor android.hidl.token@1.0-utils android.hardware.graphics.bufferqueue@1.0
+    libhardware \
+    liblog \
+    libutils \
+    libcutils \
+    libcamera_metadata \
+    libjpeg
 
-LOCAL_C_INCLUDES += \
-    frameworks/native/include \
-    frameworks/native/include/media/openmax \
-    frameworks/native/libs/nativebase/include \
+LOCAL_C_INCLUDES := \
     system/core/include \
-    system/core/base/include \
     system/media/camera/include \
+    hardware/libhardware/include \
+    frameworks/native/include \
+    frameworks/av/include \
+    external/libjpeg-turbo
 
-LOCAL_HEADER_LIBRARIES := libnativebase_headers
+LOCAL_ARM_NEON := true
+LOCAL_CFLAGS := -DLOG_TAG=\"MochaCameraHAL\" -std=c++11 -D__ARM_NEON__ -mfpu=neon -mfloat-abi=softfp
 
 LOCAL_32_BIT_ONLY := true
-LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+LOCAL_MODULE_RELATIVE_PATH := hw
+LOCAL_VENDOR_MODULE := true
 
 LOCAL_MODULE := camera.$(TARGET_BOARD_PLATFORM)
 LOCAL_MODULE_TAGS := optional
 
-BUILD_BROKEN_VNDK_USAGE := true
-LOCAL_PRIVATE_PLATFORM_APIS := true
-LOCAL_VENDOR_MODULE := false
-
-LOCAL_PROPRIETARY_MODULE := false
-
 include $(BUILD_SHARED_LIBRARY)
+
+include $(call all-makefiles-under,$(LOCAL_PATH))
