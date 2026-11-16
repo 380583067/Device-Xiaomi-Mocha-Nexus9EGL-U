@@ -1,0 +1,74 @@
+diff --git a/bcmdhd/wifi_hal/wifi_hal.cpp b/bcmdhd/wifi_hal/wifi_hal.cpp
+index af9b06c..21d48ab 100644
+--- a/bcmdhd/wifi_hal/wifi_hal.cpp
++++ b/bcmdhd/wifi_hal/wifi_hal.cpp
+@@ -682,6 +682,23 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
+ 
+     /* calling internal modules or cleanup */
+     wifi_internal_module_cleanup();
++
++    /* 【修复 2026-11-17】提前置 clean_up，阻止 event loop 线程继续处理
++     * nl80211 事件。原因：下面 while 循环会遍历 info->cmd 数组，对每个
++     * 命令调 cancel() + releaseRef()（releaseRef 会 delete 命令对象）。
++     * 而 event loop 线程的 event_handler() 也持有这些命令的裸指针
++     * （wifi_register_handler 的 arg），若 cleanup 期间仍处理事件，就会
++     * 与 releaseRef(delete) 竞争，cmd 对象被释放后 event_handler 或
++     * 下一次迭代仍解引用它（use-after-free，vtable 被 HIDL 字符串覆盖成
++     * 0x72646e61 "andr"，CFI 检查踩空页 SIGSEGV）。
++     *
++     * clean_up=true 只让 event loop 停止 internal_pollin_handler（不再
++     * 碰命令对象），但它仍阻塞在 poll 上、不会退出，也就不会执行
++     * internal_cleaned_up_handler 去 free 接口/hal_info —— 所以这里提前置位
++     * 是安全的，接口和 hal_info 的生命周期不受影响。真正的退出信号仍在
++     * 函数末尾 write(cleanup_socks[0]) 时发出。 */
++    info->clean_up = true;
++
+     pthread_mutex_lock(&info->cb_lock);
+ 
+     int bad_commands = 0;
+@@ -710,13 +727,32 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
+             ALOGI("Cancelling command %p:%s", cmd, cmd->getType());
+             pthread_mutex_unlock(&info->cb_lock);
+             cmd->cancel();
+-            if (num_cmd == info->num_cmd) {
+-                ALOGI("Cancelling command %p:%s did not work", cmd, (cmd ? cmd->getType(): ""));
+-                bad_commands++;
++            pthread_mutex_lock(&info->cb_lock);
++            /* 【修复 2026-11-17】cancel() 可能失败或提前返回（例如
++             * HalInit::cancel 在 LOGGER_HAL_STOP 命令 create/发送失败时
++             * 直接 return，不执行末尾的 wifi_unregister_cmd），导致命令
++             * 仍留在 info->cmd 数组里。原代码此时只 bad_commands++ 跳过，
++             * 但紧接着 releaseRef() 无条件 delete 了命令对象 —— 数组里
++             * 就留下一个悬空指针。下一次访问（或再次 cleanup）时 vtable
++             * 已被复用成垃圾（0x72646e61 "andr"），CFI 检查踩空页崩溃。
++             *
++             * 修复：cancel 之后若命令仍在原位置（cancel 没有通过
++             * unregister 把它移走），这里显式 memmove 移除它，保证
++             * releaseRef(delete) 之前命令一定不在数组里。 */
++            if (info->num_cmd > bad_commands &&
++                    info->cmd[bad_commands].cmd == cmd) {
++                memmove(&info->cmd[bad_commands],
++                        &info->cmd[bad_commands + 1],
++                        (info->num_cmd - bad_commands - 1) * sizeof(cmd_info));
++                info->num_cmd--;
+             }
+             /* release reference added when command is saved */
++            pthread_mutex_unlock(&info->cb_lock);
+             cmd->releaseRef();
+             pthread_mutex_lock(&info->cb_lock);
++        } else {
++            /* 空条目防御：跳过，避免死循环 */
++            bad_commands++;
+         }
+     }
+ 
+@@ -731,7 +767,8 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
+     }
+     pthread_mutex_unlock(&info->cb_lock);
+ 
+-    info->clean_up = true;
++    /* clean_up 已提前到 while 循环之前置位（见上方【修复 2026-11-17】注释），
++     * 这里不再重复设置，保证"停止事件处理"先于"取消命令"发生。 */
+ 
+     /* global func ptr be invalidated and will not call any command from legacy hal */
+     if (cleaned_up_handler) {
