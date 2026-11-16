@@ -20,6 +20,7 @@
 
 #define LOG_TAG "CameraWrapper"
 #include <cutils/log.h>
+#include <dlfcn.h>
 #include "CameraWrapper.h"
 #include "Camera3Wrapper.h"
 
@@ -103,6 +104,50 @@ static char prop[PROPERTY_VALUE_MAX];
 static camera_metadata_t* vendorInfo[2] = {0,0};
 static camera_info vendor_camera_info;
 
+/*
+ * Preload the ABI compatibility layer for the camera blob
+ * ============================================================================
+ * The vendor blob camera.vendor.tegra.so was compiled in the Android 5.1 era; loading it
+ * directly through hw_get_module fails (2 missing DT_NEEDED files plus Android C++ ABI symbols).
+ * See the header of device/xiaomi/mocha/camera/mocha_camera_shim.cpp for the approach.
+ *
+ * This function pushes those shim libraries into the process ahead of time. Two injection
+ *   1) TARGET_LD_SHIM_LIBS in BoardConfig.mk - that mechanism compiles the mapping table
+ *      into /system/bin/linker. It is the canonical way, but changing it needs a new system image;
+ *   2) this function - an explicit dlopen. It does not depend on the linker binary, so hot-
+ *      swapping the library is enough to verify, and dlopen is idempotent when both are active.
+ *
+ * Load order of the two libraries matters:
+ *   - libcameraservice_mocha.so declares its ELF SONAME as "libcameraservice.so"
+ *     (because Make forbids LOCAL_MODULE_STEM on a SHARED_LIBRARY and the module name
+ *     clashes with the Soong cc_library). It must load before the blob so that the blob's
+ *     DT_NEEDED "libcameraservice.so" hits the soname index of loaded libraries
+ *     （bionic linker.cpp:1468 find_loaded_library_by_soname）。
+ *   - libmocha_camera_shim.so is built with DF_1_GLOBAL (-Wl,-z,global), so opening it
+ *     with RTLD_GLOBAL puts its symbols in the process global group and the blob can
+ *     resolve the reshaped or vanished CameraMetadata / Fence / SensorManager symbols.
+ *
+ * Failure is not fatal: the camera does not work anyway, so the worst case is an earlier log.
+ */
+static void preload_vendor_camera_shims() __attribute__((unused));
+static void preload_vendor_camera_shims()
+{
+    static bool preloaded = false;
+    if (preloaded)
+        return;
+    preloaded = true;
+
+    void* svc = dlopen("libcameraservice_mocha.so", RTLD_NOW | RTLD_GLOBAL);
+    if (svc == NULL)
+        ALOGW("preload libcameraservice_mocha.so failed: %s", dlerror());
+
+    void* shim = dlopen("libmocha_camera_shim.so", RTLD_NOW | RTLD_GLOBAL);
+    if (shim == NULL)
+        ALOGW("preload libmocha_camera_shim.so failed: %s", dlerror());
+    else
+        ALOGV("camera ABI shim preloaded");
+}
+
 static int check_vendor_module()
 {
     int rv = 0;
@@ -110,6 +155,25 @@ static int check_vendor_module()
 
     if(gVendorModule)
         return 0;
+
+    /*
+     * NOTE: preload_vendor_camera_shims() is *deliberately not called* here.
+     *
+     * Measured result (2026-11, on device): with all ABI shims in place the blob does
+     * dlopen successfully (camera_shim_test shows all 345 undefined symbols resolvable), but
+     * camera.vendor.tegra.so uses NVIDIA's legacy PCL path while this kernel's camera
+     * device tree was rewritten around the V4L2 subdev framework (tegra124-mocha-camera-mc.dtsi:
+     * imx179@10 / ov5693@36 / ad5823@0c) and has no PCL nodes the blob expects.
+     * The blob then probes PCL chips one by one, all time out (4s each) and hold the i2c
+     * bus lock for a long time, *freezing the entire system* (adb shell blocks, adb reboot hangs).
+     *
+     * Therefore the blob path cannot be enabled before the HAL switches to the in-house
+     * V4L2 implementation (MochaCameraHAL.cpp). The function is kept so it can be restored
+     *
+     * To restore: uncomment the line below and also restore the two commented-out camera
+     * lines of TARGET_LD_SHIM_LIBS in BoardConfig.mk.
+     */
+    // preload_vendor_camera_shims();
 
     rv = hw_get_module_by_class("camera", "vendor", (const hw_module_t **)&gVendorModule);
     if (rv)
