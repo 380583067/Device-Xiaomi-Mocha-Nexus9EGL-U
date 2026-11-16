@@ -15,6 +15,15 @@
 #include <hardware/gralloc.h>
 #include <utils/threads.h>
 #include <utils/Vector.h>
+/* 【拍照保存修复 2026-11-17】设备 gralloc 是 mapper@2.1（HIDL passthrough），
+ * App(Aperture/CameraX) 通过 gralloc2.1 的 GraphicBufferMapper 锁 buffer，而
+ * NVIDIA gralloc 的跨进程锁（共享内存 LockState + pthread mutex）要求所有进程
+ * 用同一套接口锁/解锁。本 HAL 之前用 gralloc0 的 gralloc_module_t->lock()，
+ * 与 App 的 gralloc2.1 锁语义不一致，导致 HAL 写 JPEG 后共享 LockState 残留
+ * 为 -1，App 侧 AcquireBufferLock 永远超时（拍照卡死、无法保存）。改用
+ * GraphicBufferMapper（走 mapper@2.1，与 App 一致）后锁状态正确配对。 */
+#include <ui/GraphicBufferMapper.h>
+#include <ui/Rect.h>
 #include <system/graphics.h>
 #include <system/camera_metadata.h>
 #include <errno.h>
@@ -1061,9 +1070,11 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
 
 // Copy a captured frame from one gralloc buffer to another (same format/dimensions).
 // Used to fan a single captured frame out to every output stream (preview + video).
-static void copyFrameBetweenBuffers(const gralloc_module_t* grallocModule,
+// 【拍照保存修复 2026-11-17】改用 GraphicBufferMapper（mapper@2.1），与 App 侧
+// 锁语义一致，避免 NVIDIA 跨进程 LockState 残留。
+static void copyFrameBetweenBuffers(
         const camera3_stream_buffer_t* src, const camera3_stream_buffer_t* dst) {
-    if (!grallocModule || !src || !dst || !src->buffer || !dst->buffer) return;
+    if (!src || !dst || !src->buffer || !dst->buffer) return;
     if (src->stream->format != dst->stream->format) {
         ALOGW("copyFrameBetweenBuffers: format mismatch src=%d dst=%d",
               src->stream->format, dst->stream->format);
@@ -1076,24 +1087,26 @@ static void copyFrameBetweenBuffers(const gralloc_module_t* grallocModule,
     }
     void* srcVaddr = nullptr;
     void* dstVaddr = nullptr;
-    int ret = grallocModule->lock(grallocModule, *src->buffer, GRALLOC_USAGE_SW_READ_OFTEN,
-                                  0, 0, src->stream->width, src->stream->height, &srcVaddr);
+    const android::Rect srcRect((int)src->stream->width, (int)src->stream->height);
+    const android::Rect dstRect((int)dst->stream->width, (int)dst->stream->height);
+    int ret = android::GraphicBufferMapper::get().lock(*src->buffer,
+                GRALLOC_USAGE_SW_READ_OFTEN, srcRect, &srcVaddr);
     if (ret != 0 || !srcVaddr) {
         ALOGE("copyFrameBetweenBuffers: failed to lock src buffer: %d", ret);
         return;
     }
-    ret = grallocModule->lock(grallocModule, *dst->buffer, GRALLOC_USAGE_SW_WRITE_OFTEN,
-                              0, 0, dst->stream->width, dst->stream->height, &dstVaddr);
+    ret = android::GraphicBufferMapper::get().lock(*dst->buffer,
+                GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &dstVaddr);
     if (ret != 0 || !dstVaddr) {
-        grallocModule->unlock(grallocModule, *src->buffer);
+        android::GraphicBufferMapper::get().unlock(*src->buffer);
         ALOGE("copyFrameBetweenBuffers: failed to lock dst buffer: %d", ret);
         return;
     }
     // RGBA_8888: 4 bytes/pixel. (Both preview and video streams are RGBA_8888 here.)
     size_t size = (size_t)dst->stream->width * dst->stream->height * 4;
     memcpy(dstVaddr, srcVaddr, size);
-    grallocModule->unlock(grallocModule, *dst->buffer);
-    grallocModule->unlock(grallocModule, *src->buffer);
+    android::GraphicBufferMapper::get().unlock(*dst->buffer);
+    android::GraphicBufferMapper::get().unlock(*src->buffer);
 }
 
 static int camera_device_process_capture_request(const camera3_device_t *device, camera3_capture_request_t *request) {
@@ -1219,111 +1232,102 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         buffer_handle_t handle = *buf.buffer;
         void* vaddr = nullptr;
 
-        const gralloc_module_t* grallocModule = nullptr;
-        hw_module_t* module = nullptr;
-
-        if (hw_get_module(GRALLOC_HARDWARE_MODULE_ID, (const hw_module_t**)&module) != 0) {
-            ALOGW("Failed to get gralloc module");
-        } else {
-            grallocModule = reinterpret_cast<const gralloc_module_t*>(module);
-
-            /* BLOB format = JPEG still capture */
-            if (buf.stream->format == HAL_PIXEL_FORMAT_BLOB) {
-                /* Allocate temp RGBA buffer at pipeline resolution */
-                uint32_t rgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
-                if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
-                    if (dev->temp_rgba) free(dev->temp_rgba);
-                    dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
-                    dev->temp_rgba_size = rgbaSize;
-                }
-                if (!dev->temp_rgba) {
-                    ALOGE("Failed to allocate temp RGBA buffer");
-                } else {
-                    int captureRet = pipeline->captureFrame(dev->temp_rgba, HAL_PIXEL_FORMAT_RGBA_8888);
-                    if (captureRet == 0) {
-                        /* Lock the output blob buffer using its own dimensions */
-                        uint32_t blobW = buf.stream->width;
-                        uint32_t blobH = buf.stream->height;
-                        int ret = grallocModule->lock(grallocModule, handle,
-                                                       GRALLOC_USAGE_SW_WRITE_OFTEN,
-                                                       0, 0, blobW, blobH, &vaddr);
-                        if (ret == 0 && vaddr) {
-                            /* Initialize JPEG encoder */
-                            if (!dev->jpeg_encoder) {
-                                dev->jpeg_encoder = new mocha::JpegEncoder();
-                            }
-                            /* Encode RGBA to JPEG at pipeline resolution into blob buffer */
-                            size_t jpegSize = 0;
-                            uint32_t blobSize = blobW * blobH * 2;
-                            ret = dev->jpeg_encoder->encodeRGBA(dev->temp_rgba,
-                                                                  dev->pipeline_width, dev->pipeline_height,
-                                                                  90, (uint8_t*)vaddr, blobSize, &jpegSize);
-                            if (ret == 0 && jpegSize > 0) {
-                                /* Write camera3_jpeg_blob at the end */
-                                camera3_jpeg_blob_t blob;
-                                blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
-                                blob.jpeg_size = jpegSize;
-                                uint8_t* blobPtr = (uint8_t*)vaddr + blobSize - sizeof(blob);
-                                memcpy(blobPtr, &blob, sizeof(blob));
-                                frameCaptured = true;
-                                ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d -> %zu bytes",
-                                      dev->pipeline_width, dev->pipeline_height,
-                                      blobW, blobH, jpegSize);
-                            } else {
-                                ALOGE("JPEG encode failed: %d", ret);
-                            }
-                            grallocModule->unlock(grallocModule, handle);
-                        } else {
-                            ALOGE("Failed to lock BLOB buffer");
-                        }
-                    } else if (captureRet == -EAGAIN) {
-                        if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-                        return -EAGAIN;
-                    } else {
-                        ALOGE("Failed to capture frame for JPEG: %d", captureRet);
-                    }
-                }
-            } else if (buf.stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
-                struct android_ycbcr ycbcr;
-                memset(&ycbcr, 0, sizeof(ycbcr));
-                int ret = grallocModule->lock_ycbcr(grallocModule, handle,
-                                                   GRALLOC_USAGE_SW_WRITE_OFTEN,
-                                                   0, 0, buf.stream->width, buf.stream->height, &ycbcr);
-                if (ret == 0 && ycbcr.y) {
-                    int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(ycbcr.y), buf.stream->format);
-                    if (captureRet == 0) {
-                        frameCaptured = true;
-                    } else if (captureRet == -EAGAIN) {
-                        grallocModule->unlock(grallocModule, handle);
-                        if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-                        return -EAGAIN;
-                    }
-                    grallocModule->unlock(grallocModule, handle);
-                }
+        /* BLOB format = JPEG still capture */
+        if (buf.stream->format == HAL_PIXEL_FORMAT_BLOB) {
+            /* Allocate temp RGBA buffer at pipeline resolution */
+            uint32_t rgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
+            if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
+                if (dev->temp_rgba) free(dev->temp_rgba);
+                dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
+                dev->temp_rgba_size = rgbaSize;
+            }
+            if (!dev->temp_rgba) {
+                ALOGE("Failed to allocate temp RGBA buffer");
             } else {
-                int usage = GRALLOC_USAGE_SW_WRITE_OFTEN;
-                int ret = grallocModule->lock(grallocModule, handle, usage,
-                                              0, 0, buf.stream->width, buf.stream->height, &vaddr);
-                if (ret == 0 && vaddr) {
-                    int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(vaddr), buf.stream->format);
-                    if (captureRet == 0) {
-                        frameCaptured = true;
-                    } else if (captureRet == -EAGAIN) {
-                        grallocModule->unlock(grallocModule, handle);
-                        if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-                        return -EAGAIN;
+                int captureRet = pipeline->captureFrame(dev->temp_rgba, HAL_PIXEL_FORMAT_RGBA_8888);
+                if (captureRet == 0) {
+                    /* Lock the output blob buffer using its own dimensions */
+                    uint32_t blobW = buf.stream->width;
+                    uint32_t blobH = buf.stream->height;
+                    const android::Rect blobRect((int)blobW, (int)blobH);
+                    int ret = android::GraphicBufferMapper::get().lock(handle,
+                                   GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr);
+                    if (ret == 0 && vaddr) {
+                        /* Initialize JPEG encoder */
+                        if (!dev->jpeg_encoder) {
+                            dev->jpeg_encoder = new mocha::JpegEncoder();
+                        }
+                        /* Encode RGBA to JPEG at pipeline resolution into blob buffer */
+                        size_t jpegSize = 0;
+                        uint32_t blobSize = blobW * blobH * 2;
+                        ret = dev->jpeg_encoder->encodeRGBA(dev->temp_rgba,
+                                                              dev->pipeline_width, dev->pipeline_height,
+                                                              90, (uint8_t*)vaddr, blobSize, &jpegSize);
+                        if (ret == 0 && jpegSize > 0) {
+                            /* Write camera3_jpeg_blob at the end */
+                            camera3_jpeg_blob_t blob;
+                            blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
+                            blob.jpeg_size = jpegSize;
+                            uint8_t* blobPtr = (uint8_t*)vaddr + blobSize - sizeof(blob);
+                            memcpy(blobPtr, &blob, sizeof(blob));
+                            frameCaptured = true;
+                            ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d -> %zu bytes",
+                                  dev->pipeline_width, dev->pipeline_height,
+                                  blobW, blobH, jpegSize);
+                        } else {
+                            ALOGE("JPEG encode failed: %d", ret);
+                        }
+                        android::GraphicBufferMapper::get().unlock(handle);
+                    } else {
+                        ALOGE("Failed to lock BLOB buffer: %d", ret);
                     }
-                    grallocModule->unlock(grallocModule, handle);
+                } else if (captureRet == -EAGAIN) {
+                    if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
+                    return -EAGAIN;
+                } else {
+                    ALOGE("Failed to capture frame for JPEG: %d", captureRet);
                 }
             }
-
-            // Fan the captured frame out to every other output stream (preview + video).
-            // The framework configures TWO output streams during recording (preview + video);
-            // we only captured into output_buffers[0], so copy it to the rest.
-            if (frameCaptured && buf.stream->format != HAL_PIXEL_FORMAT_BLOB) {
-                for (uint32_t i = 1; i < request->num_output_buffers; i++) {
-                    copyFrameBetweenBuffers(grallocModule, &buf, &request->output_buffers[i]);
+        } else if (buf.stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+            struct android_ycbcr ycbcr;
+            memset(&ycbcr, 0, sizeof(ycbcr));
+            const android::Rect yuvRect((int)buf.stream->width, (int)buf.stream->height);
+            int ret = android::GraphicBufferMapper::get().lockYCbCr(handle,
+                               GRALLOC_USAGE_SW_WRITE_OFTEN, yuvRect, &ycbcr);
+            if (ret == 0 && ycbcr.y) {
+                int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(ycbcr.y), buf.stream->format);
+                if (captureRet == 0) {
+                    frameCaptured = true;
+                } else if (captureRet == -EAGAIN) {
+                    android::GraphicBufferMapper::get().unlock(handle);
+                    if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
+                    return -EAGAIN;
                 }
+                android::GraphicBufferMapper::get().unlock(handle);
+            }
+        } else {
+            int usage = GRALLOC_USAGE_SW_WRITE_OFTEN;
+            const android::Rect rect((int)buf.stream->width, (int)buf.stream->height);
+            int ret = android::GraphicBufferMapper::get().lock(handle, usage, rect, &vaddr);
+            if (ret == 0 && vaddr) {
+                int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(vaddr), buf.stream->format);
+                if (captureRet == 0) {
+                    frameCaptured = true;
+                } else if (captureRet == -EAGAIN) {
+                    android::GraphicBufferMapper::get().unlock(handle);
+                    if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
+                    return -EAGAIN;
+                }
+                android::GraphicBufferMapper::get().unlock(handle);
+            }
+        }
+
+        // Fan the captured frame out to every other output stream (preview + video).
+        // The framework configures TWO output streams during recording (preview + video);
+        // we only captured into output_buffers[0], so copy it to the rest.
+        if (frameCaptured && buf.stream->format != HAL_PIXEL_FORMAT_BLOB) {
+            for (uint32_t i = 1; i < request->num_output_buffers; i++) {
+                copyFrameBetweenBuffers(&buf, &request->output_buffers[i]);
             }
         }
     }

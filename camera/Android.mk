@@ -26,7 +26,7 @@ LOCAL_SRC_FILES := \
     isp/ColorConvNEON.cpp
 
 LOCAL_SHARED_LIBRARIES := \
-    libhardware liblog libcamera_metadata libutils libjpeg libdl libc++
+    libhardware liblog libcamera_metadata libutils libjpeg libdl libc++ libui
 
 LOCAL_STATIC_LIBRARIES := libbase
 
@@ -36,6 +36,7 @@ LOCAL_C_INCLUDES += \
     frameworks/native/include \
     frameworks/native/include/media/openmax \
     frameworks/native/libs/nativebase/include \
+    frameworks/native/libs/ui/include \
     system/core/include \
     system/core/base/include \
     system/media/camera/include \
