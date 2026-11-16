@@ -1,0 +1,57 @@
+diff --git a/media/libstagefright/colorconversion/SoftwareRenderer.cpp b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+index 2409315..c78444a 100644
+--- a/media/libstagefright/colorconversion/SoftwareRenderer.cpp
++++ b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+@@ -276,14 +276,49 @@ std::list<FrameRenderTracker::Info> SoftwareRenderer::render(
+ 
+     void *dst = NULL;
+     struct android_ycbcr ycbcr;
++    memset(&ycbcr, 0, sizeof(ycbcr));
+     if ( !mConverter &&
+          (mColorFormat == OMX_COLOR_FormatYUV420Planar ||
+          mColorFormat == OMX_COLOR_FormatYUV420SemiPlanar ||
+          mColorFormat == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar ||
+          mColorFormat == OMX_COLOR_FormatYUV420Planar16)) {
+-        CHECK_EQ(0, mapper.lockYCbCr(buf->handle,
+-                GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,
+-                bounds, &ycbcr));
++        const uint32_t usage =
++                GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY;
++        status_t lockError = mapper.lockYCbCr(buf->handle, usage, bounds, &ycbcr);
++        if (lockError != NO_ERROR) {
++            // mocha (NVIDIA Tegra K1 / TN8) adaptation:
++            // gralloc.tegra.so on this device does export NvGrLock_ycbcr, but
++            // for YV12 buffers it returns -ENOSYS (-38) outright ("Locking for
++            // SW use not supported (unknown shadow format)"), so the original
++            // CHECK_EQ aborts and Gallery crashes on any software-decoded video.
++            //
++            // Measured: this gralloc can only allocate YV12 at all -
++            // YCbCr_420_888 / NV12 / NV21 already fail to allocate, while a plain
++            // single-plane lock() works fine on YV12. So degrade to single-plane
++            // lock plus a manually derived Y/Cb/Cr layout: no crash, zero-copy kept.
++            ALOGW("lockYCbCr failed (%d), falling back to single-plane lock + "
++                  "manual YV12 layout", lockError);
++
++            uint8_t *base = NULL;
++            lockError = mapper.lock(buf->handle, usage, bounds,
++                                    reinterpret_cast<void **>(&base));
++            CHECK_EQ(NO_ERROR, lockError);   // no fallback if this one fails too
++
++            // HAL_PIXEL_FORMAT_YV12 memory layout (stride/height are aligned):
++            //   [ Y plane: yStride * height ]
++            //   [ V plane: cStride * (height/2) ]   <- YV12 stores V before U
++            //   [ U plane: cStride * (height/2) ]
++            const size_t yStride = buf->stride;
++            const size_t cStride = yStride / 2;
++            const size_t cPlaneSize = cStride * (buf->height / 2);
++
++            ycbcr.y = base;
++            ycbcr.cr = base + yStride * buf->height;            // V
++            ycbcr.cb = base + yStride * buf->height + cPlaneSize; // U
++            ycbcr.ystride = yStride;
++            ycbcr.cstride = cStride;
++            ycbcr.chroma_step = 1;   // planar, chroma step is one byte
++        }
+     } else {
+         CHECK_EQ(0, mapper.lock(buf->handle,
+                 GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,

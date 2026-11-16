@@ -1,0 +1,20 @@
+diff --git a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+index 3d138f730..3848cd79d 100644
+--- a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
++++ b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+@@ -2397,3 +2397,15 @@ bool HWC2On1Adapter::prepareAllDisplays() {
+         auto displayId = mHwc1DisplayMap[hwc1Id];
+         auto& display = mDisplays[displayId];
++        // HWC1 stores the framebuffer client target at the final layer when
++        // present. Release an acquire fence left behind by prepare(); guard
++        // the lookup because an empty layer list has no final layer.
++        const size_t numLayers = mHwc1Contents[hwc1Id]->numHwLayers;
++        if (numLayers > 0) {
++            auto& clientTargetLayer = mHwc1Contents[hwc1Id]->hwLayers[numLayers - 1];
++            if (clientTargetLayer.compositionType == HWC_FRAMEBUFFER_TARGET &&
++                    clientTargetLayer.acquireFenceFd != -1) {
++                close(clientTargetLayer.acquireFenceFd);
++                clientTargetLayer.acquireFenceFd = -1;
++            }
++        }
+         display->generateChanges();
