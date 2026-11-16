@@ -26,12 +26,15 @@ on post-fs-data
     chmod 0644 /sys/devices/platform/host1x/tegradc.0/color_filter
     chmod 0644 /sys/devices/platform/host1x/tegradc.0/color_filter_rgb
 
+    chown system system /dev/sysmatdrv
+    chmod 0660 /dev/sysmatdrv
+
 on init
     # Mount a tmpfs into /mnt/tmp for hosting nvram, phs shared memory
     mkdir /mnt/tmp 0770 system system
     mount tmpfs tmpfs /mnt/tmp mode=0775,gid=1003
 
-    setprop sys.esrd.powermon_path /sys/bus/i2c/devices/1-0040/iio_device
+    setprop sys.esrd.powermon_path /sys/bus/i2c/devices/1-0008/iio_device
     setprop sys.esrd.powermon_channel 0
     setprop sys.esrd.min_esr 95
     setprop sys.esrd.max_esr 160
@@ -55,7 +58,7 @@ on fs
     mount_all  /vendor/etc/fstab.tn8
     swapon_all /vendor/etc/fstab.tn8
 
-on property:dev.bootcomplete=1
+on property:sys.boot_completed=1
     start vendor.init_renderer
 
 service vendor.init_renderer /vendor/bin/init.renderer.sh
@@ -63,7 +66,7 @@ service vendor.init_renderer /vendor/bin/init.renderer.sh
     oneshot
 
 on boot
-    #change vm memory parameter
+    # change vm memory parameter
     write /proc/sys/vm/lowmem_reserve_ratio "128 128"
 
 on post-fs
@@ -80,3 +83,9 @@ on property:sys.boot_completed=1
 on property:apexd.status=ready
     mount none /system/etc/swcodec/ld.config.txt /apex/com.android.media.swcodec/etc/ld.config.txt bind
 
+on property:ro.radio.noril=true
+    exec -- pm disable com.android.messaging
+
+# Ensure Settings app can open: mark device as provisioned (setup wizard is skipped on this device)
+on property:sys.boot_completed=1
+    exec -- /system/bin/settings put global device_provisioned 1
