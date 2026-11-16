@@ -1,0 +1,67 @@
+diff --git a/service/java/com/android/server/wifi/hal/WifiHalHidlImpl.java b/service/java/com/android/server/wifi/hal/WifiHalHidlImpl.java
+index 114a494..1c2ac88 100644
+--- a/service/java/com/android/server/wifi/hal/WifiHalHidlImpl.java
++++ b/service/java/com/android/server/wifi/hal/WifiHalHidlImpl.java
+@@ -230,6 +230,33 @@ public class WifiHalHidlImpl implements IWifiHal {
+ 
+     private boolean registerHalCallback() {
+         final String methodStr = "registerHalCallback";
++        /*
++         * [mocha] Return early when mWifi is null instead of dereferencing it.
++         *
++         * This method has two call paths:
++         *   1. registerEventCallback -> validateAndCall -> here (mWifi null-checked)
++         *   2. initWifiIfNecessaryLocked -> here (bypasses validateAndCall)
++         *
++         * On path 2, if the preceding stopInternal("stop") throws RemoteException,
++         * handleRemoteException() sets mWifi to null. mWifi is a HIDL proxy for
++         * V1_0.IWifi, and at that moment the HAL is crashing or restarting (the
++         * bcmdhd wifi_cleanup here holds a dangling callback pointer and SIGSEGVs
++         * on every stop), so mWifi.registerEventCallback(...) then throws an NPE.
++         *
++         * The consequences are amplified: every public method of this class runs
++         * on system_server's WifiHandlerThread. An uncaught NPE propagates out of
++         * the message loop into AndroidRuntime, and "FATAL EXCEPTION IN SYSTEM
++         * PROCESS" kills system_server. Zygote forks again and the boot animation
++         * replays - exactly the "boot animation loop" the user observes.
++         *
++         * After the fix: repeated HAL crashes only make Wi-Fi temporarily
++         * unusable, they no longer take system_server down. The framework side
++         * retries automatically when the service registers again.
++         */
++        if (mWifi == null) {
++            Log.e(TAG, "Cannot register HAL callback because mWifi is null");
++            return false;
++        }
+         try {
+             android.hardware.wifi.V1_5.IWifi wifi15 = getWifiV1_5Mockable();
+             WifiStatus status;
+@@ -424,6 +451,28 @@ public class WifiHalHidlImpl implements IWifiHal {
+ 
+             // Stop wifi just in case. Stop will invalidate the callbacks, so re-register them.
+             stopInternal("stop");
++            /*
++             * [mocha] stopInternal may already have nulled mWifi - do not go on.
++             *
++             * stopInternal calls mWifi.stop(); if that throws RemoteException the
++             * call goes through handleRemoteException(), which does mWifi = null.
++             * registerHalCallback() and getVersion() below still need mWifi, so
++             * calling them on the null reference is an NPE -> system_server crash.
++             *
++             * Typical trigger (reproducible on this device): wifi_cleanup in the
++             * vendor libwifi-hal holds a dangling callback pointer and segfaults
++             * on stop, so the HIDL side receives a RemoteException. init then
++             * restarts the HAL, mServiceNotificationCallback comes in again, and
++             * the cycle "crash -> restart -> NPE -> system_server dies" repeats.
++             *
++             * Returning here simply waits for the next registration
++             * notification: mWifi stays null, isInitializationComplete() returns
++             * false and callers see "HAL not ready" - far safer than a crash.
++             */
++            if (mWifi == null) {
++                Log.e(TAG, "IWifi became null after stop - will retry on next registration");
++                return;
++            }
+             registerHalCallback();
+             Log.i(TAG, "mWifi was retrieved. HAL is running version " + getVersion());
+         } catch (RemoteException e) {
