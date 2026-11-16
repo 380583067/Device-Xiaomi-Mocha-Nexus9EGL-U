@@ -789,11 +789,12 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
 
     pipelineConfig.enableISP = true;
 
-     /* 【画面灰蒙蒙修复 2026-11-16】blackLevel 恢复为 IMX179 的实际黑电平。
-      * raw10_to_8bit 里做 (v>>2)-blackLevel，即 8-bit 刻度。IMX179 10-bit
-      * 黑电平约 240~256（数据手册典型 256），对应 8-bit 约 64。之前 DEBUG
-      * 期间写 0 导致暗部抬升、整图低对比发灰。 */
-     pipelineConfig.blackLevel = 64;
+     /* 【画面全黑修复 2026-11-16】blackLevel 单位是 raw10_to_8bit 输出的
+      * 8-bit 刻度（代码里 v>>2 之后才减）。IMX179 10-bit 黑电平典型 64
+      * （10-bit 域），换算到 8-bit 是 64/4=16。上一轮误把 10-bit 的 64
+      * 直接填进来，而夜间画面均值 239(10-bit)=59(8-bit)<64，被饱和减法
+      * 钳到 0，整幅预览全黑（AE luma=0.00）。改为 16。 */
+     pipelineConfig.blackLevel = 16;
      pipelineConfig.wbGain[0] = 1.0f;  // R gain
      pipelineConfig.wbGain[1] = 1.0f;  // G gain
      pipelineConfig.wbGain[2] = 1.0f;  // B gain
