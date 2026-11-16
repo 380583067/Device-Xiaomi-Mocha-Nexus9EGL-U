@@ -1,0 +1,86 @@
+//
+// Copyright (C) 2014 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+/*
+ * FIX NOTE (FM, 2026-11-16):
+ *
+ * This module used to live in Android.mk in the same directory (LOCAL_MODULE := libfmjni,
+ * LOCAL_VENDOR_MODULE := true). That no longer works on Android 14, because
+ * packages/apps/FMRadio/Android.bp contains:
+ *
+ *     android_app {
+ *         name: "FMRadio",
+ *         jni_libs: ["libfmjni"],
+ *         ...
+ *     }
+ *
+ * jni_libs is a *Soong* property and only resolves Soong modules. Make modules (Android.mk)
+ * are invisible to jni_libs, which fails immediately with:
+ *
+ *     error: packages/apps/FMRadio/Android.bp: FMRadio depends on
+ *            undefined module "libfmjni"
+ *
+ * This is the real reason BOARD_HAVE_BCM_FM had to be forced to false in BoardConfig.mk.
+ *
+ * Meanwhile packages/apps/FMRadio/jni/fmr/Android.bp ships an *MTK* variant of
+ * libfmjni (for MediaTek FM chips, completely incompatible with our Broadcom BCM4354).
+ * Both share the same name and are isolated by soong namespace:
+ *   - that directory declares soong_namespace {}, so it is only visible when
+ *     vendor/lineage/config/BoardConfigSoong.mk adds packages/apps/FMRadio/jni/fmr
+ *   - BoardConfig.mk sets BOARD_HAVE_MTK_FM := true to disable that branch, so the MTK
+ *     build is excluded and the libfmjni in this file becomes the only one.
+ *
+ * Install location is /system/lib (vendor: true is not set):
+ *   1) FMRadio is a platform-signed system app, and jni_libs may only reference libraries
+ *      visible to platform; vendor libraries are not (check_platform_availability fails).
+ *   2) libfmjni dlopens libfmradio.v4l2-fm.so at runtime using a path hardcoded to its own
+ *      directory, so both must be in /system/lib for the app process classloader-namespace
+ *      to reach them (permitted.paths of the app namespace includes /system/lib but not
+ *      necessarily /vendor/lib; cross-namespace loads are rejected as "not accessible for the namespace").
+ */
+cc_library_shared {
+    name: "libfmjni",
+
+    srcs: [
+        "android_fm.cpp",
+        "android_fmradio_Receiver.cpp",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        // android_fm.cpp scans this directory for libfmradio.<variant>.so, so this
+        // must match the install location of libfmradio.v4l2-fm.
+        "-DLIBRARY_PATH=\"/system/lib/\"",
+    ],
+
+    header_libs: [
+        "jni_headers",
+        "libnativehelper_header_only",
+    ],
+
+    shared_libs: [
+        "liblog",
+        "libnativehelper",
+    ],
+
+    // libfmradio.v4l2-fm is loaded by dlopen rather than linked, but it must still be installed.
+    required: [
+        "libfmradio.v4l2-fm",
+        "brcm-uim-sysfs",
+    ],
+}

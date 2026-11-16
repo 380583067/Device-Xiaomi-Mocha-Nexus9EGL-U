@@ -24,4 +24,3 @@
 #define BTA_DM_COD {0x5A, 0x01, 0x10}
 
 #endif
-
