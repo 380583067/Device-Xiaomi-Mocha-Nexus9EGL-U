@@ -1,0 +1,107 @@
+diff --git a/quickstep/src/com/android/quickstep/OverviewCommandHelper.java b/quickstep/src/com/android/quickstep/OverviewCommandHelper.java
+index b555bf7..0dbacfe 100644
+--- a/quickstep/src/com/android/quickstep/OverviewCommandHelper.java
++++ b/quickstep/src/com/android/quickstep/OverviewCommandHelper.java
+@@ -25,7 +25,6 @@ import android.content.Intent;
+ import android.graphics.PointF;
+ import android.os.SystemClock;
+ import android.os.Trace;
+-import android.view.KeyEvent;
+ import android.view.View;
+ 
+ import androidx.annotation.BinderThread;
+@@ -71,7 +70,6 @@ public class OverviewCommandHelper {
+     private final TouchInteractionService mService;
+     private final OverviewComponentObserver mOverviewComponentObserver;
+     private final TaskAnimationManager mTaskAnimationManager;
+-    private final SystemUiProxy mSystemUiProxy;
+     private final ArrayList<CommandInfo> mPendingCommands = new ArrayList<>();
+ 
+     /**
+@@ -91,12 +89,10 @@ public class OverviewCommandHelper {
+ 
+     public OverviewCommandHelper(TouchInteractionService service,
+             OverviewComponentObserver observer,
+-            TaskAnimationManager taskAnimationManager,
+-            SystemUiProxy systemUiProxy) {
++            TaskAnimationManager taskAnimationManager) {
+         mService = service;
+         mOverviewComponentObserver = observer;
+         mTaskAnimationManager = taskAnimationManager;
+-        mSystemUiProxy = systemUiProxy;
+     }
+ 
+     /**
+@@ -234,7 +230,10 @@ public class OverviewCommandHelper {
+                 case TYPE_HOME:
+                     ActiveGestureLog.INSTANCE.addLog(
+                             "OverviewCommandHelper.executeCommand(TYPE_HOME)");
+-                    mSystemUiProxy.onKeyEvent(KeyEvent.KEYCODE_HOME);
++                    // Launch the currently resolved home activity for this user.
++                    OverviewComponentObserver.startHomeIntentSafely(mService,
++                            mOverviewComponentObserver.getHomeIntent(), null,
++                            "OverviewCommandHelper.executeCommand(TYPE_HOME)");
+                     return true;
+                 case TYPE_SHOW:
+                     // When Recents is not currently visible, the command's type is TYPE_SHOW
+diff --git a/quickstep/src/com/android/quickstep/QuickstepProcessInitializer.java b/quickstep/src/com/android/quickstep/QuickstepProcessInitializer.java
+index 61f6be2..d4b27d7 100644
+--- a/quickstep/src/com/android/quickstep/QuickstepProcessInitializer.java
++++ b/quickstep/src/com/android/quickstep/QuickstepProcessInitializer.java
+@@ -83,8 +83,18 @@ public class QuickstepProcessInitializer extends MainProcessInitializer {
+         // Get the allowed mime types from the resources.
+         Set<String> allowedMimeTypes = Set.of(context.getResources().getStringArray(
+                 R.array.allowed_image_mime_types));
+-        ImageDecoder.setDefaultProcessListener(
+-                new LauncherProcessImageListener(maxMemoryBytes, allowedMimeTypes));
++        ImageDecoder.OnHeaderDecodedListener listener =
++                new LauncherProcessImageListener(maxMemoryBytes, allowedMimeTypes);
++        try {
++            // Android 14 supports listeners per decode; newer platform releases may expose a
++            // process-wide hook. Resolve that optional API at runtime to keep both versions usable.
++            ImageDecoder.class.getMethod("setDefaultProcessListener",
++                    ImageDecoder.OnHeaderDecodedListener.class).invoke(null, listener);
++        } catch (NoSuchMethodException e) {
++            Log.i(TAG, "ImageDecoder has no process-wide listener hook on this platform");
++        } catch (ReflectiveOperationException e) {
++            Log.w(TAG, "Unable to configure the process-wide image decoder listener", e);
++        }
+     }
+ 
+ }
+diff --git a/quickstep/src/com/android/quickstep/SystemUiProxy.java b/quickstep/src/com/android/quickstep/SystemUiProxy.java
+index b5454cb..24db2ed 100644
+--- a/quickstep/src/com/android/quickstep/SystemUiProxy.java
++++ b/quickstep/src/com/android/quickstep/SystemUiProxy.java
+@@ -210,17 +210,6 @@ public class SystemUiProxy implements ISystemUiProxy, NavHandle {
+         }
+     }
+ 
+-    @Override
+-    public void onKeyEvent(int keycode) {
+-        if (mSystemUiProxy != null) {
+-            try {
+-                mSystemUiProxy.onKeyEvent(keycode);
+-            } catch (RemoteException e) {
+-                Log.w(TAG, "Failed call onKeyEvent", e);
+-            }
+-        }
+-    }
+-
+     @Override
+     public void onImeSwitcherPressed() {
+         if (mSystemUiProxy != null) {
+diff --git a/quickstep/src/com/android/quickstep/TouchInteractionService.java b/quickstep/src/com/android/quickstep/TouchInteractionService.java
+index b088c01..b43c520 100644
+--- a/quickstep/src/com/android/quickstep/TouchInteractionService.java
++++ b/quickstep/src/com/android/quickstep/TouchInteractionService.java
+@@ -550,8 +550,7 @@ public class TouchInteractionService extends Service {
+         mTaskAnimationManager = new TaskAnimationManager(this);
+         mOverviewComponentObserver = new OverviewComponentObserver(this, mDeviceState);
+         mOverviewCommandHelper = new OverviewCommandHelper(this,
+-                mOverviewComponentObserver, mTaskAnimationManager,
+-                SystemUiProxy.INSTANCE.get(this));
++                mOverviewComponentObserver, mTaskAnimationManager);
+         mResetGestureInputConsumer = new ResetGestureInputConsumer(
+                 mTaskAnimationManager, mTaskbarManager::getCurrentActivityContext);
+         mInputConsumer.registerInputConsumer();

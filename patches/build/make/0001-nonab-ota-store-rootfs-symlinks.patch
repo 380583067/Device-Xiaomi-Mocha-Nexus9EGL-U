@@ -1,0 +1,15 @@
+diff --git a/tools/releasetools/non_ab_ota.py b/tools/releasetools/non_ab_ota.py
+index 6cd01e4..bb0c67d 100644
+--- a/tools/releasetools/non_ab_ota.py
++++ b/tools/releasetools/non_ab_ota.py
+@@ -605,7 +605,9 @@ def GenerateNonAbOtaPackage(target_file, output_file, source_file=None):
+       tmpfile = common.MakeTempFile(suffix=".zip")
+       os.unlink(tmpfile)
+       common.RunAndCheckOutput(
+-          ["zip", tmpfile, "-r", ".", "-0"], cwd=target_file)
++          # Preserve the ramdisk's /d -> /sys/kernel/debug symlink instead of
++          # recursively archiving the build host's mounted debugfs contents.
++          ["zip", tmpfile, "-r", "-y", ".", "-0"], cwd=target_file)
+       assert zipfile.is_zipfile(tmpfile)
+       target_file = tmpfile
+ 

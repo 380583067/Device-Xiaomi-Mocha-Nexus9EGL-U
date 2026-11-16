@@ -1,0 +1,26 @@
+diff --git a/core/res/res/values/config.xml b/core/res/res/values/config.xml
+index 0a4fc6515..9f994c0ba 100644
+--- a/core/res/res/values/config.xml
++++ b/core/res/res/values/config.xml
+@@ -5547,6 +5547,9 @@
+     <string-array name="config_restrictedImagesServices" translatable="false"/>
+ 
+     <string name="config_biometric_prompt_ui_package">com.android.systemui</string>
++    <!-- Packages that Settings protects from disable, force-stop and update removal. Device
++         overlays can add package names; the Android default is an empty list. -->
++    <string-array name="config_biometric_protected_package_names" translatable="false" />
+     <!-- List of biometric sensors on the device, in decreasing strength. Consumed by AuthService
+          when registering authenticators with BiometricService. Format must be ID:Modality:Strength,
+          where: IDs are unique per device, Modality as defined in BiometricAuthenticator.java,
+diff --git a/core/res/res/values/symbols.xml b/core/res/res/values/symbols.xml
+index a1804672d..0345bad16 100644
+--- a/core/res/res/values/symbols.xml
++++ b/core/res/res/values/symbols.xml
+@@ -2773,6 +2773,7 @@
+   <java-symbol type="string" name="face_error_security_update_required" />
+ 
+   <java-symbol type="string" name="config_biometric_prompt_ui_package" />
++  <java-symbol type="array" name="config_biometric_protected_package_names" />
+   <java-symbol type="array" name="config_biometric_sensors" />
+   <java-symbol type="bool" name="allow_test_udfps" />
+   <java-symbol type="array" name="config_udfps_sensor_props" />

@@ -1,0 +1,43 @@
+diff --git a/java/src/com/android/intentresolver/IntentForwarderActivity.java b/java/src/com/android/intentresolver/IntentForwarderActivity.java
+index 2a957d6..821a141 100644
+--- a/java/src/com/android/intentresolver/IntentForwarderActivity.java
++++ b/java/src/com/android/intentresolver/IntentForwarderActivity.java
+@@ -142,10 +142,9 @@ public class IntentForwarderActivity extends Activity  {
+         }
+ 
+         newIntent.prepareToLeaveUser(callingUserId);
++        // Android 14's PackageManager API derives the resolved type from the Intent itself.
+         final CompletableFuture<ResolveInfo> targetResolveInfoFuture =
+-                mInjector.resolveActivityAsUser(newIntent, resolvedType,
+-                        MATCH_DEFAULT_ONLY,
+-                        targetUserId);
++                mInjector.resolveActivityAsUser(newIntent, MATCH_DEFAULT_ONLY, targetUserId);
+         targetResolveInfoFuture
+                 .thenApplyAsync(targetResolveInfo -> {
+                     if (isResolverActivityResolveInfo(targetResolveInfo)) {
+@@ -426,15 +425,6 @@ public class IntentForwarderActivity extends Activity  {
+             return IntentForwarderActivity.this.getPackageManager();
+         }
+ 
+-        @Override
+-        @Nullable
+-        public CompletableFuture<ResolveInfo> resolveActivityAsUser(Intent intent,
+-                String resolvedType, int flags, int userId) {
+-            return CompletableFuture.supplyAsync(
+-                    () -> getPackageManager().resolveActivityAsUser(intent,
+-                            resolvedType, flags, userId));
+-        }
+-
+         @Override
+         @Nullable
+         public CompletableFuture<ResolveInfo> resolveActivityAsUser(Intent intent, int flags,
+@@ -456,9 +446,6 @@ public class IntentForwarderActivity extends Activity  {
+ 
+         PackageManager getPackageManager();
+ 
+-        CompletableFuture<ResolveInfo> resolveActivityAsUser(Intent intent,
+-                String resolvedType, int flags, int userId);
+-
+         CompletableFuture<ResolveInfo> resolveActivityAsUser(Intent intent, int flags, int userId);
+ 
+         void showToast(String message, int duration);

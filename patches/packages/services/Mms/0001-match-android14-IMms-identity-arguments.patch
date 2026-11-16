@@ -1,0 +1,65 @@
+diff --git a/src/com/android/mms/service/MmsService.java b/src/com/android/mms/service/MmsService.java
+index 5d9621a..f84e2b2 100644
+--- a/src/com/android/mms/service/MmsService.java
++++ b/src/com/android/mms/service/MmsService.java
+@@ -214,11 +214,14 @@ public class MmsService extends Service implements MmsRequest.RequestManager {
+ 
+     private IMms.Stub mStub = new IMms.Stub() {
+         @Override
+-        public void sendMessage(int subId, int callingUser, String callingPkg,
++        public void sendMessage(int subId, String callingPkg,
+                 Uri contentUri, String locationUrl, Bundle configOverrides,
+                 PendingIntent sentIntent, long messageId, String attributionTag) {
+             LogUtil.d("sendMessage " + formatCrossStackMessageId(messageId));
+             enforceSystemUid();
++            // IMms carries the caller's user in the content URI; derive it here because the
++            // Android 14 interface no longer has a separate callingUser argument.
++            int callingUser = ContentProvider.getUserIdFromUri(contentUri, UserHandle.myUserId());
+ 
+             MmsStats mmsStats = new MmsStats(MmsService.this,
+                     mMmsMetricsCollector.getAtomsStorage(), subId, getTelephonyManager(subId),
+@@ -298,7 +301,7 @@ public class MmsService extends Service implements MmsRequest.RequestManager {
+         }
+ 
+         @Override
+-        public void downloadMessage(int subId, int callingUser, String callingPkg,
++        public void downloadMessage(int subId, String callingPkg,
+                 String locationUrl, Uri contentUri, Bundle configOverrides,
+                 PendingIntent downloadedIntent, long messageId, String attributionTag) {
+             // If the subId is no longer active it could be caused by an MVNO using multiple
+@@ -308,6 +311,8 @@ public class MmsService extends Service implements MmsRequest.RequestManager {
+                     ", " + formatCrossStackMessageId(messageId));
+ 
+             enforceSystemUid();
++            // The broker embeds the originating user in contentUri before crossing this binder.
++            int callingUser = ContentProvider.getUserIdFromUri(contentUri, UserHandle.myUserId());
+ 
+             MmsStats mmsStats = new MmsStats(MmsService.this,
+                     mMmsMetricsCollector.getAtomsStorage(), subId, getTelephonyManager(subId),
+@@ -441,10 +446,11 @@ public class MmsService extends Service implements MmsRequest.RequestManager {
+         }
+ 
+         @Override
+-        public Uri importMultimediaMessage(int callingUser, String callingPkg,
++        public Uri importMultimediaMessage(String callingPkg,
+                 Uri contentUri, String messageId, long timestampSecs, boolean seen, boolean read) {
+             LogUtil.d("importMultimediaMessage");
+             enforceSystemUid();
++            int callingUser = ContentProvider.getUserIdFromUri(contentUri, UserHandle.myUserId());
+             return importMms(contentUri, messageId, timestampSecs, seen,
+                 read, callingUser, callingPkg);
+         }
+@@ -536,10 +542,11 @@ public class MmsService extends Service implements MmsRequest.RequestManager {
+         }
+ 
+         @Override
+-        public Uri addMultimediaMessageDraft(int callingUser,
+-                String callingPkg, Uri contentUri) throws RemoteException {
++        public Uri addMultimediaMessageDraft(String callingPkg, Uri contentUri)
++                throws RemoteException {
+             LogUtil.d("addMultimediaMessageDraft");
+             enforceSystemUid();
++            int callingUser = ContentProvider.getUserIdFromUri(contentUri, UserHandle.myUserId());
+             return addMmsDraft(contentUri, callingUser, callingPkg);
+         }
+ 

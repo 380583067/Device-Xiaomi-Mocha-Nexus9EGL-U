@@ -1,0 +1,48 @@
+diff --git a/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminAdd.java b/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminAdd.java
+index ae95559..078a2db 100644
+--- a/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminAdd.java
++++ b/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminAdd.java
+@@ -645,7 +645,7 @@ public class DeviceAdminAdd extends CollapsingToolbarBaseActivity {
+         mAdminName.setText(mDeviceAdmin.loadLabel(getPackageManager()));
+         try {
+             mAdminDescription.setText(
+-                    mDeviceAdmin.loadDescriptionSafe(getPackageManager()));
++                    mDeviceAdmin.loadDescription(getPackageManager()));
+             mAdminDescription.setVisibility(View.VISIBLE);
+         } catch (Resources.NotFoundException e) {
+             mAdminDescription.setVisibility(View.GONE);
+diff --git a/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminListItem.java b/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminListItem.java
+index 99be343..f7dff2e 100644
+--- a/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminListItem.java
++++ b/src/com/android/settings/applications/specialaccess/deviceadmin/DeviceAdminListItem.java
+@@ -46,7 +46,7 @@ class DeviceAdminListItem implements Comparable<DeviceAdminListItem> {
+         final PackageManager pm = context.getPackageManager();
+         mName = mInfo.loadLabel(pm);
+         try {
+-            mDescription = mInfo.loadDescriptionSafe(pm);
++            mDescription = mInfo.loadDescription(pm);
+         } catch (Resources.NotFoundException exception) {
+             Log.w(TAG, "Setting description to null because can't find resource: " + mKey);
+         }
+diff --git a/src/com/android/settings/password/BiometricFragment.java b/src/com/android/settings/password/BiometricFragment.java
+index b90450c..6b80fa3 100644
+--- a/src/com/android/settings/password/BiometricFragment.java
++++ b/src/com/android/settings/password/BiometricFragment.java
+@@ -127,6 +127,7 @@ public class BiometricFragment extends InstrumentedFragment {
+         final Bundle bundle = getArguments();
+         final PromptInfo promptInfo = bundle.getParcelable(KEY_PROMPT_INFO);
+ 
++        // Android 14 PromptInfo has no confirm-credential activity class-name field.
+         BiometricPrompt.Builder promptBuilder = new BiometricPrompt.Builder(getContext())
+                 .setTitle(promptInfo.getTitle())
+                 .setUseDefaultTitle() // use default title if title is null/empty
+@@ -141,8 +142,7 @@ public class BiometricFragment extends InstrumentedFragment {
+                 .setDisallowBiometricsIfPolicyExists(
+                         promptInfo.isDisallowBiometricsIfPolicyExists())
+                 .setShowEmergencyCallButton(promptInfo.isShowEmergencyCallButton())
+-                .setReceiveSystemEvents(true)
+-                .setClassNameIfItIsConfirmDeviceCredentialActivity();
++                .setReceiveSystemEvents(true);
+ 
+         if (Flags.enableBiometricsToUnlockPrivateSpace()) {
+             promptBuilder = promptBuilder.setAllowBackgroundAuthentication(true /* allow */,
