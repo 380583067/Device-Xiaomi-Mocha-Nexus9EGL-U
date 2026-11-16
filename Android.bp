@@ -1,13 +1,10 @@
+// Soong subdirectories that contain Android.bp definitions.
+// Only directories that actually exist are listed here: a missing entry
+// makes soong abort with "cannot find directory".
 subdirs = [
-    "sensors",    
+    "sensors",
     "hidl",
     "tinyalsa",
-    "health",
-    "hardware",
+    "init",
+    "shims",
 ]
-
-cc_library_shared {
-    name: "libldacBT_bco",
-    vendor_available: true,
-    srcs: [],
-}
