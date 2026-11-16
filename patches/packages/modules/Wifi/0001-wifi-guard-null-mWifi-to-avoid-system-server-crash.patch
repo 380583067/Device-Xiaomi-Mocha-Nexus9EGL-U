@@ -7,27 +7,27 @@ index 114a494..1c2ac88 100644
      private boolean registerHalCallback() {
          final String methodStr = "registerHalCallback";
 +        /*
-+         * [mocha] Return early when mWifi is null instead of dereferencing it.
++         * [mocha] mWifi 为空时直接返回，不要解引用。
 +         *
-+         * This method has two call paths:
-+         *   1. registerEventCallback -> validateAndCall -> here (mWifi null-checked)
-+         *   2. initWifiIfNecessaryLocked -> here (bypasses validateAndCall)
++         * 本方法有两条调用路径：
++         *   1. registerEventCallback -> validateAndCall -> 这里（有 mWifi 判空）
++         *   2. initWifiIfNecessaryLocked -> 这里（绕过 validateAndCall，直接调用）
 +         *
-+         * On path 2, if the preceding stopInternal("stop") throws RemoteException,
-+         * handleRemoteException() sets mWifi to null. mWifi is a HIDL proxy for
-+         * V1_0.IWifi, and at that moment the HAL is crashing or restarting (the
-+         * bcmdhd wifi_cleanup here holds a dangling callback pointer and SIGSEGVs
-+         * on every stop), so mWifi.registerEventCallback(...) then throws an NPE.
++         * 第 2 条路径上，前面那行 stopInternal("stop") 一旦抛 RemoteException，
++         * handleRemoteException() 会把 mWifi 置为 null；而 mWifi 又是
++         * V1_0.IWifi 的 HIDL proxy，此时 HAL 正在崩溃/重启（本机 bcmdhd 的
++         * wifi_cleanup 存在野回调指针，每次 stop 都 SIGSEGV）。于是紧接着执行
++         * mWifi.registerEventCallback(...) 就是一次 NullPointerException。
 +         *
-+         * The consequences are amplified: every public method of this class runs
-+         * on system_server's WifiHandlerThread. An uncaught NPE propagates out of
-+         * the message loop into AndroidRuntime, and "FATAL EXCEPTION IN SYSTEM
-+         * PROCESS" kills system_server. Zygote forks again and the boot animation
-+         * replays - exactly the "boot animation loop" the user observes.
++         * 崩溃后果被放大了：本类所有 public 方法都由 system_server 的
++         * WifiHandlerThread 调用，NPE 没被 catch 会顺着消息循环抛到
++         * AndroidRuntime，"FATAL EXCEPTION IN SYSTEM PROCESS" 直接把
++         * system_server 打死，zygote 重新 fork，开机动画重新播一遍
++         * —— 用户看到的就是"开机动画循环"。
 +         *
-+         * After the fix: repeated HAL crashes only make Wi-Fi temporarily
-+         * unusable, they no longer take system_server down. The framework side
-+         * retries automatically when the service registers again.
++         * 修完的效果：HAL 反复崩溃只会让 Wi-Fi 暂时不可用，不再带崩
++         * system_server。上层 WifiVendorHal 会在服务重新注册时回调
++         * mServiceNotificationCallback，自动重试。
 +         */
 +        if (mWifi == null) {
 +            Log.e(TAG, "Cannot register HAL callback because mWifi is null");
@@ -41,22 +41,22 @@ index 114a494..1c2ac88 100644
              // Stop wifi just in case. Stop will invalidate the callbacks, so re-register them.
              stopInternal("stop");
 +            /*
-+             * [mocha] stopInternal may already have nulled mWifi - do not go on.
++             * [mocha] stopInternal 可能已经把 mWifi 置空，此时不能再往下走。
 +             *
-+             * stopInternal calls mWifi.stop(); if that throws RemoteException the
-+             * call goes through handleRemoteException(), which does mWifi = null.
-+             * registerHalCallback() and getVersion() below still need mWifi, so
-+             * calling them on the null reference is an NPE -> system_server crash.
++             * stopInternal 内部调用 mWifi.stop()，抛 RemoteException 时走
++             * handleRemoteException()，那里会执行 mWifi = null。之后
++             * registerHalCallback() 和 getVersion() 都还要用 mWifi，
++             * 在空引用上继续调用就是 NPE -> system_server 崩溃。
 +             *
-+             * Typical trigger (reproducible on this device): wifi_cleanup in the
-+             * vendor libwifi-hal holds a dangling callback pointer and segfaults
-+             * on stop, so the HIDL side receives a RemoteException. init then
-+             * restarts the HAL, mServiceNotificationCallback comes in again, and
-+             * the cycle "crash -> restart -> NPE -> system_server dies" repeats.
++             * 常见触发场景（本机必现）：vendor 的 libwifi-hal 里的
++             * wifi_cleanup 带着野回调指针，stop 时直接段错误，HIDL 侧收到
++             * 的就是 RemoteException。init 随后重启 HAL，
++             * mServiceNotificationCallback 再次进来，形成
++             * "崩溃 -> 重启 -> NPE -> system_server 死" 的死循环。
 +             *
-+             * Returning here simply waits for the next registration
-+             * notification: mWifi stays null, isInitializationComplete() returns
-+             * false and callers see "HAL not ready" - far safer than a crash.
++             * 直接 return：什么都不做等下一次注册通知即可，
++             * mWifi 保持 null，isInitializationComplete() 会返回 false，
++             * 上层按" HAL 未就绪"处理，比让进程崩掉安全得多。
 +             */
 +            if (mWifi == null) {
 +                Log.e(TAG, "IWifi became null after stop - will retry on next registration");

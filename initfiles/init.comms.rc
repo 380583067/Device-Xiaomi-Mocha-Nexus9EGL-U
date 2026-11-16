@@ -47,11 +47,11 @@ service dns_masq /system/bin/dnsmasq --no-daemon --no-resolv --no-poll --dhcp-op
     disabled
     oneshot
 
-# FIX NOTE: added the uim service. brcm-uim-sysfs is the userspace init module (UIM)
-# for the shared Broadcom BT/FM transport. It owns the ttyTHS2 UART and talks to the
-# Bluetooth chip (BCM4354) through /sys/devices/platform/bcm_ldisc/ sysfs; FM depends on it
-# to establish the HCI channel (BOARD_BRCM_HCI_NUM=26). The service was missing before,
-# which is why FM could not talk to the chip. Reference: Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S.
+# 修复说明：新增 uim 服务。brcm-uim-sysfs 是 Broadcom 蓝牙/FM 共享传输的
+# 用户态初始化模块（UIM），拥有 ttyTHS2 串口，通过 /sys/devices/platform/bcm_ldisc/
+# sysfs 通道与蓝牙芯片（BCM4354）通信，FM 功能依赖它建立 HCI 通道（BOARD_BRCM_HCI_NUM=26）。
+# 原先缺失此服务，导致 FM 无法与蓝牙芯片通信。参考
+# Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S 的 init.comms.rc。
 # Owns ttyTHS2 for the Broadcom Bluetooth/FM shared transport.
 service uim /vendor/bin/brcm-uim-sysfs
     class late_start

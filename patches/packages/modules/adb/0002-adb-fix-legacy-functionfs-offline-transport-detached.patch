@@ -7,28 +7,28 @@ index 244c253..b6c37aa 100644
          t->connection()->SetTransport(t);
  
 -        if (t->type == kTransportUsb
-+        // FIX: adb stayed offline forever on legacy FunctionFS devices (mocha).
++        // 修复 legacy FunctionFS 设备（如 mocha）adb 一直 offline 的 bug。
 +        //
-+        // Background: kCsDetached is a host-side libusb state used purely for
-+        // attach/detach handling, driven by usb_devices_start_detached() (which
-+        // reads ADB_LIBUSB_START_DETACHED). That function only exists when
-+        // ADB_HOST is defined; its own comment says "hence n/a on-device".
++        // 背景：kCsDetached 是 host 端 libusb 的 attach/detach 专用状态，
++        // 由 `usb_devices_start_detached()`（读取 ADB_LIBUSB_START_DETACHED 环境变量）
++        // 控制。该函数仅在有 ADB_HOST 编译时才存在，注释也明确写了
++        // "hence n/a on-device"（设备端不适用）。
 +        //
-+        // But in Android 14, #if ADB_HOST only drops
-+        // "&& usb_devices_start_detached()" from the condition, so on device
-+        // (ADB_HOST=0) the if becomes "t->type == kTransportUsb" - true for
-+        // every legacy USB transport. All of them are wrongly marked
-+        // kCsDetached: Start() never runs, so the host keeps seeing offline.
++        // 但在 Android 14 的代码里，#if ADB_HOST 只是把 `&& usb_devices_start_detached()`
++        // 从条件里删掉，导致 device 端（ADB_HOST=0）的 if 条件退化为
++        // `t->type == kTransportUsb`（对 legacy USB transport 恒为真），于是
++        // 所有 USB transport 都被错误地设为 kCsDetached，connection()->Start()
++        // 永远不会被调用，读/写线程不启动，host 端 adb 一直显示 offline。
 +        //
-+        // FIX: the device side always takes the else branch, i.e. Start() is
-+        // called; only the host enters kCsDetached, and only with libusb -d.
++        // 修复：device 端恒走 else 分支（调用 connection()->Start()），
++        // 只有 host 端启用 libusb detached 时才走 kCsDetached 分支。
 +        if (
  #if ADB_HOST
 -            && usb_devices_start_detached()  // -d setting propagated from the
 -                                             // host device, hence n/a on-device.
-+            t->type == kTransportUsb && usb_devices_start_detached()  // -d is host-only
++            t->type == kTransportUsb && usb_devices_start_detached()  // -d 选项仅 host 端有效
 +#else
-+            false  // device side (adbd) never enters the detached state
++            false  // device 端(adbd)永远不进入 detached 状态
  #endif
          ) {
              t->SetConnectionState(kCsDetached);

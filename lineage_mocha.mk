@@ -1,10 +1,8 @@
-# FIX for adb offline (critical): LineageOS provides a WITH_ADB_INSECURE switch,
-# and vendor/lineage/config/common.mk sets ro.adb.secure=0 accordingly (no
-# authorisation required). When /data/misc/adb/adb_keys is empty on the device,
-# ro.adb.secure=1 makes adbd demand authorisation, so the host side hangs in the
-# handshake and reports offline. Setting this to true disables authorisation and
-# allows direct root debugging.
-# Must be defined before inheriting common.mk.
+# 修复 adb offline（关键）：LineageOS 官方提供 WITH_ADB_INSECURE 开关，
+# vendor/lineage/config/common.mk 会据此设置 ro.adb.secure=0（免授权）。
+# 设备上 /data/misc/adb/adb_keys 为空时，ro.adb.secure=1 会让 adbd 要求授权，
+# host 端 adb 卡在授权握手、显示 offline。设为 true 即免授权、允许直接 root 调试。
+# 必须在 inherit common.mk 之前定义。
 WITH_ADB_INSECURE := true
 
 # Inherit device configuration for mocha.

@@ -1,24 +1,47 @@
 LOCAL_PATH := $(call my-dir)
 
+# ============================================================================
+# V4L2 camera HAL (Plan B) —— 自研 HAL3 实现
+# ----------------------------------------------------------------------------
+# 原厂 blob 走 NVIDIA 老式 PCL 通路（/dev/camera.pcl），在 Android 14 上
+# dlopen 成功但 I2C 探测全部超时并卡死系统（详见 BoardConfig.mk 说明）。
+# 正确路线是内核 V4L2 驱动（CONFIG_VIDEO_TEGRA_VI_V4L2 + IMX179/OV5693/
+# AD5823）+ 这里的自研 HAL：
+#   MochaCameraHAL.cpp   HAL3 设备、静态元数据、拍照控制
+#   CameraPipeline.cpp   /dev/video0 V4L2 mmap 采集 + VCM 自动对焦
+#   JpegEncoder.cpp      libjpeg-turbo 把 Bayer 转换后的帧编码成 JPEG
+#   isp/*.cpp            NEON demosaic / 色彩转换
+# 产物名必须是 camera.<ro.hardware>（= camera.tegra.so），camera provider
+# 才会以 passthrough 方式加载它。原 CameraWrapper/Camera3Wrapper 保留在
+# 源码里但不再编译。
+# ============================================================================
+
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := \
-    CameraWrapper.cpp \
-    Camera3Wrapper.cpp
+    MochaCameraHAL.cpp \
+    CameraPipeline.cpp \
+    JpegEncoder.cpp \
+    isp/DemosaicNEON.cpp \
+    isp/ColorConvNEON.cpp
 
-LOCAL_STATIC_LIBRARIES := libbase libarect
 LOCAL_SHARED_LIBRARIES := \
-    libhardware liblog  libcamera_client libutils libgui libhidltransport libcamera_metadata libsensor android.hidl.token@1.0-utils android.hardware.graphics.bufferqueue@1.0 libdl
+    libhardware liblog libcamera_metadata libutils libjpeg libdl libc++
+
+LOCAL_STATIC_LIBRARIES := libbase
 
 LOCAL_C_INCLUDES += \
+    $(LOCAL_PATH) \
+    $(LOCAL_PATH)/isp \
     frameworks/native/include \
     frameworks/native/include/media/openmax \
     frameworks/native/libs/nativebase/include \
     system/core/include \
     system/core/base/include \
     system/media/camera/include \
+    external/libjpeg-turbo
 
-LOCAL_HEADER_LIBRARIES := libnativebase_headers
+LOCAL_HEADER_LIBRARIES := libnativebase_headers libcamera_metadata_headers
 
 LOCAL_32_BIT_ONLY := true
 LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
@@ -29,54 +52,53 @@ LOCAL_MODULE_TAGS := optional
 BUILD_BROKEN_VNDK_USAGE := true
 LOCAL_PRIVATE_PLATFORM_APIS := true
 LOCAL_VENDOR_MODULE := false
-
 LOCAL_PROPRIETARY_MODULE := false
 
 include $(BUILD_SHARED_LIBRARY)
 
 # ============================================================================
-# ABI compatibility layer for the camera vendor blob (camera.vendor.tegra.so)
+# 相机 vendor blob（camera.vendor.tegra.so）的 ABI 兼容层
 # ----------------------------------------------------------------------------
-# The vendor blob was compiled in the Android 5.1 era (2015) and fails to dlopen on Android 14:
+# 原厂 blob 是 2015 年 Android 5.1 时代编译的，在 Android 14 上 dlopen 会失败：
 #   E HAL: dlopen failed: library "libcameraservice.so" not found:
 #          needed by /system/lib/hw/camera.vendor.tegra.so in namespace (default)
-# Symbol-by-symbol comparison shows three things must be supplied; see each source header:
-#   1. libcameraservice.so            -- DT_NEEDED requires the file, no symbol references
-#   2. libpowerservice_client.so      -- PowerServiceClient constructor + sendPowerHint
+# 逐符号比对后确认需要补齐 3 个东西，详见各源文件头部注释：
+#   1. libcameraservice.so            —— DT_NEEDED 要求文件存在，无符号引用
+#   2. libpowerservice_client.so      —— PowerServiceClient 构造 + sendPowerHint
 #   3. libmocha_camera_shim.so        —— CameraMetadata / Fence / SensorManager
-#                                        / ABI forwarding for libstdc++ iostream
-# libmocha_camera_shim.so is preloaded into camera.vendor.tegra.so via
-# TARGET_LD_SHIM_LIBS in BoardConfig.mk; the other two load by DT_NEEDED name.
+#                                        / libstdc++ iostream 的 ABI 转发
+# 其中 libmocha_camera_shim.so 通过 BoardConfig.mk 的 TARGET_LD_SHIM_LIBS
+# 预加载到 camera.vendor.tegra.so，另外两个靠 DT_NEEDED 名字自动加载。
 # ============================================================================
 
-# libcameraservice.so -- empty stub (only to satisfy the blob's DT_NEEDED)
+# libcameraservice.so —— 空 stub（只为满足 blob 的 DT_NEEDED）
 #
-# Why this indirection is needed:
-#   1) frameworks/av/services/camera/libcameraservice/Android.bp already defines a
-#      cc_library named "libcameraservice" (Soong module names are globally unique).
-#      Fortunately it is a static_libs of cameraserver (statically linked into the
-#      executable), so /system/lib/libcameraservice.so is never loaded at runtime and
-#      an empty library with the same SONAME hijacks no real implementation.
-#   2) build/make/core/shared_library_internal.mk:16 forbids setting LOCAL_MODULE_STEM
-#      on a SHARED_LIBRARY, so "different module name, same artifact name" is impossible.
-#   3) Hence the SONAME trick: the file is libcameraservice_mocha.so but its ELF header
-#      declares SONAME libcameraservice.so. bionic's linker looks up the soname index of
-#      already-loaded libraries first in find_library() (find_loaded_library_by_soname), so
-#      as long as this library is loaded before camera.vendor.tegra.so, the blob's
-#      DT_NEEDED "libcameraservice.so" resolves to it without a real file of that name.
-#      Load order is guaranteed by libmocha_camera_shim.so's DT_NEEDED (see
-#      LOCAL_SHARED_LIBRARIES below), and the shim is preloaded by TARGET_LD_SHIM_LIBS.
+# 为什么搞这么绕：
+#   1) frameworks/av/services/camera/libcameraservice/Android.bp 里已经有一个
+#      cc_library 叫 "libcameraservice"（Soong 模块名全局唯一，不能重名）。
+#      好在它是 cameraserver 的 static_libs（静态链接进可执行文件），运行时
+#      根本不会去加载 /system/lib/libcameraservice.so，所以造一个同名空库
+#      不会劫持任何真实实现。
+#   2) 但 build/make/core/shared_library_internal.mk:16 明确禁止给 SHARED_LIBRARY
+#      设置 LOCAL_MODULE_STEM，没法"模块名不同、产物名相同"。
+#   3) 于是用 SONAME 曲线救国：文件叫 libcameraservice_mocha.so，但 ELF 头里
+#      的 SONAME 声明成 libcameraservice.so。bionic 的 linker 在 find_library()
+#      里会先查已加载库的 soname 索引（find_loaded_library_by_soname），只要
+#      本库在 camera.vendor.tegra.so 之前被加载，blob 的 DT_NEEDED
+#      "libcameraservice.so" 就能命中它，而不必真的存在一个叫这个名字的文件。
+#      加载时机由 libmocha_camera_shim.so 的 DT_NEEDED 保证（见下面的
+#      LOCAL_SHARED_LIBRARIES），而 shim 又由 TARGET_LD_SHIM_LIBS 预加载。
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := stub_libcameraservice.cpp
 LOCAL_MODULE := libcameraservice_mocha
 LOCAL_MODULE_TAGS := optional
 LOCAL_32_BIT_ONLY := true
 LOCAL_PROPRIETARY_MODULE := false
-# Override the -Wl,-soname,<module>.so that shared_library_internal.mk adds automatically
+# 覆盖 shared_library_internal.mk 自动加的 -Wl,-soname,<模块名>.so
 LOCAL_LDFLAGS := -Wl,-soname,libcameraservice.so
 include $(BUILD_SHARED_LIBRARY)
 
-# libpowerservice_client.so -- minimal implementation of NVIDIA's private PowerServiceClient
+# libpowerservice_client.so —— NVIDIA 私有 PowerServiceClient 的最小实现
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := stub_libpowerservice_client.cpp
 LOCAL_SHARED_LIBRARIES := libutils
@@ -87,14 +109,14 @@ LOCAL_32_BIT_ONLY := true
 LOCAL_PROPRIETARY_MODULE := false
 include $(BUILD_SHARED_LIBRARY)
 
-# libmocha_camera_shim.so -- CameraMetadata / Fence / SensorManager ABI forwarding
+# libmocha_camera_shim.so —— CameraMetadata / Fence / SensorManager ABI 转发
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := mocha_camera_shim.cpp
-# libcamera_client provides the const CameraMetadata methods; libui provides Fence::wait(int);
-# libsensor provides the parameterised SensorManager constructor and createEventQueue.
-# Note: libcameraservice_mocha must NOT be listed in LOCAL_SHARED_LIBRARIES here -
-# ld would write its SONAME (libcameraservice.so) into this library's NEEDED section, and
-# since no file has that name the shim itself would fail to load. An explicit dlopen in the
+# libcamera_client 提供 CameraMetadata 的 const 版本；libui 提供 Fence::wait(int)；
+# libsensor 提供带参数的 SensorManager 构造与 createEventQueue。
+# 注意：这里**不能**把 libcameraservice_mocha 写进 LOCAL_SHARED_LIBRARIES ——
+# ld 会把它的 SONAME（libcameraservice.so）写进本库的 NEEDED 段，而那个名字没有
+# 对应文件，反而会让 shim 自己加载失败。改由 constructor 里显式 dlopen 完成。
 LOCAL_SHARED_LIBRARIES := \
     liblog \
     libutils \
@@ -111,52 +133,52 @@ LOCAL_MODULE := libmocha_camera_shim
 LOCAL_MODULE_TAGS := optional
 LOCAL_32_BIT_ONLY := true
 LOCAL_PROPRIETARY_MODULE := false
-# A real dependency on libc++ is required (mocha_camera_shim_keepalive references std::ios_base::Init),
-# otherwise --as-needed drops libc++ from DT_NEEDED and the blob's std:: symbols break again.
+# 必须真实依赖 libc++（mocha_camera_shim_keepalive 里引用了 std::ios_base::Init），
+# 否则 --as-needed 会把 libc++ 从 DT_NEEDED 里删掉，blob 的 std:: 符号又会找不到。
 #
-# -z global sets DF_1_GLOBAL in DT_FLAGS_1: bionic only lets a library join the process
-# global group (symbols visible to other libraries) when this flag is present. It is also
-# needed when manually dlopen'ing this library with RTLD_GLOBAL for verification (camera_shim_test).
+# -z global 设置 DT_FLAGS_1 的 DF_1_GLOBAL：bionic 只有在库带这个标志时才允许它
+# 进入进程的 global group（符号对其它库可见）。手工用 RTLD_GLOBAL dlopen 本库做
+# 验证时（camera_shim_test）同样需要它。
 LOCAL_LDFLAGS := -Wl,--no-as-needed -Wl,-z,global
 include $(BUILD_SHARED_LIBRARY)
 
-# libbeautify.so -- ABI stub replacing the vendor beautify library under the same name
+# libbeautify.so —— 原厂美颜库的 ABI stub（同名替换）
 #
-# Why replace it:
-#   The vendor libbeautify.so has libFaceProc.so in DT_NEEDED (a 3.2MB face detection
-#   library with OpenCV 2.4 statically linked), and libFaceProc.so carries TEXTREL:
+# 为什么要替换：
+#   原厂 libbeautify.so 的 DT_NEEDED 里有 libFaceProc.so（3.2MB 人脸识别库，
+#   静态链了 OpenCV 2.4），而 libFaceProc.so 带 TEXTREL：
 #       readelf -d libFaceProc.so -> 0x00000016 (TEXTREL) 0x0
-#   The Android 6+ linker rejects it outright for API>=23:
+#   Android 6+ 的 linker 对 API>=23 直接拒绝：
 #       dlopen failed: "/system/lib/libFaceProc.so" has text relocations
-#   As a result camera.vendor.tegra.so fails to load and no camera devices exist.
+#   于是 camera.vendor.tegra.so 加载失败，相机设备数为 0。
 #
-# Why not fix the TEXTREL in libFaceProc:
-#   bionic at linker.cpp:3423 calls phdr_table_unprotect_segments() for libraries with
-#   has_text_relocations, making segments writable before relocating. Removing the
-#   DT_TEXTREL entry clears the flag, so the linker no longer unprotects and relocations
-#   write into read-only code -> instant SIGSEGV. Either patch the linker (global risk) or
+# 为什么不去修 libFaceProc 的 TEXTREL：
+#   bionic 在 linker.cpp:3423 里对 has_text_relocations 的库会先
+#   phdr_table_unprotect_segments() 把段改成可写再重定位。只要把 DT_TEXTREL
+#   条目删掉，这个标志就没了，linker 也就不会 unprotect，重定位会写只读的
+#   代码段 —— 直接 SIGSEGV。要么改 linker（全局风险），要么就别用这个库。
 #
-# Why a stub replaces libbeautify rather than libFaceProc:
-#   Measured cross-references:
-#     camera.vendor.tegra.so  -> libbeautify.so   needs 17 symbols
-#     libbeautify.so          -> libFaceProc.so   needs 73 symbols (many cv::)
-#   Cutting at the libbeautify side is clearly the cheaper option.
+# 为什么不用 stub 顶掉 libFaceProc 而是顶掉 libbeautify：
+#   实测符号交叉引用：
+#     camera.vendor.tegra.so  -> libbeautify.so   需要 17 个符号
+#     libbeautify.so          -> libFaceProc.so   需要 73 个符号（含一大堆 cv::）
+#   显然从 libbeautify 这一侧切断代价小得多。
 #
-# Functional impact: only beauty mode, face detection and watermark are affected, all of
-#   which go through libbeautify; preview, photo capture, 3A, flash, HDR and video never
-#   touch this path. See libbeautify_stub.cpp for the per-symbol implementation notes.
+# 功能影响：只影响美颜/人脸检测/水印三件事，它们都走 libbeautify；
+#   取景、拍照、3A、闪光灯、HDR、录像完全不经这条路径，不受影响。
+# 具体实现见 libbeautify_stub.cpp 头部注释（那里有逐符号的说明）。
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := libbeautify_stub.cpp
 LOCAL_MODULE := libbeautify
 LOCAL_MODULE_TAGS := optional
 LOCAL_32_BIT_ONLY := true
 LOCAL_PROPRIETARY_MODULE := false
-# Guard against function-level GC: the stub symbols are only looked up by name by the
-# dynamic linker and have no in-TU caller, so keep an anchor array in addition to --gc-sections.
+# 关闭函数级 GC 的裁剪风险：stub 里的符号只被动态链接器按名字查找，
+# 编译单元内没有调用者，保留 --gc-sections 之外再靠锚点数组兜底。
 LOCAL_LDFLAGS := -Wl,--no-gc-sections
 include $(BUILD_SHARED_LIBRARY)
 
-# Diagnostic tool for the camera blob load path (not installed, push to /data/local/tmp manually)
+# 相机 blob 加载链路诊断工具（不装进镜像，手工 push 到 /data/local/tmp 使用）
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := camera_shim_test.cpp
 LOCAL_SHARED_LIBRARIES := libdl liblog

@@ -1,68 +1,68 @@
 /*
  * libmocha_camera_shim.so
  * ============================================================================
- * ABI compatibility layer for the camera vendor blob on Xiaomi Mi Pad 1
+ * 小米平板1（mocha / NVIDIA Tegra K1 T124 / TN8）相机 vendor blob 的 ABI 兼容层。
  *
- * Background
+ * 背景
  * ---------------------------------------------------------------------------
- * camera.vendor.tegra.so is a binary blob compiled by NVIDIA in the Android 5.1 (2015) era,
- * loaded by CameraWrapper (camera.tegra.so) through hw_get_module_by_class("camera", "vendor").
- * On Android 14 (LineageOS 21) most of the blob's 345 undefined symbols still resolve against
- * stable ABIs such as libc / pthread / liblog, but a batch of Android C++ ABI symbols changed
- * shape or disappeared, so dlopen fails with "cannot locate symbol ..." and no camera exists.
+ * camera.vendor.tegra.so 是 Android 5.1（2015 年）时代 NVIDIA 编译的二进制 blob，
+ * 由 CameraWrapper（camera.tegra.so）通过 hw_get_module_by_class("camera", "vendor")
+ * 加载。在 Android 14（LineageOS 21）上，blob 的 345 个未定义符号里，除了 libc /
+ * pthread / liblog 这些稳定 ABI 之外，有一批 Android C++ ABI 符号已经变形或消失，
+ * 导致 dlopen 阶段就失败（"cannot locate symbol ..."），相机设备数为 0。
  *
- * Missing symbols, measured one by one (2026-11, symbol-level diff of all 1056 .so in out/)
+ * 逐项实测的缺失符号（2026-11，用 readelf 对 out/ 下全部 1056 个 .so 做符号级比对）
  * ---------------------------------------------------------------------------
  *  1) android::CameraMetadata::getAndLock()
  *     android::CameraMetadata::unlock(const camera_metadata*)
- *     -- the method became const in Android 14 (mangled prefix ZNK instead of ZN).
- *        libcamera_client.so exports both const variants, only the non-const one is gone.
- *        -> forward the non-const overload to the const one; zero cost.
+ *     —— 方法在 Android 14 变成 const 成员（mangle 前缀 ZNK 而非 ZN）。
+ *        libcamera_client.so 里两个 const 版本都在，只是非 const 版本没了。
+ *        → 这里做「非 const 转发到 const」，零成本。
  *
  *  2) android::Fence::wait(unsigned int)
- *     -- Android 14 changed the signature to wait(int timeout), so mangle waitEj became waitEi.
- *        -> forward and reinterpret uint32 as int32 (TIMEOUT_NEVER is -1 on both sides).
+ *     —— Android 14 的签名改成 wait(int timeout)，mangle 由 waitEj 变 waitEi。
+ *        → 转发并做 uint32 -> int32 的位转换（TIMEOUT_NEVER = -1 两边一致）。
  *
  *  3) android::Fence::~Fence()
- *     -- Android 14 declares `virtual ~Fence() = default;` (Fence.h:151), so the compiler
- *        emits a COMDAT weak symbol that libui does not export, and the blob's reference to
- *        _ZN7android5FenceD1Ev cannot be resolved. Both versions have the same layout
- *        { vptr; int mFenceFd; } (Android 14 uses base::unique_fd, which is an int). We read
+ *     —— Android 14 里写成 `virtual ~Fence() = default;`（Fence.h:151），
+ *        编译器只生成 COMDAT 弱符号且 libui 未导出，blob 引用的 _ZN7android5FenceD1Ev
+ *        找不到。Fence 的布局两个版本都是 { vptr; int mFenceFd; }（Android 14 是
+ *        base::unique_fd，本质就是一个 int），所以这里按同样偏移取 fd 并 close。
  *
- *  4) android::SensorManager::SensorManager()               (no-arg constructor)
- *     android::SensorManager::createEventQueue()            (no-arg)
+ *  4) android::SensorManager::SensorManager()               （无参构造）
+ *     android::SensorManager::createEventQueue()            （无参）
  *     android::Singleton<SensorManager>::sInstance
  *     android::Singleton<SensorManager>::sLock
- *     -- Android 5 SensorManager inherits Singleton<TS>, and the blob inlined getInstance() as
- *        "lock; if sInstance is null then new SensorManager(); return *sInstance".
- *        Android 14 replaced this with getInstanceForPackage(String16, int) and the class is no
- *        longer a Singleton. Handling:
- *          a) export sInstance / sLock under the old names from .bss so the blob's inlined code
- *             keeps working;
- *          b) preset sInstance in an ELF constructor to the real system singleton
- *             (getInstanceForPackage), so the blob's "if (!sInstance) new ..." branch is never
- *             taken. This matters: the blob allocates using the Android 5 sizeof, and the
- *             Android 14 SensorManager is larger, so a real new would corrupt the heap;
- *          c) give the no-arg constructor an empty body (link-only, never called in practice);
- *          d) forward the no-arg createEventQueue() to the new three-argument version.
+ *     —— Android 5 的 SensorManager 继承 Singleton<TS>，getInstance() 被 blob 内联成
+ *        「加锁；若 sInstance 为空则 new SensorManager()；返回 *sInstance」。
+ *        Android 14 已改为 getInstanceForPackage(String16, int)，类里也不再是 Singleton。
+ *        处理办法：
+ *          a) 在 .bss 里按老名字导出 sInstance / sLock 两个变量，让 blob 的内联代码
+ *             能正常工作；
+ *          b) 在 ELF constructor 里把 sInstance 预置成系统真实单例
+ *             （getInstanceForPackage），于是 blob 那段 "if (!sInstance) new ..." 的
+ *             分支永远不会走 —— 这一步很关键：blob 是按 Android 5 的 sizeof 去 new 的，
+ *             而 Android 14 的 SensorManager 更大，真让它 new 会踩堆。
+ *          c) 无参构造给一个空实现（只为满足链接，正常不会被调用）；
+ *          d) 无参 createEventQueue() 转发到新签名的三参版本。
  *
- * Out of scope for this shim (verified as needing no work)
+ * 不属于本 shim 范围的（已确认无需处理）
  * ---------------------------------------------------------------------------
- *  - NvSFxFloat2Fixed: exported by libnvisp_v3.so, which is a NEEDED of libnvmm_camera_v3.so
- *    (a direct dependency of the blob), so the symbol is globally visible at runtime.
- *  - libcameraservice.so / libpowerservice_client.so: the blob's DT_NEEDED requires both files
- *    to exist, but the former has no symbol references at all (an empty stub suffices) and the
- *    latter only needs the PowerServiceClient constructor plus sendPowerHint. They are produced
- *    by stub_libcameraservice.cpp / stub_libpowerservice_client.cpp in this directory.
- *  - std::string COW symbols (_ZNSs*): measured count is 0, the blob never hits GNU libstdc++.
+ *  - NvSFxFloat2Fixed：由 libnvisp_v3.so 导出，而 libnvisp_v3.so 是 blob 直接依赖的
+ *    libnvmm_camera_v3.so 的 NEEDED，运行时符号全局可见，能正常解析。
+ *  - libcameraservice.so / libpowerservice_client.so：blob 的 DT_NEEDED 里要求这两个
+ *    文件必须存在，但前者无任何符号引用（空 stub 即可），后者只需要
+ *    PowerServiceClient 的构造 + sendPowerHint。两者分别由同目录下的
+ *    stub_libcameraservice.cpp / stub_libpowerservice_client.cpp 生成。
+ *  - std::string 的 COW 符号（_ZNSs*）：实测计数为 0，blob 没有踩 GNU libstdc++ 的
  *    std::string ABI。
  *
- * Warning (hard-learned, see libbeautify_stub.cpp / mocha_cpp_shim.cpp)
+ * 注意（血泪教训，摘自 libbeautify_stub.cpp / mocha_cpp_shim.cpp）
  * ---------------------------------------------------------------------------
- * This shim is preloaded via TARGET_LD_SHIM_LIBS and therefore joins the process *shared group*:
- * every symbol it exports is visible to all libraries in cameraserver. Only define symbols that
- * truly do not exist anywhere else; never redefine operator new/delete or __throw_* style
- * symbols used by the whole process. Doing so previously made libutils segfault in call_constructors.
+ * 本 shim 通过 TARGET_LD_SHIM_LIBS 预加载，会进入进程的 *shared group*，也就是说
+ * 它导出的符号对 cameraserver 里所有库可见。因此这里只定义"系统里确实不存在"的
+ * 符号，绝不能重定义 operator new/delete、__throw_* 这类被全进程使用的符号 ——
+ * 之前那么干过，直接让 libutils 在 call_constructors 阶段 segfault。
  */
 
 #include <errno.h>
@@ -84,24 +84,24 @@
 #include <utils/threads.h>
 
 /*
- * camera_metadata_t is deliberately kept as an opaque pointer (void*) here, without including
+ * camera_metadata_t 这里刻意只用不透明指针（void*）代替，不 include
  * <camera/camera_metadata.h>：
- *   - the names below are *hand-written mangled names* (extern "C"), so a symbol only depends
- *     on the type encoding inside the mangled name, not on the C++ types declared in this TU;
- *   - it avoids pulling the libcamera_metadata headers into this shim (that header lives under
- *     system/media/camera/include and would need one more include path in the Make file).
+ *   - 下面的函数名是**手工写死的 mangled name**（extern "C"），符号只跟
+ *     mangled 名字里的类型编码有关，跟本 TU 里声明的 C++ 类型无关；
+ *   - 避免把 libcamera_metadata 的头文件依赖拉进这个 shim（该头文件在
+ *     system/media/camera/include 下，Make 里还要多一个 include 路径）。
  */
 
 /* ==========================================================================
- * 1) CameraMetadata: non-const -> const forwarding
+ * 1) CameraMetadata：非 const -> const 转发
  * ========================================================================== */
 
-// Const variant that actually exists in libcamera_client.so.
+// libcamera_client.so 里真实存在的 const 版本。
 extern "C" void* _ZNK7android14CameraMetadata10getAndLockEv(const void* thiz);
 extern "C" int _ZNK7android14CameraMetadata6unlockEPK15camera_metadata(const void* thiz,
                                                                      const void* md);
 
-// Non-const variant referenced by the blob (Android 5 ABI).
+// blob 引用的非 const 版本（Android 5 ABI）。
 extern "C" void* _ZN7android14CameraMetadata10getAndLockEv(void* thiz) {
     return _ZNK7android14CameraMetadata10getAndLockEv(thiz);
 }
@@ -115,24 +115,24 @@ extern "C" int _ZN7android14CameraMetadata6unlockEPK15camera_metadata(void* thiz
  * 2) Fence
  * ========================================================================== */
 
-// New signature: status_t Fence::wait(int timeout)
+// 新签名：status_t Fence::wait(int timeout)
 extern "C" int _ZN7android5Fence4waitEi(void* thiz, int timeout);
 
-// Old signature: status_t Fence::wait(unsigned int timeout)
-// A bit-cast is enough: old code passes Fence::TIMEOUT_NEVER as 0xFFFFFFFF, which reads as -1
-// as an int, and Android 14 TIMEOUT_NEVER is also -1.
+// 老签名：status_t Fence::wait(unsigned int timeout)
+// 位转换即可：老代码传 Fence::TIMEOUT_NEVER 时是 0xFFFFFFFF，解释成 int 就是 -1，
+// 而 Android 14 的 TIMEOUT_NEVER 同样是 -1。
 extern "C" int _ZN7android5Fence4waitEj(void* thiz, unsigned int timeout) {
     return _ZN7android5Fence4waitEi(thiz, static_cast<int>(timeout));
 }
 
 /*
- * Fence object layout (identical in both versions):
+ * Fence 对象布局（两个版本一致）：
  *   offset 0 : vptr
- *   offset 4 : int mFenceFd      (Android 14 uses base::unique_fd, internally an int)
- * 8 bytes in total.
+ *   offset 4 : int mFenceFd      (Android 14 是 base::unique_fd，内部就是一个 int)
+ * 整体 8 字节。
  *
- * The destructor only has to close the fd. libui's `virtual ~Fence() = default;` does not
- * export a symbol, so this logic has to be supplied here.
+ * 析构只需要把 fd 关掉。libui 里 `virtual ~Fence() = default;` 未导出符号，
+ * 所以这段逻辑由我们自己补。
  */
 static inline void mocha_fence_destroy(void* thiz) {
     if (thiz == nullptr) return;
@@ -156,12 +156,12 @@ extern "C" void _ZN7android5FenceD0Ev(void* thiz) {
  * ========================================================================== */
 
 /*
- * The inlined getInstance() in the blob accesses these two legacy symbols directly:
+ * blob 内联的 getInstance() 会直接访问这两个老符号：
  *   static Mutex sLock;             -> Singleton<SensorManager>::sLock
  *   static SensorManager* sInstance;-> Singleton<SensorManager>::sInstance
  *
- * sLock is large zero-initialised memory: bionic's PTHREAD_MUTEX_INITIALIZER is all zeros, so
- * pthread_mutex_lock() on this storage is legal and needs no explicit construction.
+ * sLock 用一块足够大的零初始化内存：bionic 的 PTHREAD_MUTEX_INITIALIZER 就是全零，
+ * 所以 pthread_mutex_lock() 对这块内存完全合法，不需要（也无法）显式构造。
  */
 extern "C" {
 void* _ZN7android9SingletonINS_13SensorManagerEE9sInstanceE = nullptr;
@@ -169,19 +169,19 @@ __attribute__((aligned(16))) unsigned char _ZN7android9SingletonINS_13SensorMana
 }
 
 /*
- * No-arg constructor: only there so the dynamic linker resolves.
- * The blob never reaches it in the normal path (sInstance is preset in the constructor),
- * and even if it did, a placement-new of a real SensorManager is not allowed here:
- * the blob allocated using Android 5 sizeof while the new object is larger, corrupting the heap.
+ * 无参构造：只为满足动态链接器解析。
+ * 正常路径下 blob 不会走到这里（sInstance 在 constructor 阶段就已被预置），
+ * 而即便走到了，我们也不能在这里 placement-new 真正的 SensorManager ——
+ * blob 分配的大小是 Android 5 的 sizeof，新版对象更大，会踩堆。
  */
 extern "C" void _ZN7android13SensorManagerC2Ev(void* /*thiz*/) {}
 extern "C" void _ZN7android13SensorManagerC1Ev(void* thiz) { _ZN7android13SensorManagerC2Ev(thiz); }
 
 /*
- * No-arg createEventQueue(): returns sp<SensorEventQueue>, a non-trivial return type, so it
- * uses the sret hidden parameter per AAPCS and effectively has the signature
+ * 无参 createEventQueue()：返回 sp<SensorEventQueue>，属于非平凡返回类型，
+ * 按 AAPCS 走 sret 隐藏参数，实际签名相当于
  *     void f(sp<SensorEventQueue>* ret, SensorManager* this)
- * This forwards to the Android 14 three-argument version (all three have defaults).
+ * 这里转发到 Android 14 的三参版本（三个参数都有默认值）。
  */
 extern "C" void _ZN7android13SensorManager16createEventQueueEv(void* ret, void* thiz) {
     android::SensorManager* mgr = static_cast<android::SensorManager*>(thiz);
@@ -194,40 +194,40 @@ extern "C" void _ZN7android13SensorManager16createEventQueueEv(void* ret, void* 
 }
 
 /*
- * Preset sInstance to the real system SensorManager singleton.
+ * 预置 sInstance 为系统真实的 SensorManager 单例。
  *
- * Timing: this library is preloaded by TARGET_LD_SHIM_LIBS at process start, so the constructor
- * runs before cameraserver's main(). Binder is already available at that point
- * (libsensor's getInstanceForPackage asserts state and retries internally).
+ * 时机：本库由 TARGET_LD_SHIM_LIBS 在进程启动时预加载，constructor 早于
+ * cameraserver 的 main()，此时 binder 已可用（libsensor 的 getInstanceForPackage
+ * 内部会自行 assertStateLocked 并重试）。
  *
- * It has to happen here rather than on first call: the blob's inlined getInstance() logic is
- * "if sInstance is null, new it myself". Once that runs we lose the chance to take over, and it
- * would allocate an object of the wrong size.
+ * 之所以必须在这里做、不能推迟到首次调用：blob 的内联 getInstance() 逻辑是
+ * 「若 sInstance 为空就自己 new」，一旦它先跑，我们就失去了接管的机会，而且它会
+ * 按错误的大小分配对象。
  */
 __attribute__((constructor)) static void mocha_camera_shim_init() {
     /*
-    * Load libcameraservice_mocha.so first.
+     * 先把 libcameraservice_mocha.so 加载进来。
      *
-    * Reason: camera.vendor.tegra.so lists "libcameraservice.so" in DT_NEEDED, but that file
-    * does not exist on Android 14 (libcameraservice is a static_libs of cameraserver, purely
-    * statically linked, producing no shared library). We build an empty library as a stand-in, but
-    *   - the module cannot be named libcameraservice (clashes with the same-named cc_library),
-    *   - SHARED_LIBRARY does not allow LOCAL_MODULE_STEM,
-    * so the artifact is libcameraservice_mocha.so and only its ELF header declares the SONAME
-    * as libcameraservice.so.
+     * 原因：camera.vendor.tegra.so 的 DT_NEEDED 里写了 "libcameraservice.so"，
+     * 但那个文件在 Android 14 里不存在（libcameraservice 是 cameraserver 的
+     * static_libs，纯静态链接，不产出共享库）。我们编了一个空库顶上，但
+     *   - 模块名不能叫 libcameraservice（与 Soong 里的同名 cc_library 冲突），
+     *   - SHARED_LIBRARY 又不允许设置 LOCAL_MODULE_STEM，
+     * 所以产物文件名是 libcameraservice_mocha.so，只在 ELF 头里把 SONAME
+     * 声明成 libcameraservice.so。
      *
-    * bionic's linker checks the soname index of already-loaded libraries first in find_library()
-    * (linker.cpp:1468 find_loaded_library_by_soname), so loading libcameraservice_mocha.so here
-    * makes the blob's DT_NEEDED "libcameraservice.so" resolve to its SONAME without a real file.
+     * bionic 的 linker 在 find_library() 里会先查已加载库的 soname 索引
+     * （linker.cpp:1468 find_loaded_library_by_soname），所以只要这里先把
+     * libcameraservice_mocha.so 加载进来，后面 blob 的 DT_NEEDED
+     * "libcameraservice.so" 就能命中它的 SONAME，不必真的存在同名文件。
      *
+     * 注意：不能靠 shim 自己的 DT_NEEDED 来建立这个依赖 —— ld 会把被链接库的
+     * SONAME（libcameraservice.so）写进 NEEDED 段，而这个名字反过来又没有对应
+     * 文件，会导致 shim 自己加载失败。所以改用显式 dlopen。
      *
-    * Note: do not rely on the shim's own DT_NEEDED for this dependency - ld would write the
-    * linked library's SONAME (libcameraservice.so) into the NEEDED section, and that name has no
-    * matching file, which would make the shim itself fail to load. Hence an explicit dlopen.
-     *
-    * BoardConfig.mk also lists libcameraservice_mocha.so as the second shim for
-    * camera.vendor.tegra.so in TARGET_LD_SHIM_LIBS, so either path works; dlopen is idempotent.
-     *
+     * 另外 BoardConfig.mk 的 TARGET_LD_SHIM_LIBS 里也把
+     * libcameraservice_mocha.so 列为 camera.vendor.tegra.so 的第二个 shim，
+     * 两条路任意一条生效即可，dlopen 这里是幂等的。
      */
     if (dlopen("libcameraservice_mocha.so", RTLD_NOW | RTLD_GLOBAL) == nullptr) {
         ALOGW("mocha_camera_shim: dlopen libcameraservice_mocha.so failed: %s", dlerror());
@@ -241,67 +241,67 @@ __attribute__((constructor)) static void mocha_camera_shim_init() {
 }
 
 /* ==========================================================================
- * 4) Legacy API of NVIDIA libphs: NvPHSSetThrottle
+ * 4) NVIDIA libphs 的旧 API：NvPHSSetThrottle
  * ========================================================================== */
 
 /*
- * This one is not requested by the blob itself but by its dependency libcuda.so - checking
- * camera.vendor.tegra.so alone does not reveal it, the whole dependency tree must be walked.
+ * 这一条不是 blob 自己要的，而是它的依赖 libcuda.so 要的 —— 单独检查
+ * camera.vendor.tegra.so 是发现不了的，必须把整条依赖树走一遍。
  *
- * Symptom:
+ * 现象：
  *   dlopen("/system/lib/hw/camera.vendor.tegra.so") failed:
  *     cannot locate symbol "NvPHSSetThrottle" referenced by
  *     "/system/vendor/lib/libcuda.so"
  *
- * Cause:
- *   libcuda.so (libphs.so in DT_NEEDED) expects libphs to provide two APIs:
- *     NvPHSSetThrottle         (old interface)
- *     NvPHSSendThroughputHints (new interface)
- *   but libphs.so shipped in this ROM only has the latter:
+ * 原因：
+ *   libcuda.so（DT_NEEDED 里有 libphs.so）期望 libphs 提供两个 API：
+ *     NvPHSSetThrottle        （老接口）
+ *     NvPHSSendThroughputHints（新接口）
+ *   而本 ROM 带的 libphs.so 只有后一个：
  *     NvPHSSendThroughputHints / NvPHSCancelThroughputHints
  *     NvVaSendThroughputHints  / NvCancelThroughputHints
- *   NVIDIA folded SetThrottle into SendThroughputHints in later versions.
+ *   NVIDIA 在后期版本里把 SetThrottle 并入了 SendThroughputHints。
  *
- * Handling:
- *   NvPHSSetThrottle means "apply a frequency cap to GPU/EMC" (a performance hint) and is
- *   unrelated to camera functionality. It is a no-op returning 0 (NvSuccess); the worst case is
- *   that the GPU is not downclocked under heavy camera load - viewfinder, photo, video unaffected.
+ * 处理：
+ *   NvPHSSetThrottle 的语义是"给 GPU/EMC 施加一个频率上限"（性能调节提示），
+ *   与相机功能本身无关。这里做成 no-op 并返回 0（NvSuccess），最坏后果只是
+ *   相机负载高时 GPU 不会被主动降频 —— 不影响取景、拍照、录像。
  *
- * Visibility: this shim is built with DF_1_GLOBAL (see -Wl,-z,global in Android.mk) and loads
- * before libcuda.so, so the symbol is visible to libcuda.
+ * 可见性：本 shim 带 DF_1_GLOBAL（见 Android.mk 的 -Wl,-z,global），且在
+ * libcuda.so 之前加载，因此该符号对 libcuda 可见。
  */
 extern "C" int NvPHSSetThrottle() {
     return 0;  // NvSuccess
 }
 
 /* ==========================================================================
- * 5) New NvRmSync APIs (libnvrm.so in this ROM is old and lacks them)
+ * 5) NvRmSync 的新 API（本 ROM 的 libnvrm.so 是旧版，缺少这几个）
  * ========================================================================== */
 
 /*
- * Again not requested by the blob directly but by libnvrm_gpu.so:
+ * 这一组同样不是 blob 直接要的，而是 libnvrm_gpu.so 要的：
  *   camera.vendor.tegra.so -> libcuda.so -> libnvrm_gpu.so
  *
- * Symptom:
+ * 现象：
  *   dlopen failed: cannot locate symbol
  *     "NvRmSyncCalculateSizeForInplaceSyncpoints" referenced by
  *     "/system/vendor/lib/libnvrm_gpu.so"
  *
- * Cause:
- *   libnvrm_gpu.so in this blob set is newer than libnvrm.so. The old libnvrm.so only exports:
+ * 原因：
+ *   这套 blob 里的 libnvrm_gpu.so 比 libnvrm.so 新。旧版 libnvrm.so 只导出：
  *     NvRmSyncCreateFromFd / NvRmSyncCreateFromSyncpoints
- *   while libnvrm_gpu.so also looks for the "WithAttr" and "CalculateSizeForInplace" variants
- *   that only newer libnvrm.so provides. No library in the whole blob set exports these 4 symbols.
+ *   而 libnvrm_gpu.so 还在找带 "WithAttr" 和 "CalculateSizeForInplace" 的新变体，
+ *   新版 libnvrm.so 才有。全套 blob 里没有任何库导出这 4 个符号，所以只能补。
  *
- * Strategy (important):
- *   These APIs belong to the sync path that turns a GPU fence into an NvRmSync handle and are
- *   only used from the CUDA-accelerated branches (EDR/HDR merge, face acceleration, JPEG).
- *   Real semantics cannot be implemented, so *fail explicitly* instead of pretending success:
- *     - CalculateSizeForInplace* returns 0 (no extra space needed);
- *     - Create*WithAttr first writes NULL to the output handle, then returns NvError_NotImplemented,
- *       so even a caller that ignores the return code cannot pass a wild pointer to NvRmSyncClose
- *       (which is where a real crash would happen).
- *   As long as the CUDA branches are never taken, none of these run: zero impact.
+ * 处理策略（重要）：
+ *   这几个 API 属于"把 GPU 的 fence 做成 NvRmSync 句柄"的同步路径，只在
+ *   CUDA 加速分支里用（相机侧是 EDR/HDR 合成、人脸加速、JPEG 加速）。
+ *   我们没法实现真语义，所以选择**明确失败**而不是假装成功：
+ *     - CalculateSizeForInplace* 返回 0（不需要额外空间）；
+ *     - Create*WithAttr 先把输出句柄写成 NULL，再返回 NvError_NotImplemented，
+ *       这样即使调用方不检查返回码，也不会拿一个野指针去 NvRmSyncClose（那才是
+ *       真正会崩的地方）。
+ *   只要 CUDA 分支根本没被走到，这些函数一次都不会执行，等于零影响。
  */
 #define MOCHA_NVERROR_NOT_IMPLEMENTED 0x000C0000u
 
@@ -329,17 +329,17 @@ extern "C" unsigned int NvRmSyncCreateFromSyncpointsWithAttr(void** sync) {
 }
 
 /* ==========================================================================
- * 6) GNU libstdc++ iostream symbols (same fix as in mocha_cpp_shim.cpp)
+ * 6) GNU libstdc++ iostream 符号（沿用 mocha_cpp_shim.cpp 的既有修复）
  * ========================================================================== */
 
 /*
- * Blobs from 2015 such as libbeautify.so include <iostream> in some TU and therefore reference
- * the *GNU libstdc++* ABI of std::ios_base::Init::Init()/~Init() (namespace std rather than
- * std::__1). Android 14 only has libc++, so nobody provides them (/system/lib/libstdc++.so
- * has degenerated into a 10KB stub).
+ * libbeautify.so 等 2015 年的 blob 在某个 TU 里 include 了 <iostream>，
+ * 因而引用 std::ios_base::Init::Init()/~Init() 的 **GNU libstdc++** ABI
+ * （namespace std 而非 std::__1）。Android 14 只有 libc++，这些符号没人提供
+ * （/system/lib/libstdc++.so 已退化为 10KB 的空壳）。
  *
- * These two functions only initialise iostream globals; the blob does not depend on their
- * behaviour, so empty bodies are enough.
+ * 这两个函数只负责初始化 iostream 的全局对象，blob 并不依赖它们的实际行为，
+ * 空实现即可。
  */
 extern "C" void _ZNSt8ios_base4InitC1Ev(void) {}
 extern "C" void _ZNSt8ios_base4InitC2Ev(void) {}
@@ -347,9 +347,9 @@ extern "C" void _ZNSt8ios_base4InitD1Ev(void) {}
 extern "C" void _ZNSt8ios_base4InitD2Ev(void) {}
 
 /*
- * Keep a real reference to libc++.so so that libc++ is pulled into the shim's shared group,
- * which lets the blob's other libc++ symbols resolve. Without a real reference --as-needed
- * drops the dependency.
+ * 保持对 libc++.so 的真实引用：让 libc++ 被本 shim 拖进进程的 shared group，
+ * 这样 blob 里其它 libc++ 符号也能解析。若没有真实引用，--as-needed 会把
+ * 依赖丢掉。
  */
 extern "C" void mocha_camera_shim_keepalive(void) {
     static std::ios_base::Init io_init;

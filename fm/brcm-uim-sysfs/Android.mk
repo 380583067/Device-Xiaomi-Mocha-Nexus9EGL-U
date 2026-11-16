@@ -4,26 +4,26 @@ include $(CLEAR_VARS)
 #
 # UIM Application
 #
-# FIX NOTE (FM, 2026-11-16):
-# brcm-uim-sysfs switches the Broadcom combo chip (BCM4354) from Bluetooth HCI mode
-# to UIM/FM mode before FM is opened: through sysfs nodes exposed by the bcm_ldisc
-# driver (install / vendor_params / snoop_enable ...) it downloads patchram parameters
-# and controls chip power sequencing; only then can libfmradio.v4l2-fm reach /dev/radio0.
+# 修复说明（FM，2026-11-16）：
+# brcm-uim-sysfs 的作用是在 FM 打开前把 Broadcom 组合芯片（BCM4354）从
+# 「蓝牙 HCI 模式」切到「UIM/FM 模式」：它通过 bcm_ldisc 驱动暴露的 sysfs
+# 节点（install / vendor_params / snoop_enable …）下发 patchram 参数、控制
+# 芯片上电时序，之后 libfmradio.v4l2-fm 才能通过 /dev/radio0 与芯片通信。
 #
-# Install path changed from /vendor/bin to /system/bin:
-#   it reads /system/etc/bluetooth/bt_vendor.conf (system_file); installing to /vendor/bin
-#   would subject it to SELinux vendor domains and require more verbose read rules.
-#   On this device /vendor is really /system/vendor (old unpartitioned TN8 layout), so this
-#   changes no actual layout and only simplifies SELinux and path handling.
+# 安装位置从 /vendor/bin 改成 /system/bin：
+#   它要读 /system/etc/bluetooth/bt_vendor.conf（system_file），装到 /vendor/bin
+#   会被 SELinux 的 vendor 域限制、并且给 system 分区文件的读权限配置更啰嗦。
+#   本机 /vendor 其实就是 /system/vendor（不分区的老 TN8 布局），所以这个选择
+#   不改变任何实际布局，只是简化 SELinux 与路径判断。
 #
-# About SYSFS_PREFIX:
-#   bcm_ldisc is a platform driver, so its sysfs directory carries a device instance number
-#   (bcmbt_ldisc.<N>, where N depends on kernel probe order, not a constant). Upstream Sony
-#   devices use .93, Nexus 9 uses another value. This must match the value printed by
+# 关于 SYSFS_PREFIX：
+#   bcm_ldisc 是 platform driver，sysfs 目录名带设备实例编号
+#   （bcmbt_ldisc.<N>，N 由内核探测顺序决定，不是固定值）。上游 Sony 设备是
+#   .93，Nexus 9 是别的值。这个值必须和真机
 #       ls /sys/bus/platform/drivers/bcm_ldisc/
-#   otherwise uim fails to open and prints "unable to open .../install".
-#   If the measured number differs, override BOARD_HAVE_BCM_FM_SYSFS in BoardConfig.mk
-#   (this file already honours that override).
+#   的输出一致，否则 uim 会 open 失败并打印 "unable to open .../install"。
+#   如果实测发现编号不同，改 BoardConfig.mk 的 BOARD_HAVE_BCM_FM_SYSFS 即可
+#   （本文件已支持该覆盖）。
 #
 
 LOCAL_C_INCLUDES:= $(LOCAL_PATH)/include
@@ -36,20 +36,20 @@ LOCAL_SRC_FILES:= \
     utils.c
 
 LOCAL_CFLAGS:= -c -W -Wall -O2 -D_POSIX_SOURCE -DUIM_DEBUG -DBLUEDROID_ENABLE_V4L2
-# FIX NOTE (FM, 2026-11-16, measured on device):
-# V4L2_SNOOP_ENABLE must be turned off. Its default is TRUE (fallback in
-# include/v4l2_cfg.h:35 via #ifndef), and when enabled uim's main() reads a second config file:
-#     if (vnd_load_conf(VENDOR_LIB_CONF_FILE, ...)) return UIM_FAIL;   // bt_vendor.conf, present
+# 修复说明（FM，2026-11-16，真机实测）：
+# 必须关掉 V4L2_SNOOP_ENABLE。它的默认值是 TRUE（include/v4l2_cfg.h:35 的
+# #ifndef 兜底），打开后 uim 的 main() 会去读第二个配置文件：
+#     if (vnd_load_conf(VENDOR_LIB_CONF_FILE, ...)) return UIM_FAIL;   // bt_vendor.conf，存在
 #     if (vnd_load_conf(STACK_CONF_FILE, ...))    return UIM_FAIL;     // bt_stack.conf
-# STACK_CONF_FILE is /etc/bluetooth/bt_stack.conf, which this ROM does not install
-# (it belongs to the Bluedroid tree, packages/modules/Bluetooth/system/conf/, not shipped).
-# Measured log:
+# 而 STACK_CONF_FILE 是 /etc/bluetooth/bt_stack.conf，本 ROM 并不安装这个文件
+# （它属于 Bluedroid 源码树 packages/modules/Bluetooth/system/conf/，不进镜像）。
+# 实测日志：
 #     I brcm-uim: Attempt to load conf from /etc/bluetooth/bt_stack.conf
 #     I brcm-uim: vnd_load_conf file >/etc/bluetooth/bt_stack.conf< not found
 #     I init    : Service 'uim' (pid 741) exited with status 255
-# So uim exits with UIM_FAIL immediately on every start, init restarts it every 5 seconds and
-# it never reaches "open the install sysfs node and poll for the BT chip state".
-# snoop (HCI capture dump) does nothing for FM, so turning it off is safe.
+# 于是 uim 每次启动都立刻以 UIM_FAIL 退出，被 init 每 5 秒重启一次，永远走不到
+# "打开 install sysfs、poll 等 BT 芯片状态" 那一步。
+# snoop（HCI 抓包转储）对 FM 功能没有任何作用，关掉即可。
 LOCAL_CFLAGS += -DV4L2_SNOOP_ENABLE=0
 LOCAL_SHARED_LIBRARIES:= libnetutils libcutils liblog
 
@@ -64,10 +64,10 @@ ifneq ($(BOARD_BRCM_HCI_NUM),)
 LOCAL_CFLAGS += -DBOARD_BRCM_HCI_NUM=$(BOARD_BRCM_HCI_NUM)
 endif
 
-# Install path stays /vendor/bin: the uim service in init.comms.rc references
-# /vendor/bin/brcm-uim-sysfs (class late_start, user root, group bluetooth net_bt).
-# On this device /vendor is actually /system/vendor (old TN8 layout, no separate partition), so
-# both paths point at the same file; keeping init unchanged avoids touching the rc file.
+# 安装位置保持 /vendor/bin：init.comms.rc 里的 uim service 就是按
+# /vendor/bin/brcm-uim-sysfs 写的（class late_start, user root, group bluetooth net_bt）。
+# 本机 /vendor 实际上是 /system/vendor（TN8 老布局，不单独分区），所以这两个路径
+# 指向同一个文件，但按 init 配置保持一致可省去改 rc 的风险。
 LOCAL_MODULE := brcm-uim-sysfs
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_OWNER := sony

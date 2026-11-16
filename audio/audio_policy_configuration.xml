@@ -22,6 +22,11 @@
             <attachedDevices>
                 <item>Speaker</item>
                 <item>Built-In Mic</item>
+                <!-- FM Tuner must be attached so AudioPolicyManager exposes it
+                     as an available input device for AudioSource.RADIO_TUNER.
+                     Without this, AudioRecord(RADIO_TUNER) fails with
+                     "could not find device for source 1998" (-EINVAL). -->
+                <item>FM</item>
             </attachedDevices>
             <defaultOutputDevice>Speaker</defaultOutputDevice>
             <mixPorts>
@@ -41,7 +46,10 @@
                 <devicePort tagName="Wired Headphones" type="AUDIO_DEVICE_OUT_WIRED_HEADPHONE" role="sink"/>
                 <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source"/>
                 <devicePort tagName="Wired Headset Mic" type="AUDIO_DEVICE_IN_WIRED_HEADSET" role="source"/>
-                <devicePort tagName="FM" type="AUDIO_DEVICE_IN_FM_TUNER" role="source"/>
+                <devicePort tagName="FM" type="AUDIO_DEVICE_IN_FM_TUNER" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </devicePort>
             </devicePorts>
             
             <routes>

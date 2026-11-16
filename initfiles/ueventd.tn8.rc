@@ -52,16 +52,16 @@
 /dev/nvhost-prof-gpu   0666   root   root
 /dev/tlk_device 0660    system  drmrpc
 # for FM V4L2 Radio
-# FIX NOTE (FM, 2026-11-16): this used to be /dev/radio (no suffix), but the kernel
-# v4l2_fm_driver calls video_register_device(..., VFL_TYPE_RADIO, ...) which creates
-# **/dev/radio0** (the videoX radio variant carries an index). When the rule did not match,
-# /dev/radio0 fell back to ueventd's default 0600 root:root and the FMRadio app process
-# could not open it at all - FM failed at open("/dev/radio0") on every start.
-# /dev/radio* covers both the unnumbered and numbered forms.
-# The 0666 mode is the kernel driver's own convention: fmdrv_v4l2.c comments state it,
+# 修复说明（FM，2026-11-16）：原来写的是 /dev/radio（没有后缀），但内核
+# v4l2_fm_driver 调 video_register_device(..., VFL_TYPE_RADIO, ...) 创建出来的
+# 节点名是 **/dev/radio0**（videoX 的 radio 变体带序号）。规则不匹配的后果是
+# /dev/radio0 落到 ueventd 默认的 0600 root:root，FMRadio app 进程根本打不开，
+# FM 一启动就失败在 open("/dev/radio0")。
+# 用 /dev/radio* 同时覆盖无序号和有序号两种命名。
+# 权限给 0666 是内核驱动自己的约定：fmdrv_v4l2.c 里注释明确写了
 # "FM GUI app belongs to group fmradio, ... these entries got permission 666"，
-# and this ROM's android_filesystem_config.h has no fmradio group,
-# so the group reuses the existing radio group.
+# 而本 ROM 的 android_filesystem_config.h 里并没有 fmradio 这个组，
+# 所以组名沿用已存在的 radio。
 /dev/radio*     0666    system  radio
 /dev/mpu        0640    system  system
 /dev/mpuirq     0640    system  system

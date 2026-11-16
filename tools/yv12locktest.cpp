@@ -1,21 +1,19 @@
 /*
- * yv12locktest - diagnostic tool for gralloc YUV lock on mocha (Tegra K1 / TN8)
+ * yv12locktest — mocha (Tegra K1 / TN8) gralloc YUV lock 能力诊断工具
  *
- * Background:
- *   When SoftwareRenderer in Android 14 renders a software-decoded YUV420
- *   frame, it configures the Surface buffer as HAL_PIXEL_FORMAT_YV12 and then
- *   calls GraphicBufferMapper::lockYCbCr() to obtain the Y/Cb/Cr plane
- *   pointers. On mocha that call returns -ENOSYS (-38), so SoftwareRenderer's
- *   CHECK_EQ(0, ...) aborts and the Gallery app crashes as soon as any video is
- *   played.
+ * 背景：
+ *   Android 14 的 SoftwareRenderer 在渲染软件解码的 YUV420 帧时，会把
+ *   Surface buffer 配置成 HAL_PIXEL_FORMAT_YV12，然后调用
+ *   GraphicBufferMapper::lockYCbCr() 拿到 Y/Cb/Cr 三个平面指针。
+ *   在 mocha 上该调用返回 -ENOSYS(-38)，导致 SoftwareRenderer 的
+ *   CHECK_EQ(0, ...) 直接 abort，图库一播视频就闪退。
  *
- * This tool is used to determine:
- *   1) which YUV formats this gralloc can actually lock via lockYCbCr;
- *   2) if lockYCbCr is unavailable, whether a plain single-plane lock() still
- *      returns the YV12 base address. This decides whether the SoftwareRenderer
- *      fallback should compute the planes by hand or force an RGB565 conversion.
+ * 本工具用来确认：
+ *   1) 该 gralloc 的 lockYCbCr 对哪些 YUV 格式可用；
+ *   2) 若 lockYCbCr 不可用，单平面 lock() 是否能拿到 YV12 的基址
+ *      （决定 SoftwareRenderer 兜底方案是"手工算平面"还是"强制 RGB565 转换"）。
  *
- * Debug only, never shipped in release builds.
+ * 仅用于调试，不随正式版本发布。
  */
 
 #define LOG_TAG "yv12locktest"
@@ -64,7 +62,7 @@ void testFormat(const FormatCase& c, int w, int h) {
     const Rect bounds(w, h);
     const native_handle_t* handle = buffer->getNativeBuffer()->handle;
 
-    // 1) Via lockYCbCr - the path SoftwareRenderer currently uses.
+    // 1) 走 lockYCbCr（SoftwareRenderer 当前用的路径）
     android_ycbcr ycbcr;
     memset(&ycbcr, 0, sizeof(ycbcr));
     status_t e1 = mapper.lockYCbCr(handle,
@@ -79,8 +77,7 @@ void testFormat(const FormatCase& c, int w, int h) {
         printf("  lockYCbCr FAILED: %d (%s)\n", e1, strerror(-e1));
     }
 
-    // 2) Via plain single-plane lock - the fallback needs this to get the base
-    //    address and then compute the YV12 planes itself.
+    // 2) 走单平面 lock（兜底方案要用它拿基址，再自己算 YV12 平面）
     void* vaddr = nullptr;
     status_t e2 = mapper.lock(handle,
             GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,

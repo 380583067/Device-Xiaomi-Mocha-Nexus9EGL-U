@@ -91,28 +91,28 @@ PRODUCT_PROPERTY_OVERRIDES += \
     bluetooth.a2dp.sink.enabled=false
 
 # Camera
-# FIX NOTE: the vendor NVIDIA camera blob (camera.vendor.tegra.so) reads at runtime
-# /system/etc/nvcamera.conf and /system/etc/model_frontal.xml (absolute paths, see the
-# blob source NvCameraHal). They were previously copied to /vendor/etc/, so the blob
-# could not read its config and camera init failed. Now copied to system/etc/. Ref: Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S.
+# 修复说明：原厂 NVIDIA 相机 blob（camera.vendor.tegra.so）在运行时读取
+# /system/etc/nvcamera.conf 和 /system/etc/model_frontal.xml（绝对路径，见 blob 源码
+# NvCameraHal），原先复制到 /vendor/etc/ 导致 blob 读不到配置、相机初始化失败。
+# 改为复制到 system/etc/。参考 Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S。
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/camera/nvcamera.conf:system/etc/nvcamera.conf \
     $(LOCAL_PATH)/camera/model_frontal.xml:system/etc/model_frontal.xml
 
-# NOTE: the camera wrapper (camera.tegra) is the original device-tree approach
-# (CameraWrapper + Camera3Wrapper around the vendor blob).
+# 注：相机 wrapper（camera.tegra）为设备树原始方案（CameraWrapper + Camera3Wrapper
+# 包装原厂 blob）。
 #
-# FIX NOTE (camera reports zero devices):
-#   The vendor blob camera.vendor.tegra.so fails to dlopen on Android 14: 2 DT_NEEDED
-#   files and 9 Android C++ ABI symbols are missing. See camera/Android.mk and the
-#   header of camera/mocha_camera_shim.cpp. Three fallback libraries are shipped:
-#     libcameraservice_mocha     -> builds libcameraservice_mocha.so whose SONAME
-#                                   declares itself as libcameraservice.so (empty stub)
-#     libpowerservice_client     -> PowerServiceClient constructor + sendPowerHint
-#     libmocha_camera_shim       -> CameraMetadata/Fence/SensorManager ABI forwarding
-#     libbeautify                -> replaces the vendor beautify lib (which depends on the
-#                                   TEXTREL libFaceProc.so, refused by Android 14)
-# libmocha_camera_shim is preloaded through TARGET_LD_SHIM_LIBS in BoardConfig.mk.
+# 修复说明（相机设备数 = 0）：
+#   原厂 blob camera.vendor.tegra.so 在 Android 14 上 dlopen 失败，缺 2 个 DT_NEEDED
+#   文件 + 9 个 Android C++ ABI 符号。补齐方案见 camera/Android.mk 与
+#   camera/mocha_camera_shim.cpp 头部注释。这里把 3 个兜底库打进镜像：
+#     libcameraservice_mocha     -> 生成 libcameraservice_mocha.so，
+#                                   SONAME 声明为 libcameraservice.so（空 stub）
+#     libpowerservice_client     -> PowerServiceClient 构造 + sendPowerHint
+#     libmocha_camera_shim       -> CameraMetadata/Fence/SensorManager ABI 转发
+#     libbeautify                -> 顶替原厂美颜库（原厂库依赖带 TEXTREL 的
+#                                   libFaceProc.so，Android 14 拒绝加载）
+# 其中 libmocha_camera_shim 由 BoardConfig.mk 的 TARGET_LD_SHIM_LIBS 预加载。
 PRODUCT_PACKAGES += \
     camera.device@1.0-impl \
     android.hardware.camera.provider@2.4-impl \
@@ -153,23 +153,23 @@ PRODUCT_PACKAGES += \
     fastbootd
 
 # FM Radio (Broadcom BCM4354)
-# Full stack (brought up 2026-11-16):
-#   1) Kernel: CONFIG_V4L2_FM_DRIVER=y, drivers/bluetooth/broadcom/v4l2_fm_driver/
-#      -> exposes /dev/radio0 (V4L2 radio device)
-#   2) libfmradio.v4l2-fm.so - the V4L2 backend, opens /dev/radio0 and is loaded
-#      by libfmjni via dlopen (installed to /system/lib so LIBRARY_PATH resolves it)
-#   3) libfmjni.so - JNI layer registering com/android/fmradio/FmNative for the
-#      FMRadio app's System.loadLibrary("fmjni") (installed to /system/lib)
-#   4) brcm-uim-sysfs - switches the BCM4354 from BT HCI mode to UIM/FM mode by
-#      writing the bcm_ldisc sysfs node (installed to /system/bin, started by init)
-#   5) FMRadio - the FM app shipped with the ROM (packages/apps/FMRadio)
+# 完整链路（2026-11-16 打通）：
+#   1) 内核：CONFIG_V4L2_FM_DRIVER=y，drivers/bluetooth/broadcom/v4l2_fm_driver/
+#      → 提供 /dev/radio0（V4L2 radio 设备）
+#   2) libfmradio.v4l2-fm.so —— V4L2 底层实现，open("/dev/radio0")，
+#      由 libfmjni 通过 dlopen 加载（装 /system/lib，与 LIBRARY_PATH 一致）
+#   3) libfmjni.so —— JNI 层，注册 com/android/fmradio/FmNative，
+#      供 FMRadio app 的 System.loadLibrary("fmjni") 使用（装 /system/lib）
+#   4) brcm-uim-sysfs —— 把 BCM4354 从 BT HCI 模式切到 UIM/FM 模式，
+#      写 bcm_ldisc 的 sysfs 节点（装 /system/bin，由 init 启动）
+#   5) FMRadio —— ROM 自带的 FM 应用（packages/apps/FMRadio）
 #
-# Root causes of the earlier breakage (all resolved):
-#   - libfmjni was defined in Android.mk while FMRadio's jni_libs is a Soong property,
-#     so the Make module was invisible -> "FMRadio depends on undefined module libfmjni"
-#   -> converted to libfmjni/Android.bp (see the header of that file)
-#   - the MTK build of libfmjni bundled with FMRadio is incompatible with this chip
-#   -> BoardConfig.mk sets BOARD_HAVE_MTK_FM := true to disable that namespace
+# 之前不可用的根因（已解决）：
+#   - libfmjni 原先用 Android.mk 定义，而 FMRadio 的 jni_libs 是 Soong 属性，
+#     解析不到 Make 模块 → "FMRadio depends on undefined module libfmjni"
+#   → 已转成 libfmjni/Android.bp（见该文件头部说明）
+#   - FMRadio 自带的 MTK 版 libfmjni 与本芯片不兼容
+#   → BoardConfig.mk 设 BOARD_HAVE_MTK_FM := true 关闭其 namespace
 PRODUCT_PACKAGES += \
     libfmjni \
     libfmradio.v4l2-fm \
@@ -190,11 +190,11 @@ PRODUCT_PACKAGES += \
     android.hardware.renderscript@1.0-impl
 
 # Shims
-# FIX NOTE: add libnvomxadaptor_shim, which supplies the old-ABI GraphicBuffer symbols
-# missing from the NVIDIA hardware OMX decoding adaptor (preloaded via TARGET_LD_SHIM_LIBS).
-# libsensors_fastsys_shim: short-circuits the pointless system("rm -rf /sys/...") fork
-# inside the sensor blob. Measured: sensorservice readiness drops from 5.7s to about 2s,
-# which also shortens the synchronous wait in DeviceStateManagerService (boot-speed work).
+# 修复说明：新增 libnvomxadaptor_shim，为 NVIDIA 硬件 OMX 解码 adaptor 提供缺失的
+# GraphicBuffer 旧 ABI 符号（配合 BoardConfig TARGET_LD_SHIM_LIBS 预加载）。
+# libsensors_fastsys_shim：短路传感器 blob 里 system("rm -rf /sys/...") 的
+# 无意义 fork，实测可把 sensorservice 就绪时间从 5.7 秒压到 2 秒多，
+# 连带缩短 DeviceStateManagerService 的同步等待（开机速度专项）。
 PRODUCT_PACKAGES += \
     libs \
     libshim_zw \
@@ -302,7 +302,20 @@ DEVICE_PACKAGE_OVERLAYS += \
 $(call inherit-product, $(SRC_TARGET_DIR)/product/non_ab_device.mk)
 
 # Permissions
+# Vulkan：采用 Smoke(lineage-19.1) 的配套 blob 隔离方案（2026-11-16）：
+#   1) 原厂 vulkan.tegra.so(Android24) 与 libglcore.so(20M) 版本错配，函数表结构
+#      不一致导致 CreateInstance 空指针崩溃（SEGV_MAPERR addr=0x4）。
+#   2) 改用 Smoke 配套对：vulkan.tegra.so(Android28) + libglcore.so(11M)，并把
+#      libglcore.so 复制为 libvkcore.so（SONAME 等长改名），vulkan shim 里
+#      dlopen("libglcore.so") 等长改成 dlopen("libvkcore.so")，让 Vulkan 走独立副本，
+#      EGL 继续用原 libglcore.so，物理隔离、互不干扰。
+#   3) 非 Treble 板 linker namespace 只有 /vendor/lib 不含 /vendor/lib/hw，故在
+#      /vendor/lib/ 额外放一份 vulkan.tegra.so（见 mocha-vendor-blobs.mk）。
+# 恢复 3 个 Vulkan feature 声明（照抄 Smoke device.mk）。
 PRODUCT_COPY_FILES += \
+    frameworks/native/data/etc/android.hardware.vulkan.compute-0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.compute-0.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml \
+    frameworks/native/data/etc/android.hardware.vulkan.version-1_0_3.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml \
     frameworks/native/data/etc/android.hardware.audio.low_latency.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.audio.low_latency.xml \
     frameworks/native/data/etc/android.hardware.audio.output.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.audio.output.xml \
     frameworks/native/data/etc/android.hardware.audio.pro.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.audio.pro.xml \
@@ -317,10 +330,6 @@ PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.location.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.xml \
     frameworks/native/data/etc/android.hardware.location.gps.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.location.gps.xml \
     frameworks/native/data/etc/android.hardware.opengles.aep.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.opengles.aep.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.compute-0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.compute.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.level-1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.level.xml \
-    frameworks/native/data/etc/android.hardware.vulkan.version-1_1.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.vulkan.version.xml \
-    frameworks/native/data/etc/android.software.vulkan.deqp.level-2020-03-01.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.software.vulkan.deqp.level.xml \
     frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.accelerometer.xml \
     frameworks/native/data/etc/android.hardware.sensor.compass.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.compass.xml \
     frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.sensor.gyroscope.xml \
@@ -381,9 +390,9 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/init.renderer.sh:$(TARGET_COPY_OUT_VENDOR)/bin/init.renderer.sh \
     $(LOCAL_PATH)/initfiles/ussr_setup.sh:/system/bin/ussr_setup.sh
 
-# adb self-check script: after boot, verifies the adbd USB transport and reboots into
-# recovery (TWRP) on failure, so a failed fix does not require manual key presses to get logs.
-# Triggered by the adb_selfcheck service in init.tegra.rc once sys.boot_completed=1.
+# adb 自检脚本：开机后延迟检测 adbd USB transport 是否正常，异常自动重启到
+# recovery(TWRP)，避免修复失败时需要用户手动按键进入 TWRP 拉日志。
+# 由 init.tegra.rc 中的 adb_selfcheck 服务在 sys.boot_completed=1 后触发。
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/adb_selfcheck.sh:$(TARGET_COPY_OUT_VENDOR)/bin/adb_selfcheck.sh
 
@@ -451,50 +460,50 @@ PRODUCT_PACKAGES += \
     wpa_supplicant \
     wpa_supplicant.conf
 
-# ==== libwifi-hal must ship to the vendor partition as a prebuilt (measured 2026-11-16) ====
-# Symptom: the mtime of /system/vendor/lib/libwifi-hal.so always stays at the last full build;
-#   after editing sources under frameworks/opt/net/wifi or hardware/broadcom/wlan, mka
+# ==== libwifi-hal 必须以 prebuilt 形式装进 vendor 分区（2026-11-16 真机实测）====
+# 现象：/system/vendor/lib/libwifi-hal.so 的 mtime 永远是"上一次完整编译"的时间，
+#   改了 frameworks/opt/net/wifi 或 hardware/broadcom/wlan 的源码后，mka 只重编
 #   APEX variant（out/.../apex/com.android.hardware.wifi/lib/libwifi-hal.so），
-#   only rebuilds the APEX copy while the file in the vendor partition never changes.
+#   而 vendor 分区那份纹丝不动。
 #
-# Root cause: on A14 libwifi-hal is APEX-only (the cc_library_shared "libwifi-hal" in
-#   frameworks/opt/net/wifi/libwifi_hal/Android.bp only produces an APEX variant), so Soong
-#   never generates a vendor variant. The wifi HAL here is the vendor binary extracted
-#   from stock, /vendor/bin/hw/android.hardware.wifi@1.0-service.legacy, and ldd clearly
-#   shows it loads /system/vendor/lib/libwifi-hal.so - so it always runs that stale copy
-#   and source changes never take effect. PRODUCT_PACKAGES += libwifi-hal does not help
-#   (measured): it only installs the APEX variant into the APEX, never into vendor.
+# 根因：A14 的 libwifi-hal 已经 APEX 化（frameworks/opt/net/wifi/libwifi_hal/Android.bp
+#   的 cc_library_shared "libwifi-hal" 只产出 APEX variant），Soong 根本不会为它
+#   生成 vendor variant。而本机的 wifi HAL 是原厂提取的 vendor 二进制
+#   /vendor/bin/hw/android.hardware.wifi@1.0-service.legacy，ldd 明确显示它加载的是
+#   /system/vendor/lib/libwifi-hal.so —— 于是它永远跑那份历史残留的旧代码，
+#   源码改动 100% 不生效。加 PRODUCT_PACKAGES += libwifi-hal 也没用（实测无效），
+#   因为它只会把 APEX variant 装进 APEX，不碰 vendor。
 #
-# Hence PRODUCT_COPY_FILES is used here to copy the built .so into the vendor partition.
-# [MAINTENANCE] prebuilts/libwifi-hal.so is a snapshot. After changing
-#   hardware/broadcom/wlan/bcmdhd/wifi_hal/ (especially sanitize/cflags of libwifi-hal-bcm)
-#   or frameworks/opt/net/wifi/libwifi_hal/, you must run:
+# 因此这里用 PRODUCT_COPY_FILES 直接把编好的 so 复制到 vendor 分区。
+# 【维护提示】prebuilts/libwifi-hal.so 是一个"快照"，改动
+#   hardware/broadcom/wlan/bcmdhd/wifi_hal/（尤其 libwifi-hal-bcm 的 sanitize/cflags）
+#   或 frameworks/opt/net/wifi/libwifi_hal/ 之后，必须执行：
 #       m libwifi-hal -j16
 #       cp out/target/product/mocha/apex/com.android.hardware.wifi/lib/libwifi-hal.so \
 #          device/xiaomi/mocha/prebuilts/libwifi-hal.so
-#   otherwise the vendor partition keeps the old binary.
+#   否则 vendor 里仍是旧二进制。
 #
-# Why this had to be changed: wifi_cleanup() in the vendor libwifi-hal dereferences a
-#   stale callback pointer, so the wifi HAL aborts during stop. Without the guard in
-#   WifiHalHidlImpl the framework then throws an NPE on a null IWifi (FATAL EXCEPTION IN SYSTEM PROCESS) and the boot animation replays.
+# 本机为何必须改它：libwifi-hal-bcm 缺 sanitize.cfi 导致 wifi_cleanup 的 CFI 检查
+#   必然失败 → wifi HAL abort → system_server 的 WifiHalHidlImpl.registerHalCallback
+#   拿到 null IWifi 抛 NPE（FATAL EXCEPTION IN SYSTEM PROCESS）→ 开机动画重放。
 PRODUCT_COPY_FILES += \
     device/xiaomi/mocha/prebuilts/libwifi-hal.so:$(TARGET_COPY_OUT_VENDOR)/lib/libwifi-hal.so
 
-# ==== Static single-frame boot image (measured on the device 2026-11-16) ====
-# Historically hwcomposer.tegra.so crashed reliably on the first presentDisplay after a
-# cold start of SurfaceFlinger (gralloc buffer handle UAF; disassembly showed
-# ldr r0,[r5,#0x100] loading the base of an already munmap'ed page). composer died ->
+# ==== 静态单帧开机画面（2026-11-16 真机实测）====
+# 本机 hwcomposer.tegra.so 在 SurfaceFlinger 冷启动第一次 presentDisplay 时会稳定崩溃
+# 一次（gralloc buffer handle UAF，反汇编确认是 ldr r0,[r5,#0x100] 取出已 munmap 的
+# 页基址后解引用）。composer 崩 → SF 重启 → init 的
 #    on property:init.svc.surfaceflinger=running -> start bootanim
-# SF restarted -> init relaunched the boot animation, 2-3 rounds per boot, which the user
+# 又会把开机动画重新拉起，实测开机阶段重复 2~3 轮，用户看到的是"开机动画一直在循环"。
 #
-# saw as an endless boot animation. That crash was a side effect of system_server restarting
-# (fixed by guarding null IWifi in WifiHalHidlImpl), but a still image also keeps boot quiet:
-# a single-frame animation plus "p 1 0 part0" in desc.txt (play once and hold) means every
-# restart of bootanim shows the same still frame instead of jumping back to the start.
-# This also covers any future composer restart caused by something else.
+# 崩溃点位于 prebuilt blob 内部（gralloc/hwcomposer 均无源码，且 NvGrDecompressBuffer
+# 不是动态符号引用，无法用 LD_SHIM_LIBS 劫持），用户态无法根治。
+# 但"观感上的循环"可以消除：换成单帧动画 + desc.txt 的 "p 1 0 part0"（播一次停住），
+# 这样即使 bootanim 被 init 重启多次，每一轮显示的都是同一张静止画面，
+# 不会出现"动画从头再播一遍"的跳变。
 #
-# [MAINTENANCE] To restore the original animation, drop this PRODUCT_COPY_FILES entry;
-#   to use your own boot image, replace prebuilts/bootanimation.zip (must be stored, not deflated).
+# 【维护提示】若要恢复原版动画，删掉本条 PRODUCT_COPY_FILES 即可；
+#   若要换成自己的开机画面，直接替换 prebuilts/bootanimation.zip（需 store 压缩）。
 PRODUCT_COPY_FILES += \
     device/xiaomi/mocha/prebuilts/bootanimation.zip:$(TARGET_COPY_OUT_SYSTEM)/media/bootanimation.zip
 

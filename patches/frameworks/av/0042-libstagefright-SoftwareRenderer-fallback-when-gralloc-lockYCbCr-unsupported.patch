@@ -19,28 +19,28 @@ index 2409315..c78444a 100644
 +                GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY;
 +        status_t lockError = mapper.lockYCbCr(buf->handle, usage, bounds, &ycbcr);
 +        if (lockError != NO_ERROR) {
-+            // mocha (NVIDIA Tegra K1 / TN8) adaptation:
-+            // gralloc.tegra.so on this device does export NvGrLock_ycbcr, but
-+            // for YV12 buffers it returns -ENOSYS (-38) outright ("Locking for
-+            // SW use not supported (unknown shadow format)"), so the original
-+            // CHECK_EQ aborts and Gallery crashes on any software-decoded video.
++            // mocha (NVIDIA Tegra K1 / TN8) 适配：
++            // 该设备的 gralloc.tegra.so 虽然导出了 NvGrLock_ycbcr，但对 YV12
++            // 缓冲区直接返回 -ENOSYS(-38)（"Locking for SW use not supported
++            // (unknown shadow format)"），导致原来的 CHECK_EQ 直接 abort，
++            // 表现为图库一播放软件解码的视频就闪退。
 +            //
-+            // Measured: this gralloc can only allocate YV12 at all -
-+            // YCbCr_420_888 / NV12 / NV21 already fail to allocate, while a plain
-+            // single-plane lock() works fine on YV12. So degrade to single-plane
-+            // lock plus a manually derived Y/Cb/Cr layout: no crash, zero-copy kept.
++            // 实测该 gralloc 只有 YV12 可分配：HAL_PIXEL_FORMAT_YCbCr_420_888 /
++            // NV12 / NV21 都在分配阶段就失败；而单平面 lock() 对 YV12 完全正常。
++            // 因此这里退化成"单平面加锁 + 按 YV12 平面布局自行计算 Y/Cb/Cr"，
++            // 既不崩溃，也保留了 YUV 直写的零转换快速路径。
 +            ALOGW("lockYCbCr failed (%d), falling back to single-plane lock + "
 +                  "manual YV12 layout", lockError);
 +
 +            uint8_t *base = NULL;
 +            lockError = mapper.lock(buf->handle, usage, bounds,
 +                                    reinterpret_cast<void **>(&base));
-+            CHECK_EQ(NO_ERROR, lockError);   // no fallback if this one fails too
++            CHECK_EQ(NO_ERROR, lockError);   // 单平面 lock 若也失败则无路可退
 +
-+            // HAL_PIXEL_FORMAT_YV12 memory layout (stride/height are aligned):
-+            //   [ Y plane: yStride * height ]
-+            //   [ V plane: cStride * (height/2) ]   <- YV12 stores V before U
-+            //   [ U plane: cStride * (height/2) ]
++            // HAL_PIXEL_FORMAT_YV12 内存布局（stride/height 均为对齐后的值）：
++            //   [ Y 平面: yStride * height ]
++            //   [ V 平面: cStride * (height/2) ]   ← YV12 先 V 后 U
++            //   [ U 平面: cStride * (height/2) ]
 +            const size_t yStride = buf->stride;
 +            const size_t cStride = yStride / 2;
 +            const size_t cPlaneSize = cStride * (buf->height / 2);
@@ -50,7 +50,7 @@ index 2409315..c78444a 100644
 +            ycbcr.cb = base + yStride * buf->height + cPlaneSize; // U
 +            ycbcr.ystride = yStride;
 +            ycbcr.cstride = cStride;
-+            ycbcr.chroma_step = 1;   // planar, chroma step is one byte
++            ycbcr.chroma_step = 1;   // 平面式，chroma 步长为 1 字节
 +        }
      } else {
          CHECK_EQ(0, mapper.lock(buf->handle,

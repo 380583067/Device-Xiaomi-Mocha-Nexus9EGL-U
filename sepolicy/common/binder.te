@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Allow hwservicemanager to access the Binder device
+# 允许hwservicemanager访问Binder设备
 allow hwservicemanager binder_device:chr_file { ioctl read write };
 
-# Allow the vold process to issue Binder ioctls
+# 允许vold进程执行Binder ioctl
 allow vold binder_device:chr_file { ioctl };
 

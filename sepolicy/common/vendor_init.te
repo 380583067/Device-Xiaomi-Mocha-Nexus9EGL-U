@@ -15,7 +15,7 @@ allow fsck block_device:blk_file { read open write ioctl };
 allow vendor_init system_data_file:dir { write add_name create setattr };
 allow vendor_init system_data_file:dir { read open };
 
-# Allow the vendor_init domain to read apexd properties
+# 允许vendor_init域读取apexd属性
 allow vendor_init apexd_prop:file read;
 
 # HWC permissions belong to common/hal_graphics_composer_default.te; do not

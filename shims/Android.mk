@@ -40,27 +40,15 @@ LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)
 
 # libnvomxadaptor_shim
-#
-# FIX: libnvomxadaptor.so is the NVIDIA hardware OMX decoder adaptor taken from
-# an Android 5 era blob. It imports an old-ABI symbol:
-#
-#     _ZN7android13GraphicBufferC1EP19ANativeWindowBufferb
-#
-# i.e. GraphicBuffer(ANativeWindowBuffer*, bool). That constructor was removed
-# from libui in Android 10+, so libnvomxadaptor.so fails to load and hardware
-# media decoding is unavailable. The log shows:
-#
-#     cannot locate symbol "_ZN7android13GraphicBufferC1EP19ANativeWindowBufferb"
-#      referenced by "/system/vendor/lib/libnvomxadaptor.so"
-#
-# This shim re-implements the legacy symbol on top of the 8-argument constructor
-# that still exists, and additionally provides the legacy
-# BufferQueue::createBufferQueue signature and MediaBuffer::refcount that
-# libnvomxadaptor also references, so the blob can be preloaded via
-# TARGET_LD_SHIM_LIBS.
-#
-# Reference: shims/libnvomxadaptor_shim.cpp from
-# Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S.
+# 修复说明：libnvomxadaptor.so（NVIDIA 硬件 OMX 解码 adaptor，Android 5 时代的 blob）
+# 引用了旧 ABI 符号 _ZN7android13GraphicBufferC1EP19ANativeWindowBufferb
+# （即 GraphicBuffer(ANativeWindowBuffer*, bool) 构造函数），该构造函数在 Android 10+
+# 的 libui 中已被移除，导致 libnvomxadaptor.so 加载失败、媒体硬件解码不可用
+# （日志：cannot locate symbol "_ZN7android13GraphicBufferC1EP19ANativeWindowBufferb"
+#  referenced by "/system/vendor/lib/libnvomxadaptor.so"）。
+# 本 shim 用现存的 8 参数构造函数重新实现该旧符号，并补齐 libnvomxadaptor 还引用的
+# BufferQueue::createBufferQueue 旧签名与 MediaBuffer::refcount，供 LD_SHIM_LIBS 预加载。
+# 参考 Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S 的 shims/libnvomxadaptor_shim.cpp。
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := libnvomxadaptor_shim.cpp
 LOCAL_SHARED_LIBRARIES := libui libgui libstagefright_foundation
@@ -72,21 +60,14 @@ LOCAL_MODULE_TAGS := optional
 include $(BUILD_SHARED_LIBRARY)
 
 # libsensors_fastsys_shim
-#
-# FIX (boot speed): the sensor HAL blob (libsensors.lsm6db0.so, NVIDIA
-# proprietary) calls system("rm -rf /sys/bus/iio/devices/...") while
-# initialising, in order to clean up iio nodes. On Android 14 system() expands
-# to posix_spawn("/system/bin/sh", "-c", ...) + waitpid, which costs 1.5-2 s per
-# call on this device (Tegra K1 + 2 GB), and what it deletes are sysfs nodes, so
-# the operation is guaranteed to fail anyway.
-#
-# As a result sensorservice needed 5.68 s to become ready, which in turn made
-# DeviceStateManagerService wait 6 s synchronously - the single largest item in
-# startOtherServices.
-#
-# This shim short-circuits that known-useless call; every other command is
-# forwarded to libc unchanged. See the header comment in
-# libsensors_fastsys_shim.cpp for the full analysis.
+# 修复说明（开机速度）：传感器 HAL blob（libsensors.lsm6db0.so，NVIDIA 原厂）
+# 初始化时用 system("rm -rf /sys/bus/iio/devices/...") 清理 iio 节点。在
+# Android 14 上 system() = posix_spawn("/system/bin/sh","-c",...) + waitpid，
+# 本机（Tegra K1 + 2GB）一次要 1.5~2 秒，而它删的是 sysfs 节点、必然失败。
+# sensorservice 因此要 5.68 秒才就绪，进而让 DeviceStateManagerService 同步
+# 等待 6 秒（它是 startOtherServices 里最大的单体耗时）。
+# 本 shim 短路掉这条已知无效的调用，其它命令照常转交 libc。
+# 详见 libsensors_fastsys_shim.cpp 头部注释。
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := libsensors_fastsys_shim.cpp
 LOCAL_SHARED_LIBRARIES := liblog libdl

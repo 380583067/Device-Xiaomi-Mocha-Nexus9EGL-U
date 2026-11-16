@@ -105,29 +105,29 @@ static camera_metadata_t* vendorInfo[2] = {0,0};
 static camera_info vendor_camera_info;
 
 /*
- * Preload the ABI compatibility layer for the camera blob
+ * 预加载相机 blob 的 ABI 兼容层
  * ============================================================================
- * The vendor blob camera.vendor.tegra.so was compiled in the Android 5.1 era; loading it
- * directly through hw_get_module fails (2 missing DT_NEEDED files plus Android C++ ABI symbols).
- * See the header of device/xiaomi/mocha/camera/mocha_camera_shim.cpp for the approach.
+ * 原厂 blob camera.vendor.tegra.so 是 Android 5.1 时代编译的，直接
+ * hw_get_module 加载会失败（缺 2 个 DT_NEEDED 文件 + 一批 Android C++ ABI 符号）。
+ * 修补思路见 device/xiaomi/mocha/camera/mocha_camera_shim.cpp 的头部注释。
  *
- * This function pushes those shim libraries into the process ahead of time. Two injection
- *   1) TARGET_LD_SHIM_LIBS in BoardConfig.mk - that mechanism compiles the mapping table
- *      into /system/bin/linker. It is the canonical way, but changing it needs a new system image;
- *   2) this function - an explicit dlopen. It does not depend on the linker binary, so hot-
- *      swapping the library is enough to verify, and dlopen is idempotent when both are active.
+ * 这里负责把那些补丁库提前塞进本进程。两条注入途径同时保留：
+ *   1) BoardConfig.mk 的 TARGET_LD_SHIM_LIBS —— 那套机制把映射表编译进了
+ *      /system/bin/linker，是"正统"做法，但改它必须刷新的 system 镜像；
+ *   2) 就是这个函数 —— 显式 dlopen。好处是不依赖 linker 二进制，热替换库文件
+ *      就能验证，而且在两套机制都生效时 dlopen 本身是幂等的。
  *
- * Load order of the two libraries matters:
- *   - libcameraservice_mocha.so declares its ELF SONAME as "libcameraservice.so"
- *     (because Make forbids LOCAL_MODULE_STEM on a SHARED_LIBRARY and the module name
- *     clashes with the Soong cc_library). It must load before the blob so that the blob's
- *     DT_NEEDED "libcameraservice.so" hits the soname index of loaded libraries
+ * 两个库的加载顺序有讲究：
+ *   - libcameraservice_mocha.so 的 ELF SONAME 声明成了 "libcameraservice.so"
+ *     （因为 Make 不允许给 SHARED_LIBRARY 设 LOCAL_MODULE_STEM，模块名又和
+ *     Soong 里那个 cc_library 撞车）。它必须比 blob 先加载，blob 的
+ *     DT_NEEDED "libcameraservice.so" 才能命中已加载库的 soname 索引
  *     （bionic linker.cpp:1468 find_loaded_library_by_soname）。
- *   - libmocha_camera_shim.so is built with DF_1_GLOBAL (-Wl,-z,global), so opening it
- *     with RTLD_GLOBAL puts its symbols in the process global group and the blob can
- *     resolve the reshaped or vanished CameraMetadata / Fence / SensorManager symbols.
+ *   - libmocha_camera_shim.so 带 DF_1_GLOBAL（链接时 -Wl,-z,global），
+ *     用 RTLD_GLOBAL 打开后其符号进入进程的 global group，blob 才能解析到
+ *     CameraMetadata / Fence / SensorManager 那些变形或消失的符号。
  *
- * Failure is not fatal: the camera does not work anyway, so the worst case is an earlier log.
+ * 失败不致命：相机本来就用不了，这里最多是让日志更早暴露原因。
  */
 static void preload_vendor_camera_shims() __attribute__((unused));
 static void preload_vendor_camera_shims()
@@ -157,21 +157,21 @@ static int check_vendor_module()
         return 0;
 
     /*
-     * NOTE: preload_vendor_camera_shims() is *deliberately not called* here.
+     * 注意：这里**故意不调用** preload_vendor_camera_shims()。
      *
-     * Measured result (2026-11, on device): with all ABI shims in place the blob does
-     * dlopen successfully (camera_shim_test shows all 345 undefined symbols resolvable), but
-     * camera.vendor.tegra.so uses NVIDIA's legacy PCL path while this kernel's camera
-     * device tree was rewritten around the V4L2 subdev framework (tegra124-mocha-camera-mc.dtsi:
-     * imx179@10 / ov5693@36 / ad5823@0c) and has no PCL nodes the blob expects.
-     * The blob then probes PCL chips one by one, all time out (4s each) and hold the i2c
-     * bus lock for a long time, *freezing the entire system* (adb shell blocks, adb reboot hangs).
+     * 实测结论（2026-11，真机验证）：把 ABI shim 全部补齐之后，blob 确实能
+     * dlopen 成功（camera_shim_test 显示 345 个未定义符号全部可解析），但
+     * camera.vendor.tegra.so 走的是 NVIDIA 老式 PCL 通路，而本内核的摄像头
+     * 设备树已经按 V4L2 subdev 框架重写（tegra124-mocha-camera-mc.dtsi：
+     * imx179@10 / ov5693@36 / ad5823@0c），没有 blob 需要的 PCL 节点。
+     * 后果是 blob 逐个探测 PCL 芯片全部超时（每个 4 秒），长时间占住 i2c 总线锁，
+     * **直接把整个系统卡死**（adb shell 全部阻塞、adb reboot 无响应）。
      *
-     * Therefore the blob path cannot be enabled before the HAL switches to the in-house
-     * V4L2 implementation (MochaCameraHAL.cpp). The function is kept so it can be restored
+     * 所以 blob 这条路在 HAL 切换到 V4L2 自研实现（MochaCameraHAL.cpp）之前
+     * 不能启用。保留这个函数是为了将来若补齐 PCL 设备树时能一键恢复。
      *
-     * To restore: uncomment the line below and also restore the two commented-out camera
-     * lines of TARGET_LD_SHIM_LIBS in BoardConfig.mk.
+     * 恢复方法：取消下面这行注释，同时把 BoardConfig.mk 里被注释掉的
+     * TARGET_LD_SHIM_LIBS 相机两行也恢复。
      */
     // preload_vendor_camera_shims();
 

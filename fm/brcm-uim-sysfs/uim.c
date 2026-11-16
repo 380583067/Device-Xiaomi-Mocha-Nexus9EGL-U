@@ -64,37 +64,37 @@
 #undef  LOG_TAG
 #define LOG_TAG "brcm-uim"
 
-/* FIX NOTE (FM, 2026-11-16, measured on mocha hardware):
+/* 修复说明（FM，2026-11-16，真机 mocha 实测）：
  *
- * This macro is the timeout for the poll() in main() that waits for the kernel install notification.
+ * 这个宏是给 main() 里「等内核 install 通知」的那个 poll() 用的超时值。
  *
- * Background: brcm_sh_ldisc_start() in brcm_sh_ldisc.c does:
- *     hu->ldisc_install = V4L2_STATUS_ON;          // set to '1'
+ * 背景：内核 brcm_sh_ldisc.c 的 brcm_sh_ldisc_start() 流程是
+ *     hu->ldisc_install = V4L2_STATUS_ON;          // 置 '1'
  *     sysfs_notify(&pdev->dev.kobj, NULL, "install");
  *     wait_for_completion_timeout(&ldisc_installed, 1500ms);   // LDISC_TIME
- * So after setting install to 1 the kernel waits *only 1.5 seconds*. UIM must complete
- * "open UART -> HCI reset -> set baud rate -> write fw_patchfile ->
- * TIOCSETD(N_BRCM_HCI)" within that window for ldisc_installed to complete.
+ * 也就是说，内核把 install 置 1 之后**只等 1.5 秒**。UIM 必须在这 1.5 秒内
+ * 完成「打开串口 -> HCI reset -> 设置波特率 -> 写 fw_patchfile ->
+ * TIOCSETD(N_BRCM_HCI)」，内核侧 ldisc_installed 才会 complete。
  *
- * The original code used poll(&p, 1, -1), i.e. *wait forever*, relying entirely on sysfs_notify.
- * This 3.10 kernel uses the old sysfs_dirent implementation (sysfs_poll / sysfs_notify_dirent
- * in fs/sysfs/file.c) whose wakeup compares the od->event counter:
+ * 原代码这里是 poll(&p, 1, -1)，即**无限等待**，完全依赖 sysfs_notify 的唤醒。
+ * 本机 3.10 内核用的是老的 sysfs_dirent 版实现（fs/sysfs/file.c 的
+ * sysfs_poll / sysfs_notify_dirent），它的唤醒是拿 od->event 计数做比较的：
  *     if (buffer->event != atomic_read(&od->event)) goto trigger;
- * Measured: events get lost. The kernel log shows install='1' set 7 times in a row (retrying
- * after each 1.5s timeout, 21s total) with UIM never woken even once, until the kernel
- * finally set install back to '0':
+ * 实测会漏事件：真机日志里内核连续置了 7 次 install='1'（每次 1.5s 超时后
+ * 重试，共 21 秒），UIM 一次都没被唤醒，直到内核最后把 install 置回 '0'
+ * 时才醒了一次：
  *     I brcm-uim: After Polling ... erro = 1
  *     I brcm-uim: value of install = 0
- * The outcome is always:
+ * 结果永远是：
  *     (brcmldisc)ERR:brcm_sh_ldisc_stop timed out waiting for ldisc to be un-installed
  *     (v4l2fmdrv):fmc_prepare (fmdrv): Failed to get shared ldisc write func pointer
  *     (fmdrv): Unable to prepare FM CORE
- * open("/dev/radio0") then returns -EAGAIN and FM cannot be opened.
+ * open("/dev/radio0") 于是返回 -EAGAIN，FM 打不开。
  *
- * Countermeasure: replace the infinite poll with a timed poll that actively re-reads install.
- * Even if the sysfs wakeup is lost entirely, UIM sees install='1' again within 250ms, far
- * below the kernel's 1.5s window; 250ms also costs negligible CPU (the buggy version
- * simply hung forever).
+ * 对策：把无限 poll 改成「带超时 poll + 每轮都主动重读 install」。
+ * 即使 sysfs 的唤醒完全丢失，UIM 也会在 250ms 内重新看到 install='1'，
+ * 远小于内核 1.5s 的窗口；同时 250ms 对 CPU 开销可以忽略（原来 bug 版本
+ * 就是无限期挂着）。
  */
 #define UIM_POLL_TIMEOUT_MS 250
 
@@ -1435,10 +1435,10 @@ int main(void)
 {
     int st_fd, err;
     struct pollfd p;
-    /* FIX NOTE (FM, 2026-11-16):
-     * install must be initialised. It used to be a bare unsigned char, so a failed first read
-     * (err <= 0) carried a random stack value into the comparison below.
-     * poll_tick is a counter for the heartbeat log (see the wait loop). */
+    /* 修复说明（FM，2026-11-16）：
+     * install 必须初始化。原来它是裸的 unsigned char，如果首次 read 失败
+     * （err <= 0）就会带着栈上的随机值进入下面的比较逻辑。
+     * poll_tick 是心跳日志用的计数器（见等待循环）。 */
     unsigned char install = V4L2_STATUS_OFF;
     unsigned int poll_tick = 0;
 
@@ -1508,47 +1508,47 @@ int main(void)
     }
 
 /* ============================================================================
- * FIX NOTE (FM, 2026-11-16, measured on mocha hardware) -- main wait loop rewritten
+ * 修复说明（FM，2026-11-16，真机 mocha 实测）—— 主等待循环重写
  *
- * The original code jumped between two blocks:
- *     RE_POLL:                // close + reopen install, read once, branch on the value
- *     RE_POLL_TILL_POLL_ERR:  // poll(&p,1,-1) waiting forever for a sysfs wakeup
- * On this device (3.10 kernel + old sysfs_dirent fs/sysfs/file.c) it had two fatal problems:
+ * 原来这里是两段式跳转：
+ *     RE_POLL:                // close + 重新 open install，读一次，按值分支
+ *     RE_POLL_TILL_POLL_ERR:  // poll(&p,1,-1) 无限等 sysfs 唤醒
+ * 在本机（3.10 内核 + 老的 sysfs_dirent 版 fs/sysfs/file.c）有两个致命问题：
  *
- *  1) The infinite poll loses wakeups, so FM can never be opened.
- *     Measured: the kernel set install='1' and called sysfs_notify 7 times in a row, waiting
- *     1500ms each time (LDISC_TIME in brcm_hci_uart.h) and retrying, about 21s total, while
- *     UIM never woke; it woke once only when the kernel finally set install back to '0':
+ *  1) 无限 poll 会漏唤醒，FM 永远打不开。
+ *     实测内核连续 7 次把 install 置 '1' 并 sysfs_notify，每次等 1500ms
+ *     （brcm_hci_uart.h 的 LDISC_TIME）超时后重试，共约 21 秒，UIM 全程
+ *     一次没醒；直到内核最后把 install 置回 '0' 才醒了一次：
  *         I brcm-uim: After Polling to check POLLERR | POLLHUP erro = 1
  *         I brcm-uim: value of install = 0
- *     So the kernel side always ends up with:
+ *     于是内核侧永远是：
  *         (brcmldisc)ERR:brcm_sh_ldisc_stop timed out waiting for ldisc to be un-installed
  *         (v4l2fmdrv):fmc_prepare  (fmdrv): Failed to get shared ldisc write func pointer
  *         (fmdrv): Unable to prepare FM CORE
- *     open("/dev/radio0") returns -EAGAIN and FM cannot be opened.
+ *     open("/dev/radio0") 返回 -EAGAIN，FM 打不开。
  *
- *  2) The install=='0' branch ended with goto RE_POLL, and RE_POLL read *the same*
- *     '0' again, so cleanup() / upio_set_bluetooth_power(0) were called in an endless loop -
- *     a busy loop power-cycling the BT/FM chip forever.
+ *  2) install=='0' 分支结尾是 goto RE_POLL，而 RE_POLL 重新读到的**还是**
+ *     '0'，于是 cleanup() / upio_set_bluetooth_power(0) 会被无限重复调用，
+ *     相当于一个忙循环在反复给 BT/FM 芯片断电。
  *
- * Merged into a single loop now:
- *   - poll with a 250ms timeout (see UIM_POLL_TIMEOUT_MS at the top) and an explicit
- *     lseek + read of install on *every* round, so a lost sysfs wakeup does not matter -
- *     this is built-in fallback polling, and 250ms is far below the kernel's 1.5s window;
- *   - act only when the install *value changes*; identical values just continue,
- *     eliminating repeated power cycles and repeated cleanup;
- *   - no more repeated close/open of st_fd: the poll registration stays valid, which also
- *     removes the old hazard where p.fd was a closed stale fd after jumping to the poll-error label.
+ * 现在合并成一个循环：
+ *   - poll 用 250ms 超时（见文件头 UIM_POLL_TIMEOUT_MS），并且**每轮都主动
+ *     lseek + read 一次 install**。sysfs 的唤醒丢了也不影响，等于自带兜底
+ *     轮询，250ms 远小于内核 1.5s 的等待窗口；
+ *   - 只有 install 的**值发生变化**时才执行动作，相同值直接 continue，
+ *     彻底避免重复上下电 / 重复 cleanup；
+ *   - 不再反复 close/open st_fd：poll 注册一直有效，同时消掉了原代码里
+ *     "goto RE_POLL_TILL_POLL_ERR 时 p.fd 还是已关闭的旧 fd" 这个隐患。
  *
- * Semantics kept identical to the original implementation:
- *   install '1' and UART not configured -> power on, open UART, install the N_BRCM_HCI ldisc
- *   install '0' and UART configured -> stop snoop, cleanup, power down the chip
- *   install '2'              -> hardware/HCI error, exit so init restarts uim
+ * 语义与原实现保持一致：
+ *   install '1' 且串口未配置 -> 上电、开 UART、装 N_BRCM_HCI ldisc
+ *   install '0' 且串口已配置 -> 停 snoop、cleanup、给芯片断电
+ *   install '2'              -> 硬件/HCI 出错，退出让 init 重启 uim
  * ========================================================================== */
 
     UIM_DBG("begin polling");
     memset(&p, 0, sizeof(p));
-    /* sysfs attributes only wake up on these two events */
+    /* sysfs 属性只会用这两个事件唤醒 */
     p.events = POLLERR | POLLHUP;
 
     for (;;) {
@@ -1562,7 +1562,7 @@ int main(void)
         p.fd      = st_fd;
         p.revents = 0;
 
-        /* Heartbeat log: one line every 20 rounds (~5s) so timed polling does not flood logd */
+        /* 心跳日志：每 20 轮（约 5 秒）一条，避免超时轮询把 logd 刷满 */
         if ((++poll_tick % 20) == 1)
             UIM_DBG("polling install (fd=%d, timeout=%dms, tick=%u)",
                     st_fd, UIM_POLL_TIMEOUT_MS, poll_tick);
@@ -1571,33 +1571,33 @@ int main(void)
         if (err < 0) {
             if (errno == EINTR)
                 continue;
-            /* Not fatal: install is still read below, degrading to pure polling */
+            /* 不致命：下面照样会去读 install，退化成纯轮询 */
             UIM_ERR("poll on install fd failed: %s", strerror(errno));
         } else if (err > 0) {
             UIM_DBG("poll got event, revents=0x%x", p.revents);
         }
 
-        /* Key fallback: whether poll timed out or fired, re-read the current value.
-         * sysfs requires lseek back to 0, otherwise the second read returns 0 (EOF). */
+        /* 关键兜底：不管 poll 是超时还是有事件，都重读一次当前值。
+         * sysfs 必须先 lseek 回 0，否则第二次 read 直接返回 0（EOF）。 */
         if (lseek(st_fd, 0, SEEK_SET) < 0)
             UIM_ERR("lseek %s failed: %s", INSTALL_SYSFS_ENTRY, strerror(errno));
 
         if (read(st_fd, &cur, 1) != 1) {
             UIM_ERR("reading %s failed: %s", INSTALL_SYSFS_ENTRY, strerror(errno));
-            /* Cannot read: back off briefly instead of spinning the CPU */
+            /* 读不到就稍等再试，别把 CPU 打满 */
             usleep(100 * 1000);
             continue;
         }
 
         if (cur == install)
-            continue;                       /* state unchanged, keep waiting */
+            continue;                       /* 状态没变，继续等 */
 
         UIM_DBG("install changed: 0x%02x -> 0x%02x (dev_fd=%d)",
                 install, cur, dev_fd);
         install = cur;
 
         if (install == V4L2_STATUS_ERR) {
-            /* BT/FM/Ant reports a hardware error (HCI timeout etc.); exit so init restarts us */
+            /* BT/FM/Ant 上报硬件错误（HCI 超时等），退出让 init 重启本进程 */
             cleanup();
             UIM_ERR("setting upio power to 0 for error recovery");
             upio_set_bluetooth_power(0);
@@ -1618,7 +1618,7 @@ int main(void)
             UIM_DBG("set UART");
             upio_set_bluetooth_power(1);
 
-            /* Handle HCI snoop (this ROM disables V4L2_SNOOP_ENABLE; fallback only) */
+            /* 处理 HCI snoop（本 ROM 已关闭 V4L2_SNOOP_ENABLE，这里只是兜底） */
             if ((fd_hcisnoop = open(LDISC_SYSFS_SNOOP, O_RDONLY)) < 0) {
                 UIM_ERR("unable to open %s", LDISC_SYSFS_SNOOP);
             } else {
@@ -1632,7 +1632,7 @@ int main(void)
 
             if (st_uart_config(install) != 0) {
                 UIM_ERR("st_uart_config failed");
-                /* UART init failed; let init restart uim to retry */
+                /* 串口初始化失败，交给 init 重启 uim 重试 */
                 err_cleanup(st_fd);
                 return UIM_FAIL;
             }
@@ -1648,7 +1648,7 @@ int main(void)
                 continue;
             }
 
-            /* Unregister all protocol drivers: stop snoop, then cleanup + power down */
+            /* 协议驱动全部注销：先停 snoop，再 cleanup + 断电 */
             fd_hcisnoop = open(LDISC_SYSFS_SNOOP, O_RDONLY);
             if (fd_hcisnoop >= 0) {
                 if (read(fd_hcisnoop, &snoop_enable, 1) != 1)

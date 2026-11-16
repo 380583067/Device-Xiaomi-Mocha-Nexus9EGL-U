@@ -68,15 +68,16 @@
 #/dev/ozwpan				u:object_r:ozmo_device:s0
 # phs
 #/dev/socket/phsd			u:object_r:phsd_socket:s0
-# dual wifi
+# 双 wifi（原厂固件带第二路 wpa_supplicant socket）
 /dev/socket/wpa_xlan[0-9]		u:object_r:wpa_socket:s0
-# Qualcomm QMUX socket endpoints used by the legacy modem client policy.
+# 旧 modem 客户端策略使用的 Qualcomm QMUX socket 端点
 /dev/socket/qmux_[^/]+(/.*)?		u:object_r:qmuxd_socket:s0
-# /dev/tegra_dc devices
+# /dev/tegra_dc 显示控制器节点
 #/dev/tegra_dc_.*			u:object_r:tegradc_device:s0
-# rpmb block device
+# rpmb 块设备
 #/dev/block/platform/sdhci-tegra\.3/mmcblk0rpmb		u:object_r:rpmb_block_device:s0
-# setup_fs emmc
+# setup_fs emmc：TN8 分区名与 AOSP 默认名不同，必须逐个映射，
+# 否则 init 无法给 userdata / cache / boot / recovery / metadata 打标签
 /dev/block/platform/sdhci-tegra(.*)/by-name/UDA		u:object_r:userdata_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/CAC		u:object_r:cache_block_device:s0
 #/dev/block/platform/sdhci-tegra(.*)/by-name/UCB		u:object_r:usercalib_block_device:s0
@@ -85,7 +86,8 @@
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/SOS		u:object_r:recovery_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/MDA		u:object_r:metadata_block_device:s0
-# AB system partition
+# A/B 分区名映射（本机实际不分 A/B，保留是为了与上游 file_contexts 对齐；
+# 注意 SOS 在 TN8 上是 recovery，不是 AOSP 的 boot）
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX-A		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX-B		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/SOS-A		u:object_r:boot_block_device:s0

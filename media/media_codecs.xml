@@ -93,15 +93,14 @@ Only the three quirks included above are recognized at this point:
             <Limit name="alignment" value="2x2" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
-        <!-- mocha note: libnvomx.so also contains a non-secure
-             OMX.Nvidia.h264.decode component, but that 2014 vendor blob is not
-             compatible with the Android 14 ACodec native buffer ABI - setPortMode
-             to DynamicANWBuffer fails outright. Measured: once selected, the
-             picture never advances and the decoder spins idle.
-             Only the secure variant is therefore kept here (for DRM); normal
-             video goes through the software decoders in
-             media_codecs_google_video.xml, which play correctly together with the
-             SoftwareRenderer gralloc fallback (see the frameworks/av patches). -->
+        <!-- mocha 说明：libnvomx.so 里虽然同时存在非 secure 的
+             OMX.Nvidia.h264.decode，但该 2014 年的厂商 blob 与 Android 14 的
+             ACodec 原生 buffer ABI 不兼容（setPortMode 到 DynamicANWBuffer 直接
+             失败），实测选中后画面不推进、解码器空转。
+             因此这里只保留 secure 版本（DRM 用），普通视频走
+             media_codecs_google_video.xml 里的软件解码器，
+             配合 SoftwareRenderer 的 gralloc 兜底（见 frameworks/av 补丁）
+             可以正常播放。 -->
         <MediaCodec name="OMX.Nvidia.h264.decode.secure" type="video/avc" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
@@ -136,11 +135,9 @@ Only the three quirks included above are recognized at this point:
             <Feature name="adaptive-playback" />
         </MediaCodec>
 
-        <!-- mocha fix: this was originally declared as audio/mpeg-L2, which the
-             Android 14 MediaCodecsXmlParser does not accept. At boot it logs
-             "OMX.Nvidia.mp3.decoder does not support any media types", so the
-             component effectively never loads. The correct MIME for MP3 is
-             audio/mpeg. -->
+        <!-- mocha 修复：原声明为 audio/mpeg-L2，Android 14 的 MediaCodecsXmlParser
+             不接受该 MIME，启动时报 "OMX.Nvidia.mp3.decoder does not support any
+             media types"，组件等于不生效。MP3 对应 MIME 为 audio/mpeg。 -->
         <MediaCodec name="OMX.Nvidia.mp3.decoder" type="audio/mpeg" >
             <Limit name="channel-count" max="2" />
             <Limit name="sample-rate" ranges="16000,22050,24000,32000,44100,48000" />

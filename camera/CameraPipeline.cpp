@@ -11,6 +11,7 @@
 #include <sys/poll.h>
 #include <errno.h>
 #include <linux/videodev2.h>
+#include <cutils/properties.h>
 
 
 #ifndef LOG_TAG
@@ -124,12 +125,23 @@ int CameraPipeline::setExposure(int exposure) {
     memset(&ctrl, 0, sizeof(ctrl));
     ctrl.id = V4L2_CID_EXPOSURE;
     ctrl.value = exposure;
-    int ret = ioctl(mFd, VIDIOC_S_CTRL, &ctrl);
-    if (ret == 0) {
-        mCurrentExposure = exposure;
-    } else {
-        ALOGE("setExposure(%d) failed: ret=%d errno=%d (%s)",
-              exposure, ret, errno, strerror(errno));
+    /*
+     * 【曝光 I2C 失败修复 2026-11-16】mocha 的相机 I2C 总线（tegra12-i2c.2）
+     * 对 IMX179 写入偶发超时（dmesg 实测 -110/-121，写 0x0202 失败后紧接着
+     * 读 chip ID 却成功），单次 VIDIOC_S_CTRL 失败率高。内核侧 tegra-i2c
+     * 驱动只重试 2 次，这里在用户态再补 3 次重试（间隔 10ms），
+     * 否则 AE 环每帧报 errno=5(EIO)、曝光永远定在 800，画面过暗。
+     */
+    int ret = -1;
+    for (int retry = 0; retry < 3; retry++) {
+        ret = ioctl(mFd, VIDIOC_S_CTRL, &ctrl);
+        if (ret == 0) {
+            mCurrentExposure = exposure;
+            break;
+        }
+        ALOGE("setExposure(%d) attempt %d failed: ret=%d errno=%d (%s)",
+              exposure, retry + 1, ret, errno, strerror(errno));
+        usleep(10000);
     }
     return ret;
 }
@@ -498,6 +510,28 @@ int CameraPipeline::captureFrame(uint8_t* outputBuffer, uint32_t outputFormat) {
     uint32_t frameSize = buf.bytesused;
 
     if (mConfig.enableISP && mDemosaic && mColorConv) {
+        /* Debug: raw frame dump (persist.mocha.camera.rawdump=1 -> dump first 3 frames) */
+        static int sDumpCount = -1;
+        if (sDumpCount < 0) {
+            char prop[PROP_VALUE_MAX] = {0};
+            __system_property_get("persist.mocha.camera.rawdump", prop);
+            sDumpCount = (prop[0] == '1') ? 3 : 0;
+        }
+        if (sDumpCount > 0) {
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "/data/local/tmp/cam_raw_%dx%d_%d.bin",
+                     mConfig.width, mConfig.height, 3 - sDumpCount);
+            int dfd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (dfd >= 0) {
+                size_t sz = (size_t)mConfig.width * mConfig.height * 2;
+                ssize_t written = ::write(dfd, frameBuffer, sz < frameSize ? sz : frameSize);
+                (void)written;
+                ::close(dfd);
+                ALOGI("rawdump: wrote %s (%u bytes)", path, frameSize);
+            }
+            sDumpCount--;
+        }
         ret = processBayerToYuv(frameBuffer, outputBuffer, outputFormat);
     } else {
         memcpy(outputBuffer, frameBuffer, frameSize);

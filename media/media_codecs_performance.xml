@@ -48,11 +48,10 @@
             <Limit name="measured-frame-rate-1280x720" range="1030-1030" />
             <Limit name="measured-frame-rate-1920x1088" range="589-589" />
         </MediaCodec>
-        <!-- mocha note: this entry used to be for OMX.Nvidia.h264.decode, but
-             media_codecs.xml does not declare that non-secure component, so at
-             boot it logs a "cannot update non-existing codec" warning. That
-             component is also unusable on Android 14, hence the entry is
-             removed. -->
+        <!-- mocha 说明：原条目写的是 OMX.Nvidia.h264.decode，但 media_codecs.xml
+             并未声明该（非 secure）组件，启动时会报
+             "cannot update non-existing codec" 警告。
+             该组件在 Android 14 上也无法真正使用，故删除此条目。 -->
         <MediaCodec name="OMX.Nvidia.h263.decode" type="video/3gpp" update="true">
             <Limit name="measured-frame-rate-176x144" range="2335-2335" />
             <Limit name="measured-frame-rate-352x288" range="1492-1492" />

@@ -1,15 +1,12 @@
 # ADB
-# FIX: this device tree previously carried no ADB-related properties, so
-# persist.sys.usb.config stayed at plain "adb" mode. The host side then failed
-# the authorisation handshake and adb showed up as offline. USB now defaults to
-# mtp,adb.
+# 修复说明：原先设备树缺少 ADB 相关属性，导致 persist.sys.usb.config 残留为纯 adb
+# 模式，host 端 adb 授权握手异常，表现为 offline。补齐 USB 默认 mtp,adb 模式。
 #
-# NOTE: ro.secure / ro.adb.secure / ro.debuggable must NOT be set here. They are
-# added by the build system (ADDITIONAL_SYSTEM_PROPERTIES in main.mk and
-# PRODUCT_SYSTEM_DEFAULT_PROPERTIES in lineage's common.mk), and a duplicate
-# assignment here fails the build with "found duplicate sysprop assignments".
-# Overrides for those read-only properties are handled in lineage_mocha.mk via
-# filter-out.
+# 注意：ro.secure / ro.adb.secure / ro.debuggable 不能写在此处——它们由 build 系统
+# 自动加入（main.mk 的 ADDITIONAL_SYSTEM_PROPERTIES 和 lineage common.mk 的
+# PRODUCT_SYSTEM_DEFAULT_PROPERTIES），在此重复赋值会触发
+# "found duplicate sysprop assignments" 编译错误。这些只读属性的覆盖改在
+# lineage_mocha.mk 里用 filter-out 方式处理。
 persist.service.adb.enable=1
 persist.service.debuggable=1
 persist.sys.usb.config=mtp,adb
@@ -56,7 +53,7 @@ ro.hardware.vulkan=nvgpu
 
 # Graphics
 ro.opengles.version=196610
-ro.sf.lcd_density=256
+ro.sf.lcd_density=320
 ro.input.noresample=1
 ro.zygote.disable_gl_preload=true
 persist.tegra.compression=0

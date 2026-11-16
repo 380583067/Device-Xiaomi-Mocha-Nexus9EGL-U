@@ -10,19 +10,19 @@ import /vendor/etc/init/hw/init.comms.rc
 
 # This yields each tegra wdt expiration to be at 30 secs and fourth expiration for reboot at 120 secs.
 #
-# FIX NOTE (boot speed, 2026-11-16):
-# oneshot is required. This service had none while /dev/watchdog does not exist here
-# (the dt node wdt0 exists and CONFIG_TEGRA_WATCHDOG=y, but tegra_wdt_probe never actually
-#  registered the character device and the kernel never printed "WDT heartbeat enabled on probe",
-#  so the probe bailed out early). watchdogd therefore failed at
+# 修复说明（开机速度，2026-11-16）：
+# 加上 oneshot 是必须的。原来这个 service 没有 oneshot，而本机 /dev/watchdog 并不存在
+# （dt 里 wdt0 节点存在、CONFIG_TEGRA_WATCHDOG=y，但 tegra_wdt_probe 实际没成功注册
+#  字符设备，内核也从未打印过 "WDT heartbeat enabled on probe"，说明 probe 早退失败了），
+# 于是 watchdogd 每次启动都在
 #     E watchdogd: Failed to open /dev/watchdog: No such file or directory
-# every start with status 1, and init restarted it forever with the default 5s backoff. The boot
-# log shows 9 restarts (looping through the whole boot window 11-15 21:16:38 -> 21:17:14), each
-# one forking, creating a process group and writing a pile of errors.
+# 之后以 status 1 退出，init 再按默认 5 秒退避无限重启。开机日志里实测重启了 9 次
+# （11-15 21:16:38 → 21:17:14 整段开机期间一直循环），每次都要 fork、建进程组、
+# 打一堆错误日志。
 #
-# With oneshot: one attempt per boot, then a quiet exit, no loop.
-# No watchdog protection is lost - if the hardware watchdog ever probes successfully,
-# /dev/watchdog will appear and oneshot can simply be removed to resume feeding it.
+# 用 oneshot 后：开机只尝试一次，失败就安静结束，不再循环。
+# 而且这不会牺牲看门狗保护——真正的硬件看门狗如果将来被 probe 起来，/dev/watchdog
+# 就会出现，那时把 oneshot 去掉即可恢复常驻喂狗。
 service watchdogd /system/bin/watchdogd 10 20
     class core
     user root
@@ -42,17 +42,17 @@ on early-init
     mount debugfs debugfs /sys/kernel/debug mode=0755
 
 on init
-    # FIX NOTE (camera): this used to be
+    # 修复说明（相机）：这里原本是
     #     mkdir /dev/camera 0755 media camera
-    # which created /dev/camera as an *empty directory* (this file was inherited from the
-    # stock/Nexus 9 device tree, where that generation of the NVIDIA camera HAL did place
-    # device nodes inside /dev/camera/). But the blob actually used here
-    # (camera.vendor.tegra.so) has NvcImager_Open calling open("/dev/camera") as a character
+    # 会把 /dev/camera 建成一个**空目录**（本文件是从原厂/Nexus 9 设备树继承来的，
+    # 那一代 NVIDIA 相机 HAL 确实往 /dev/camera/ 目录里放设备节点）。
+    # 但本设备实际使用的 blob（camera.vendor.tegra.so）里 NvcImager_Open 是直接
+    # open("/dev/camera") 当字符设备用的，撞上目录就报：
     #     NvOsDebugPrintf: NvcImager_Open: Can not open camera device
     #                      /dev/camera: Is a directory
-    # so get_number_of_cameras() returned 0 and the device reported no camera.
-    # The kernel provides /dev/camera.pcl (chr 10:53, see ueventd.tn8.rc) instead, so no
-    # directory is created here; a symlink is made in the post-fs-data stage (see file end).
+    # 结果 get_number_of_cameras() 返回 0，相机设备数 = 0。
+    # 内核实际提供的节点名是 /dev/camera.pcl（chr 10:53，见 ueventd.tn8.rc），
+    # 所以这里不再建目录，改在 post-fs-data 阶段做符号链接（见文件末尾）。
     mkdir /mnt/media_rw/sdcard1 0700 media_rw media_rw
 
     # Support legacy paths
@@ -78,12 +78,12 @@ on init
     setprop ro.hardware.keystore tegra
 
 on post-fs-data
-    # Camera fix: NvcImager_Open in the NVIDIA camera blob hardcodes "/dev/camera" while the
-    # Tegra kernel registers /dev/camera.pcl (chr 10:53). The original device tree created
-    # /dev/camera as a directory under "on init", so the blob reported
-    # "Is a directory" and get_number_of_cameras() returned 0.
-    # Changed to a symlink here; it lives in post-fs-data because by then ueventd has already
-    # created /dev/camera.pcl from the kernel uevent.
+    # 相机修复：NVIDIA 相机 blob 里 NvcImager_Open 硬编码打开 "/dev/camera"，
+    # 而 Tegra 内核注册的节点名是 /dev/camera.pcl（chr 10:53）。原设备树在
+    # "on init" 里 mkdir /dev/camera 把它建成了目录，导致 blob 报
+    # "Is a directory" 并让 get_number_of_cameras() 返回 0。
+    # 这里改成符号链接，放到 post-fs-data 是因为此时 ueventd 已经根据内核 uevent
+    # 创建好 /dev/camera.pcl 了。
     symlink /dev/camera.pcl /dev/camera
     mkdir /mnt/factory 0771 system system
     mkdir /mnt/factory/wifi 0770 system system
@@ -277,10 +277,10 @@ service logger /system/bin/logcat -b all -D -f /cache/boot_log.txt
     disabled
     oneshot
 
-# adb self-check: after boot, delayed check that the adbd USB transport completed the
-# handshake with the host. If it stays offline (boot completed but adbd never shows any
-# authorisation or connection progress), reboot into recovery (TWRP) so logs can be pulled
-# without manual key presses. See /vendor/bin/adb_selfcheck.sh.
+# adb 自检：开机后延迟检测 adbd 的 USB transport 是否成功与 host 握手，
+# 若检测到 offline（系统已启动完成但 adbd 始终无授权/连接迹象），
+# 自动重启到 recovery(TWRP)，避免手动按键进 TWRP 拉日志。
+# 详见 /vendor/bin/adb_selfcheck.sh。
 service adb_selfcheck /vendor/bin/adb_selfcheck.sh
     user root
     group root system log
@@ -295,5 +295,5 @@ on post-fs-data
 on property:sys.boot_completed=1
     # Stop the logger service
     stop logger
-    # Trigger the adb self-check once boot completes (the script waits for the host itself)
+    # 系统启动完成后触发 adb 自检（脚本内部再延迟等待 host 连接）
     start adb_selfcheck

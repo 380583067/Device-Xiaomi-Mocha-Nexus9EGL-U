@@ -285,6 +285,12 @@ struct stream_in_pcm {
 
     struct in_resampler resampler;
 
+    /* True when this input stream was opened for FM radio (RADIO_TUNER).
+     * FM audio is routed in hardware: the BCM FM chip outputs I2S into
+     * RT5671 AIF4 / "IF4 DAC". We must switch DAC1's input mux to IF4 and
+     * enable the headphone output mix so the tuner is actually audible. */
+    bool is_fm;
+
 #ifdef COMPRESS_PCM_USE_UNSHORTEN
     struct in_unshorten unshorten;
 #endif
@@ -2429,6 +2435,94 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
     (out->close)(stream);
 }
 
+/*
+ * FM radio audio is a pure hardware path: the BCM4354 FM chip streams I2S
+ * into RT5671's AIF4 (mixer name "IF4 DAC"). Android never sees these samples
+ * on a PCM capture device; the only thing software must do is switch DAC1's
+ * input mux to IF4 and turn on the headphone output mix. The LineageOS FMRadio
+ * app relies on AudioRecord(RADIO_TUNER) which opens an input stream with
+ * devices=AUDIO_DEVICE_IN_FM_TUNER, so we hook the codec routing here.
+ *
+ * Card 1 is "tegra-rt5671" on mocha. All mixer failures are non-fatal: the
+ * rest of the audio HAL must keep working even if the codec is unavailable.
+ */
+#define FM_CODEC_CARD 1
+
+static void fm_set_codec_route(bool enable)
+{
+    struct mixer *mixer;
+    struct mixer_ctl *ctl;
+
+    mixer = mixer_open(FM_CODEC_CARD);
+    if (!mixer) {
+        ALOGE("fm_set_codec_route: cannot open mixer on card %d",
+              FM_CODEC_CARD);
+        return;
+    }
+
+    if (enable) {
+        /* Power the FM DAPM pin: the FM chip's I2S enters as the "FM" LINE
+         * (machine driver) -> "FM Capture" (codec) -> "IF4 DAC". Without this
+         * pin switch the FM source is never powered, so no audio reaches DAC1.
+         */
+        ctl = mixer_get_ctl_by_name(mixer, "FM Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        /* DAC1 <- IF4 (FM chip I2S); enable headphone output mix. */
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 L Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF4 DAC");
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 R Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF4 DAC");
+        /*
+         * 【FM 无声修复 2026-11-16】必须打开 Stereo DAC MIX 的 DAC1 输入开关。
+         * RT5671 的 DAPM 完整链路是：
+         *   IF4 DAC -> DAC1 MIXL/R(DAC1 Switch) -> Stereo DAC MIXL/R(DAC L1/R1
+         *   Switch) -> DAC L1/R1 -> DAC 1 -> HPO MIX(DAC1 Switch) -> HP Amp
+         *   -> HPOL/HPOR -> Headphone Jack
+         * 正常音乐播放时 audio HAL 的常规路由会顺带打开 Stereo DAC MIX 开关，
+         * 但 FM 单独播放时不经过常规路由，这两个开关保持 Off，
+         * DAC1 MIX 到 Stereo DAC MIX 之间断链 -> FM 调谐正常却完全无声。
+         */
+        ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXR DAC R1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        ALOGI("fm_set_codec_route: FM -> IF4 DAC -> HPO enabled");
+    } else {
+        /* Restore the default media path (DAC1 <- IF1, headphone mix off). */
+        ctl = mixer_get_ctl_by_name(mixer, "FM Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 L Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF1 DAC");
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 R Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF1 DAC");
+        /* 关闭 FM 时把 Stereo DAC MIX 的 DAC1 输入也断开，
+         * 让 DAC1 通路回到常规播放的独占状态。 */
+        ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXR DAC R1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ALOGI("fm_set_codec_route: restored default media path");
+    }
+
+    mixer_close(mixer);
+}
+
 static int adev_open_input_stream(struct audio_hw_device *dev,
                                   audio_io_handle_t handle,
                                   audio_devices_t devices,
@@ -2463,6 +2557,11 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->common.dev = adev;
 
     devices &= AUDIO_DEVICE_IN_ALL;
+    /* Route the FM tuner's hardware I2S output to the headphone codec. */
+    in->is_fm = (devices & AUDIO_DEVICE_IN_FM_TUNER) != 0;
+    if (in->is_fm)
+        fm_set_codec_route(true);
+
     ret = do_init_in_common(&in->common, config, devices);
     if (ret < 0) {
         goto fail;
@@ -2477,6 +2576,8 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     return 0;
 
 fail:
+    if (in && in->is_fm)
+        fm_set_codec_route(false);
     free(in);
     ALOGV("-adev_open_input_stream (%d)", ret);
     return ret;
@@ -2485,9 +2586,11 @@ fail:
 static void adev_close_input_stream(struct audio_hw_device *dev,
                                    struct audio_stream_in *stream)
 {
-    struct stream_in_common *in = (struct stream_in_common *)stream;
+    struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
     ALOGV("adev_close_input_stream(%p)", stream);
-    (in->close)(&stream->common);
+    if (in->is_fm)
+        fm_set_codec_route(false);
+    (in->common.close)(&stream->common);
 }
 
 /*********************************************************************

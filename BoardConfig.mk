@@ -71,75 +71,75 @@ BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
 BUILD_BROKEN_PREBUILT_ELF_FILES := true
 
 # FM
-# NOTE: Xiaomi Mi Pad 1 (mocha) uses a Broadcom BCM4354 combo chip (WiFi/BT/FM shared),
-# FM works through the HCI channel of the Bluetooth chip plus a V4L2 driver (kernel:
-# drivers/bluetooth/broadcom/v4l2_fm_driver, device node /dev/radio0). No extra FM hardware.
+# 说明：小米平板1 (mocha) 使用 Broadcom BCM4354 组合芯片（WiFi/BT/FM 共用），
+# FM 通过蓝牙芯片的 HCI 通道 + V4L2 驱动（kernel: drivers/bluetooth/broadcom/v4l2_fm_driver，
+# 设备节点 /dev/radio0）工作，无需额外 FM 硬件。
 #
-# FIX NOTE (2026-11-16, FM brought up successfully):
-# The key point is: do NOT let LineageOS reference hardware/broadcom/fm. That path is where
-# upstream keeps the Broadcom FM sources; this device tree keeps them in device/xiaomi/mocha/fm.
-# In vendor/lineage/config/BoardConfigSoong.mk the libfmjni namespace selection is:
+# 修复说明（2026-11-16，FM 已打通）：
+# 关键点在于 **不要让 LineageOS 去引用 hardware/broadcom/fm**。那个路径是上游放
+# 博通 FM 源码的标准位置，本设备树把源码放在 device/xiaomi/mocha/fm 里。
+# vendor/lineage/config/BoardConfigSoong.mk 里 libfmjni 的 namespace 选择是：
 #     BOARD_HAVE_QCOM_FM -> vendor/qcom/opensource/libfmjni
-#     BOARD_HAVE_BCM_FM  -> hardware/broadcom/fm          <-- this directory does not exist here
+#     BOARD_HAVE_BCM_FM  -> hardware/broadcom/fm          <-- 我们这里没有这个目录
 #     BOARD_HAVE_SLSI_FM -> hardware/samsung_slsi/fm
-#     otherwise (i.e. BOARD_HAVE_MTK_FM=true) -> no namespace is added at all
-# FMRadio declares jni_libs: ["libfmjni"], which must resolve to our Broadcom flavor,
-# already converted to a Soong module (device/xiaomi/mocha/fm/libfmjni/Android.bp,
-# which lives in the root namespace), so no extra namespace declaration is needed.
+#     否则（即 BOARD_HAVE_MTK_FM=true）-> 不加任何 namespace
+# 而 FMRadio 的 jni_libs: ["libfmjni"] 需要能解析到我们的博通版 libfmjni，
+# 它已经改成 Soong 模块（device/xiaomi/mocha/fm/libfmjni/Android.bp，位于 root
+# namespace），所以不需要额外的 namespace 声明。
 #
-# BOARD_HAVE_MTK_FM must also be true: its purpose is to *exclude*
-# packages/apps/FMRadio/jni/fmr (the MTK build of libfmjni: same name, incompatible chip).
-# If all three switches are false the MTK namespace is added and the two libfmjni collide.
+# 同时必须设 BOARD_HAVE_MTK_FM := true：它的作用是**排除**
+# packages/apps/FMRadio/jni/fmr（MTK 版 libfmjni，同名、芯片不兼容）。
+# 若三个开关全 false，那个 MTK namespace 会被加入，两个 libfmjni 就会撞车。
 BOARD_HAVE_BCM_FM := false
 BOARD_HAVE_MTK_FM := true
-# sysfs directory name of bcm_ldisc.
-# Verified on the device (2026-11-16, queried via adb shell from TWRP):
-#     /sys/bus/platform/drivers/bcm_ldisc/ only holds bind/uevent/unbind, plus
-#     a symlink named bcm_ldisc pointing to ../../../../devices/platform/bcm_ldisc
-#     /sys/devices/platform/bcm_ldisc/ is where the real device nodes live:
+# bcm_ldisc 的 sysfs 目录名。
+# 实测确认（2026-11-16，TWRP 下 adb shell 直接查）：
+#     /sys/bus/platform/drivers/bcm_ldisc/ 下只有 bind/uevent/unbind，
+#     一个名为 bcm_ldisc 的符号链接指向 ../../../../devices/platform/bcm_ldisc
+#     /sys/devices/platform/bcm_ldisc/ 下才是真正的设备节点：
 #         bdaddr  bt_err  fm_err  fw_patchfile  install  snoop_enable  vendor_params
-# The default in brcm-uim-sysfs/Android.mk, /sys/bus/platform/drivers/bcm_ldisc/bcmbt_ldisc.93/,
-# comes from an upstream Sony device (there the ldisc is a sub-device with an instance, bcmbt_ldisc.NN).
-# The kernel used here (drivers/bluetooth/broadcom/line_discipline_driver) is a platform driver
-# without instances, so it must be overridden to /sys/devices/platform/bcm_ldisc/.
-# Consequence of not overriding: uim fails to open(".../bcmbt_ldisc.93/install") on every start,
-# prints "unable to open ... install" and exits; init restarts it every 5 seconds and it can never
-# switch the BCM4354 into FM mode.
+# 而 brcm-uim-sysfs/Android.mk 里的默认值 /sys/bus/platform/drivers/bcm_ldisc/bcmbt_ldisc.93/
+# 是上游 Sony 设备的写法（那边 ldisc 是带实例号的子设备 bcmbt_ldisc.NN），
+# 本机内核（drivers/bluetooth/broadcom/line_discipline_driver）是平台驱动、
+# 不分实例，所以必须覆盖成 /sys/devices/platform/bcm_ldisc/。
+# 不覆盖的后果：uim 每次启动都 open(".../bcmbt_ldisc.93/install") 失败，
+# 打印 "unable to open ... install" 后退出，被 init 每 5 秒重启一次，永远无法
+# 把 BCM4354 切到 FM 模式。
 BOARD_HAVE_BCM_FM_SYSFS := "/sys/devices/platform/bcm_ldisc/"
 
-# ==== Line discipline number for N_BRCM_HCI (FM, measured on device 2026-11-16) ====
+# ==== N_BRCM_HCI 的 line discipline 编号（FM，2026-11-16 真机实测）====
 #
-# It must be set explicitly to 26 to stay consistent with the kernel.
+# 必须显式设成 26，和内核保持一致。
 #
-# Kernel side: drivers/bluetooth/broadcom/line_discipline_driver/brcm_hci_uart.h
+# 内核侧：drivers/bluetooth/broadcom/line_discipline_driver/brcm_hci_uart.h
 #     #ifndef N_BRCM_HCI
 #     #define N_BRCM_HCI  26
 #     #endif
-# and brcm_sh_ldisc.c calls tty_register_ldisc(N_BRCM_HCI, &hci_uart_ldisc)
-# to register this ldisc on slot 26.
+# 并且 brcm_sh_ldisc.c 用 tty_register_ldisc(N_BRCM_HCI, &hci_uart_ldisc)
+# 把这个 ldisc 注册在 26 号上。
 #
-# Userspace: brcm-uim-sysfs/include/uim.h
+# 用户态：brcm-uim-sysfs/include/uim.h
 #     #ifdef BOARD_BRCM_HCI_NUM
 #     #define N_BRCM_HCI BOARD_BRCM_HCI_NUM
 #     #else
-#     #define N_BRCM_HCI 25          <-- upstream default
+#     #define N_BRCM_HCI 25          <-- 上游默认值
 #     #endif
 #
-# In other words: unless it is defined here, uim will use 25 to
+# 也就是说：只要这里不定义，uim 就会用 25 去做
 #     ioctl(dev_fd, TIOCSETD, &ldisc)   // ldisc = 25
-# Slot 25 is a different ldisc in this kernel (N_GSM0710MUX). TIOCSETD will *succeed*, because
-# any registered slot is accepted - but what gets installed is not the Broadcom ldisc. The
+# 而 25 在内核里是别的 ldisc（N_GSM0710MUX），TIOCSETD 会**成功**，因为
+# 只要那个号注册过就行 —— 但装上去的完全不是博通的 ldisc。紧接着的
 #     ioctl(dev_fd, HCIUARTSETPROTO, HCI_UART_H4)
-# following calls then land on the wrong ldisc ioctl and fail. Measured log:
+# 就落到错误的 ldisc ioctl 上，必然失败。实测日志：
 #     I brcm-uim: baud rate set to 3000000
 #     I brcm-uim: fw_patchfile_name = BCM4350C0.hcd
 #     E brcm-uim: ERR Can't set hci protocol
 #     E brcm-uim: ERR st_uart_config failed
-# Meanwhile the kernel is still waiting on the ldisc-installed completion, so it prints:
+# 而内核侧此时还在等 ldisc 装好的完成量，于是打出：
 #     (brcmldisc)ERR:brcm_sh_ldisc_stop timed out waiting for ldisc to be un-installed
 #     (v4l2fmdrv):fmc_prepare (fmdrv): Failed to get shared ldisc write func pointer
 #     (fmdrv): Unable to prepare FM CORE
-# Eventually open("/dev/radio0") returns -EAGAIN and FM cannot be opened.
+# 最终 open("/dev/radio0") 返回 -EAGAIN，FM 打不开。
 BOARD_BRCM_HCI_NUM := 26
 
 # FS
@@ -150,7 +150,7 @@ TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_USES_MKE2FS := true
 
 # Graphics display
-TARGET_SCREEN_DENSITY := 256
+TARGET_SCREEN_DENSITY := 320
 
 # Graphics
 NUM_FRAMEBUFFER_SURFACE_BUFFERS := 3
@@ -274,63 +274,63 @@ BOARD_SEPOLICY_DIRS += \
     $(LOCAL_PATH)/sepolicy/mocha
 
 # SHIMS
-# FIX NOTE: add a libnvomxadaptor.so -> libnvomxadaptor_shim.so mapping.
-# libnvomxadaptor.so (the NVIDIA hardware OMX decoding adaptor) references an old-ABI symbol
-# GraphicBuffer(ANativeWindowBuffer*, bool) which was removed in Android 10+. A preloaded shim
-# supplies the symbol, otherwise hardware video decoding is unavailable.
+# 修复说明：新增 libnvomxadaptor.so -> libnvomxadaptor_shim.so 映射。
+# libnvomxadaptor.so（NVIDIA 硬件 OMX 解码 adaptor）引用旧 ABI 符号
+# GraphicBuffer(ANativeWindowBuffer*, bool)，Android 10+ 已移除，需预加载 shim
+# 补齐符号，否则媒体硬件解码不可用。
 TARGET_LD_SHIM_LIBS := \
     /system/vendor/lib/hw/hwcomposer.tegra.so|libshims_ui.so \
     /system/vendor/lib/libnvcap_video.so|libshims_ui.so \
     /system/vendor/lib/libnvgr.so|libshim_atomic.so \
     /system/vendor/lib/libnvomxadaptor.so|libnvomxadaptor_shim.so \
     /system/vendor/lib/libsensors.lsm6db0.so|libsensors_fastsys_shim.so
-# FIX NOTE (boot speed, 2026-11-16): add a shim mapping for the sensor HAL blob.
-# libsensors.lsm6db0.so calls system("rm -rf /sys/bus/iio/devices/...") during init,
-# which costs 1.5-2 seconds per call on Android 14 (posix_spawn of sh + waitpid). What it
-# tries to delete are sysfs nodes, so it always fails. sensorservice therefore needs 5.68s
-# to register, which makes DeviceStateManagerService block for 6 seconds (see first-boot log
+# 修复说明（开机速度，2026-11-16）：新增传感器 HAL blob 的 shim 映射。
+# libsensors.lsm6db0.so 初始化时调 system("rm -rf /sys/bus/iio/devices/...")，
+# 在 Android 14 上一次要 1.5~2 秒（posix_spawn sh + waitpid），而它要删的是
+# sysfs 节点、必然失败。sensorservice 因此需要 5.68 秒才注册，连带让
+# DeviceStateManagerService 同步等待 6 秒（见首次开机日志
 # "Waiting for service 'sensorservice'"，14.600 → 20.614）。
-# The shim short-circuits this useless call while forwarding other commands to libc; see
-# the header comment in shims/libsensors_fastsys_shim.cpp.
+# shim 把这条无效调用短路，其它命令照旧转交 libc，详见
+# shims/libsensors_fastsys_shim.cpp 头部注释。
 
 # ============================================================================
-# Camera blob shim mapping - implemented but *disabled by default*; reasons follow (important)
+# 相机 blob 的 shim 映射 —— 已实现但**默认不启用**，原因如下（重要）
 # ----------------------------------------------------------------------------
-# What is already done (all code is in place and can be re-enabled at any time):
-#   camera/mocha_camera_shim.cpp      ABI forwarding for CameraMetadata/Fence/SensorManager
+# 已完成的部分（代码都在，随时可恢复）：
+#   camera/mocha_camera_shim.cpp      CameraMetadata/Fence/SensorManager 的 ABI 转发
 #                                     + libstdc++ iostream + NvPHSSetThrottle
-#                                     plus the new NvRmSync API
-#   camera/stub_libcameraservice.cpp  empty stub whose SONAME pretends to be libcameraservice.so
-#   camera/stub_libpowerservice_client.cpp  minimal PowerServiceClient implementation
-#   camera/libbeautify_stub.cpp       stand-in for the vendor beautify lib depending on TEXTREL libFaceProc
-#   camera/camera_shim_test.cpp       diagnostic tool; all 345 undefined symbols verified resolvable
+#                                     + NvRmSync 新 API
+#   camera/stub_libcameraservice.cpp  空 stub，SONAME 伪装成 libcameraservice.so
+#   camera/stub_libpowerservice_client.cpp  PowerServiceClient 最小实现
+#   camera/libbeautify_stub.cpp       顶替依赖带 TEXTREL 的 libFaceProc 的原厂美颜库
+#   camera/camera_shim_test.cpp       诊断工具，实测 345 个未定义符号全部可解析
 #
-# Measured result (verified on the device, 2026-11):
-#   With all of the above in place camera.vendor.tegra.so does dlopen successfully (ALL OK)
-#   and cameraserver really does enter the blob init flow. But this path cannot work on the *current kernel*:
+# 实测结论（2026-11 在真机上验证）：
+#   补完上面这些之后 camera.vendor.tegra.so 确实能 dlopen 成功了（ALL OK），
+#   cameraserver 也真的进入了 blob 的初始化流程。但这条路在**当前内核**上走不通：
 #
-#   1) The blob uses NVIDIA legacy PCL and hardcodes open("/dev/camera"). The original device tree
-#      created it as a directory via mkdir in init.tegra.rc, and the blob reported
+#   1) blob 走的是 NVIDIA 老式 PCL 通路，硬编码打开 "/dev/camera"。原设备树在
+#      init.tegra.rc 里 mkdir /dev/camera 把它建成了目录，blob 报
 #      "NvcImager_Open: Can not open camera device /dev/camera: Is a directory"。
-#      (fixed: changed to symlink /dev/camera -> /dev/camera.pcl)
+#      （该问题已修：改成 symlink /dev/camera -> /dev/camera.pcl）
 #
-#   2) After that fix the blob probes PCL chips one by one; each probe fails and times out after 4s:
+#   2) 修掉之后 blob 开始逐个探测 PCL 芯片，全部失败且各超时 4 秒：
 #        PCLDeviceRead: pcl_OV5693 1 - -1
 #        PCLDeviceRead: pcl_IMX135 2 - -1
-#        PCLDeviceRead: pcl_AR0261 3 - -1   ... 7 in total
-#      because the camera device tree in this kernel was rewritten around the *V4L2 subdev framework*,
+#        PCLDeviceRead: pcl_AR0261 3 - -1   ... 共 7 个
+#      因为本内核的摄像头设备树是按 **V4L2 subdev 框架**重写的
 #      （tegra124-mocha-camera-mc.dtsi：imx179@10 / ov5693@36 / ad5823@0c），
-#      so there is no PCL node configuration the blob expects; only an empty pcl-generic exists.
+#      根本没有 blob 需要的 PCL 节点配置，内核里只有 pcl-generic 的空壳。
 #
-#   3) Worst of all, these I2C probe timeouts hold the i2c bus lock for a long time and *freeze the system*
-#      (measured: adb shell blocks completely, even adb reboot does not respond, long power press only).
+#   3) 最严重的是：这些 I2C 探测超时会长时间占住 i2c 总线锁，**把整个系统卡死**
+#      （实测 adb shell 全部阻塞、adb reboot 也无响应，只能长按电源键）。
 #
-# The right approach is therefore the in-house V4L2 HAL matching the device tree (camera/MochaCameraHAL.cpp +
-#   CameraPipeline.cpp + isp/ + v4l2/ + tuning/) instead of continuing to patch the blob.
-#   Until the HAL switch is complete the shim mapping must stay off, otherwise boot freezes.
+#   所以正确的路线是配套设备树的 V4L2 自研 HAL（camera/MochaCameraHAL.cpp +
+#   CameraPipeline.cpp + isp/ + v4l2/ + tuning/），而不是继续修 blob。
+#   在 HAL 切换完成之前，这里不能打开 shim 映射，否则开机就会卡死。
 #
-# To restore: uncomment the two lines below (and set the getprop switch in CameraWrapper.cpp,
-# persist.mocha.camera.blob_preload, to 1).
+# 恢复方法：把下面两行取消注释即可（同时需要把 CameraWrapper.cpp 里的
+# getprop 开关 persist.mocha.camera.blob_preload 设为 1）。
 # TARGET_LD_SHIM_LIBS += \
 #     /system/lib/hw/camera.vendor.tegra.so|libmocha_camera_shim.so \
 #     /system/lib/hw/camera.vendor.tegra.so|libcameraservice_mocha.so
