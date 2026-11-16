@@ -1,0 +1,3 @@
+# The legacy dataservice_app domain has no Android 14 declaration or device
+# seapp_context mapping in this checkout. Do not emit a rule for that removed
+# domain; active platform domains already receive their own service access.

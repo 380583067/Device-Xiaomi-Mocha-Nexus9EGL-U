@@ -1,0 +1,3 @@
+# The valid renderer file permissions are in common/servicemanager.te. This
+# duplicate legacy rule targeted a process domain as a file label and used the
+# undefined rs_file_perms macro, so it has no meaningful Mocha access behavior.

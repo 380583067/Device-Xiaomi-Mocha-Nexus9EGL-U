@@ -1,0 +1,5 @@
+# The Tegra NVMAP driver creates /sys/kernel/debug/nvmap, and the bundled
+# memtrack.tegra HAL reads handles_by_pid from this directory to report GPU
+# memory usage. Keep access read-only and scoped to the labeled NVMAP subtree.
+allow hal_memtrack_default debugfs_nvmap:dir r_dir_perms;
+allow hal_memtrack_default debugfs_nvmap:file  r_file_perms;

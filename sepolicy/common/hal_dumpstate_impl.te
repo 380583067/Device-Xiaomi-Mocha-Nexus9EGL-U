@@ -1,0 +1,12 @@
+# Legacy dumpstate HAL policy is intentionally disabled for Mocha.
+#
+# This device tree has no dumpstate HAL service declaration, init service,
+# executable file_contexts entry, or debugfs file_contexts entries for the
+# paths previously authorized here. In particular, the old rules referenced
+# undefined types (including a duplicated debugfs_nvavp rule). Defining those
+# types without confirming the runtime paths would leave the permissions
+# ineffective or label unrelated debugfs nodes too broadly.
+#
+# If a Mocha dumpstate HAL is added later, restore a dedicated policy together
+# with its service and executable mapping, then label only verified debugfs
+# nodes and grant the minimum permissions needed by that implementation.

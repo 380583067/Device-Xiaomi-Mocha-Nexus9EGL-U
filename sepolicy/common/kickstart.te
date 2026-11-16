@@ -1,0 +1,5 @@
+# Legacy Qualcomm EFS/USB bridge policy is intentionally disabled for Mocha.
+# The product tree contains no efsks/ks binary, init service, executable
+# context, or kickstart device-node context. This old policy also referenced
+# undefined EFS and kickstart types, so adding guessed labels would grant
+# access to devices that are not present in this device tree.

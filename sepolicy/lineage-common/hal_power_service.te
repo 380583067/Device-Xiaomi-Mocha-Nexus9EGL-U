@@ -1,0 +1,3 @@
+# Keep the board's legacy capability allowance on the standard Android 14
+# HAL server domain selected by lineage-common/file_contexts.
+allow hal_power_default self:capability { dac_override net_bind_service };

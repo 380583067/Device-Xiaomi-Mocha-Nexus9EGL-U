@@ -1,0 +1,2 @@
+# ro.bt.bdaddr_path uses the single shared bdaddr_path_prop declaration in
+# sepolicy/common/property.te; do not declare the property type twice.

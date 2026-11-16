@@ -1,0 +1,29 @@
+allow hal_graphics_composer_default sysfs_gpu:file r_file_perms;
+allow hal_graphics_composer_default sysfs_gpu:dir r_dir_perms;
+allow hal_graphics_composer_default self:netlink_kobject_uevent_socket create_socket_perms_no_ioctl;
+allow hal_graphics_composer_default proc_meminfo:file r_file_perms;
+allow hal_graphics_composer_default sysfs_graphics:lnk_file read;
+allow hal_graphics_composer_default default_android_vndservice:service_manager { find add };
+
+# Permit traversal of /dev. Access to individual nodes remains controlled by
+# their specific SELinux labels below.
+allow hal_graphics_composer_default device:dir r_dir_perms;
+
+allow hal_graphics_composer_default hal_configstore_ISurfaceFlingerConfigs:hwservice_manager find;
+allow hal_graphics_composer_default hal_configstore_default:binder call;
+vndbinder_use(hal_graphics_composer_default);
+allow hal_graphics_composer_default vndbinder_device:chr_file { read write ioctl };
+allow hal_graphics_composer_default system_prop:file { read };
+allow hal_graphics_composer_default default_prop:file { read };
+allow hal_graphics_composer_default sysfs_graphics:file { read };
+# Mocha's Tegra GPU nodes are labeled gpu_device in common/file_contexts.
+allow hal_graphics_composer_default gpu_device:chr_file { read write open ioctl };
+# Android labels input event nodes as input_device; keep the legacy read access.
+allow hal_graphics_composer_default input_device:chr_file { read open };
+allow hal_graphics_composer_default self:tcp_socket { create connect };
+
+# Keep the legacy sysfs reads required by Tegra display and composer code.
+allow hal_graphics_composer_default sysfs:file { read open getattr };
+allow surfaceflinger sysfs:file { read open getattr };
+# SurfaceFlinger uses the platform's graphics_device label for display nodes.
+allow surfaceflinger graphics_device:chr_file { open ioctl };

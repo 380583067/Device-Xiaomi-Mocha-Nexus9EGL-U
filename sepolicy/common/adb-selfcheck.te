@@ -1,0 +1,32 @@
+# adb_selfcheck.sh - SELinux policy for the adb self-check script
+# The script checks after boot that the adbd USB transport works and reboots to recovery otherwise.
+type adb-selfcheck, domain;
+type adb-selfcheck_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(adb-selfcheck)
+
+# Execute /vendor/bin/sh (the script interpreter, #!/vendor/bin/sh)
+allow adb-selfcheck vendor_shell_exec:file rx_file_perms;
+
+# Execute toolbox commands: pidof, log, getprop, setprop, reboot all live in /system/bin/toolbox
+allow adb-selfcheck toolbox_exec:file rx_file_perms;
+
+# FIX NOTE (measured on device, 2026-11-16):
+# On this device toolbox is provided by /system/vendor/bin/toybox_vendor (old TN8 layout;
+# /vendor is /system/vendor), so the executed file carries the vendor label.
+# Granting only toolbox_exec misses it; every boot produces:
+#     avc: denied { execute_no_trans } for comm="adb_selfcheck.s"
+#          path="/system/vendor/bin/toybox_vendor"
+#          scontext=u:r:adb-selfcheck:s0 tcontext=u:object_r:vendor_toolbox_exec:s0
+# Harmless under permissive, but under enforcing the self-check cannot run at all
+# (losing the "reboot to TWRP when adb dies" safety net), so it is added here.
+allow adb-selfcheck vendor_toolbox_exec:file rx_file_perms;
+
+# Read the sys.boot_completed property (getprop)
+get_prop(adb-selfcheck, boot_status_prop)
+
+# Read logcat (to see whether adbd registered a transport)
+read_logd(adb-selfcheck)
+
+# reboot recovery (writes sys.powerctl, triggered by the reboot command)
+set_prop(adb-selfcheck, powerctl_prop)

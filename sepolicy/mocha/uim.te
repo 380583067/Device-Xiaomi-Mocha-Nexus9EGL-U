@@ -1,1 +1,79 @@
+# brcm-uim-sysfs -- userspace init process (UIM) for the shared Broadcom BT/FM transport
+#
+# FIX NOTE (FM, 2026-11-16):
+# This executable has always existed in the device tree (device/xiaomi/mocha/fm/brcm-uim-sysfs)
+# and init.comms.rc already defined a service for it (class late_start, user root,
+# group bluetooth net_bt), but with BOARD_HAVE_BCM_FM=false it was never built and
+# never installed, so it could never run - the first layer of why FM was completely dead.
+#
+# Its job: through sysfs nodes exposed by the bcm_ldisc driver (install / vendor_params /
+# snoop_enable / bdaddr / fw_patchfile) it pushes patchram parameters to the BCM4354 and
+# controls chip power sequencing, switching it from Bluetooth HCI mode to UIM/FM mode.
+# Only then can libfmradio.v4l2-fm open("/dev/radio0") and talk to the chip.
+#
+# Note: this file used to contain only "type uim, domain;" (with no exec_type assigned, so
+# init_daemon_domain could not be used and the process fell into the init domain). Now:
+#   - uim_exec executable type (mapped to /vendor/bin/brcm-uim-sysfs in file_contexts)
+#   - init_daemon_domain: init switches from uim_exec to the uim domain when spawning
+#   - a minimal access set: read bt_vendor.conf, read/write bcm_ldisc sysfs, open the BT UART
+#
+# SELinux is currently permissive here (BoardConfig: androidboot.selinux=permissive),
+# so these rules block nothing today, but they serve three purposes:
+#   1) uim really runs in its own domain instead of the init domain (clearer logs);
+#   2) nothing has to be written from scratch when switching to enforcing;
+#   3) less permissive=1 avc denial noise during boot (each line costs logd IO).
+
 type uim, domain;
+type uim_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(uim)
+
+# Read /system/etc/bluetooth/bt_vendor.conf (UimUartPort / UartBaudRate /
+# FwPatchFileName / LpmEnable and friends come from this file).
+allow uim system_file:file r_file_perms;
+
+# bcm_ldisc sysfs channel: install, vendor_params, snoop_enable, bdaddr, fw_patchfile.
+# uim reads state and writes parameters, so it needs directory search plus file read/write.
+allow uim sysfs:dir search;
+allow uim sysfs:file rw_file_perms;
+
+# ==== Critical: chip power-up (FM, measured on device 2026-11-16) ====
+#
+# uim powers the BT/FM core of the BCM4354 by writing to
+#     /sys/class/rfkill/rfkill0/state        （u:object_r:sysfs_bluetooth_writable）
+# That rfkill comes from the bluedroid_pm driver (name=bluedroid_pm) and resolves to
+# shutdown_gpio = TEGRA_GPIO_PR1 (BT_REG_ON) in board-mocha.c.
+#
+# Measured: with PR1 low (/sys/kernel/debug/gpio shows "gpio-137 (shutdown_gpio) out lo")
+# the BT core is unpowered and HCI Reset on /dev/ttyTHS2 gets no reply on any ttyTHS;
+# writing 1 to state immediately returns
+#     04 0e 04 01 03 0c 00        (Command Complete for HCI Reset)
+# Without this write permission neither FM nor Bluetooth can ever start.
+#
+# The old sysfs:file rule did not cover the sysfs_bluetooth_writable attribute type, so it
+# only worked by accident under permissive and would fail outright under enforcing.
+allow uim sysfs_bluetooth_writable:file rw_file_perms;
+
+# Bluetooth UART: UartPort = /dev/ttyTHS2 in bt_vendor.conf
+allow uim tty_device:chr_file rw_file_perms;
+
+# ==== Property access (2026-11-16, added after testing a clean image) ====
+#
+# After adding the tty_device label and sysfs_bluetooth_writable, a fresh avc capture shows
+# uim still denied on the two property reads below (harmless permissive, fatal enforcing):
+#
+#   avc: denied { read } name="u:object_r:default_prop:s0"
+#       scontext=u:r:uim:s0 tcontext=u:object_r:default_prop:s0 tclass=file
+#   avc: denied { read } name="u:object_r:exported_bluetooth_prop:s0"
+#       scontext=u:r:uim:s0 tcontext=u:object_r:exported_bluetooth_prop:s0 tclass=file
+#
+# During init uim looks up Bluetooth configuration (chip model, bdaddr path, ...) through the
+# generic property channel, so it hits default_prop; parsing bt_vendor.conf also reads
+# exported_bluetooth_prop (such as ro.bt.xxx).
+# The get_prop macro is used instead of a bare allow to get the AOSP-defined permission set.
+get_prop(uim, default_prop)
+get_prop(uim, exported_bluetooth_prop)
+
+# libnetutils / socket bits (uim links against libnetutils)
+allow uim self:capability { net_admin net_raw };
+allow uim self:{ rawip_socket tcp_socket udp_socket } { create ioctl read write getattr setopt };

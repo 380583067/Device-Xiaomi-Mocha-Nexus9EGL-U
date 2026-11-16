@@ -4,4 +4,6 @@ allow conn_wifi init:unix_stream_socket connectto;
 allow conn_wifi kernel:system module_request;
 allow conn_wifi property_socket:sock_file write;
 allow conn_wifi sysfs:file { open read write };
-
+# conn_wifi bluetooth_data_file
+allow conn_wifi bluetooth_data_file:dir { search write add_name };
+allow conn_wifi bluetooth_data_file:file { create write setattr open };

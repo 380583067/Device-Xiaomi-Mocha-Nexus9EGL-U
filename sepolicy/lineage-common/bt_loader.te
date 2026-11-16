@@ -1,0 +1,2 @@
+# bt_loader's domain, executable transition, and ro.bt.bdaddr_path access are
+# defined once in sepolicy/common/bt_loader.te. Keep no duplicate policy here.

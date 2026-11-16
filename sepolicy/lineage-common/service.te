@@ -1,0 +1,3 @@
+# Android 14 system/sepolicy/public/hal_{light,power,vibrator}.te already
+# declares these HAL service and hwservice labels and their registration rules.
+# Keep this file free of duplicate type declarations from the legacy policy.
