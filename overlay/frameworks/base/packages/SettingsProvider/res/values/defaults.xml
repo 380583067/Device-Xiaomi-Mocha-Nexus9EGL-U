@@ -27,4 +27,13 @@
 
     <!-- Doubletap2wake is OFF by default-->
     <bool name="def_double_tap_to_wake">false</bool>
+
+    <!-- 【跳过开机向导 2026-11-17】本机没有可用的配置向导流程（无 RIL、无 GApps），
+         四清后第一次开机会卡在 LineageOS SetupWizard 里退不出去。
+         向导的"已完成"判定只看 Settings.Secure.user_setup_complete
+         （SetupWizardUtils.java:181），而 framework 还要求 global.device_provisioned。
+         在 SettingsProvider 建库时就把两者写成 true，比 init 里 exec settings
+         更早、也没有竞态：首次开机直接进桌面。 -->
+    <bool name="def_device_provisioned">true</bool>
+    <bool name="def_user_setup_complete">true</bool>
 </resources>

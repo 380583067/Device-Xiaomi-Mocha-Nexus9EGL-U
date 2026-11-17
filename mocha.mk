@@ -397,6 +397,12 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/adb_selfcheck.sh:$(TARGET_COPY_OUT_VENDOR)/bin/adb_selfcheck.sh
 
+# 开机向导跳过脚本：由 init.tn8.rc 里的 mocha_provision oneshot 服务在
+# sys.boot_completed=1 时执行，把 device_provisioned / user_setup_complete
+# 两个标志都写上，避免卡在设置向导里。
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/initfiles/mocha_provision.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_provision.sh
+
 # Sensors
 PRODUCT_PACKAGES += \
     android.hardware.sensors@1.0-impl \

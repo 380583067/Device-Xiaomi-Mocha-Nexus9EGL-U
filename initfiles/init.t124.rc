@@ -84,7 +84,11 @@ service conn_wifi /system/vendor/bin/conn_init -op
     seclabel u:r:conn_wifi:s0
     oneshot
 
-    service init-btloader-sh /system/bin/init.btloader.sh 
+# 【格式修正 2026-11-17】段关键字统一顶格、去掉行尾空格。init 解析器会裁掉
+# 首尾空白，原写法实际也能解析，这里只是规范化，方便用 grep '^service ' 扫描。
+# 注意：这个服务是被 `on boot` 里的 `exec_start init-btloader-sh` 拉起的，
+# exec_start 走 Service::ExecStart()，不受 disabled 影响（builtins.cpp:269）。
+service init-btloader-sh /system/bin/init.btloader.sh
     class main
     user root
     group root system
