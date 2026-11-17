@@ -31,6 +31,7 @@
 #include <sys/poll.h>
 #include <time.h>
 #include <cstdio>
+#include <vector>
 
 #include "MochaCameraHAL.h"
 #include "CameraPipeline.h"
@@ -829,7 +830,19 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type == CAMERA3_STREAM_OUTPUT &&
             stream->format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
-            stream->format = HAL_PIXEL_FORMAT_RGBA_8888;
+            /* 【录像修复 2026-11-17】录像时框架多配一条"编码器输入流"
+             * （usage 带 GRALLOC_USAGE_HW_VIDEO_ENCODER）。MediaCodec 的
+             * input Surface 只接受 YUV，之前把所有 PRIV 流统一改成 RGBA_8888，
+             * 编码器拿到 RGBA 缓冲后一帧都出不来（CameraX 报
+             * ERROR_NO_VALID_DATA、screenrecord 也是 recorded 0 frames）。
+             * 这里把编码器流保留为 YCbCr_420_888，pipeline 原生支持写 YUV；
+             * 预览流仍然用 RGBA_8888。 */
+            if ((stream->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) != 0) {
+                stream->format = HAL_PIXEL_FORMAT_YCBCR_420_888;
+                ALOGI("stream %u is the video encoder input -> YCbCr_420_888", i);
+            } else {
+                stream->format = HAL_PIXEL_FORMAT_RGBA_8888;
+            }
         }
     }
     uint32_t v4l2Format = (dev->camera_id == 0) ? V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SBGGR10;
@@ -1076,18 +1089,113 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
 // Used to fan a single captured frame out to every output stream (preview + video).
 // 【拍照保存修复 2026-11-17】改用 GraphicBufferMapper（mapper@2.1），与 App 侧
 // 锁语义一致，避免 NVIDIA 跨进程 LockState 残留。
+/* 【录像修复 2026-11-17】RGBA_8888 最近邻缩放。
+ * 录像时框架会配两个 output 流：预览流和编码器输入流，两者分辨率常常不同
+ * （例如预览 1280x720、录像 1920x1080）。原来 copyFrameBetweenBuffers 遇到
+ * 尺寸不同直接 return，导致**编码器那条流从来没被写过**，MediaCodec 等不到
+ * 关键帧，CameraX 最终报 ERROR_NO_VALID_DATA、DCIM 里没有 mp4。
+ * 这里按目标分辨率做一次最近邻缩放（先预算列映射，内层只有查表和拷贝，
+ * 720p→1080p 在 TK1 上大约几十毫秒，比双线性省一半以上内存带宽）。 */
+static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
+                             uint8_t* dst, int dstW, int dstH) {
+    if (!src || !dst || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
+
+    /* 列映射：dstX -> srcX，避免每像素做除法 */
+    std::vector<int> xmap(dstW);
+    for (int x = 0; x < dstW; x++)
+        xmap[x] = (int)((int64_t)x * srcW / dstW);
+
+    for (int y = 0; y < dstH; y++) {
+        int srcY = (int)((int64_t)y * srcH / dstH);
+        const uint32_t* srow = reinterpret_cast<const uint32_t*>(
+                src + (size_t)srcY * srcW * 4);
+        uint32_t* drow = reinterpret_cast<uint32_t*>(
+                dst + (size_t)y * dstW * 4);
+        for (int x = 0; x < dstW; x++)
+            drow[x] = srow[xmap[x]];
+    }
+}
+
+/* 【录像修复 2026-11-17】RGBA_8888 -> YUV420（BT.601，limited range）。
+ * 编码器输入 Surface 的缓冲是 YUV，而 pipeline 出的画面是 RGBA，
+ * 所以 fan-out 到编码器那条流时必须做一次颜色空间转换。
+ * android_ycbcr 的布局由 gralloc 决定：chroma_step==2 是 NV12/NV21 那样的
+ * 半平面（Cb/Cr 交错），==1 是 I420 的独立平面，这里两种都支持。 */
+static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
+                               int dstW, int dstH, struct android_ycbcr* out) {
+    if (!rgba || !out || !out->y || !out->cb || !out->cr) return;
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
+    const int w = dstW, h = dstH;
+
+    uint8_t* yPlane = static_cast<uint8_t*>(out->y);
+    uint8_t* uPlane = static_cast<uint8_t*>(out->cb);
+    uint8_t* vPlane = static_cast<uint8_t*>(out->cr);
+    const size_t yStride = out->ystride;
+    const size_t cStride = out->cstride;
+    const size_t cStep = out->chroma_step ? out->chroma_step : 1;
+
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = rgba + (size_t)((int64_t)y * srcH / h) * srcW * 4;
+        uint8_t* yRow = yPlane + (size_t)y * yStride;
+        for (int x = 0; x < w; x++) {
+            int sx = (int)((int64_t)x * srcW / w);
+            int r = row[sx * 4 + 0];
+            int g = row[sx * 4 + 1];
+            int b = row[sx * 4 + 2];
+            int yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            yRow[x] = (uint8_t)(yy < 0 ? 0 : (yy > 255 ? 255 : yy));
+        }
+    }
+
+    for (int y = 0; y < h; y += 2) {
+        int sy0 = (int)((int64_t)y * srcH / h);
+        int sy1 = (int)((int64_t)(y + 1 < h ? y + 1 : y) * srcH / h);
+        const uint8_t* row0 = rgba + (size_t)sy0 * srcW * 4;
+        const uint8_t* row1 = rgba + (size_t)sy1 * srcW * 4;
+        uint8_t* uRow = uPlane + (size_t)(y / 2) * cStride;
+        uint8_t* vRow = vPlane + (size_t)(y / 2) * cStride;
+        for (int x = 0; x < w; x += 2) {
+            int x1 = (x + 1 < w) ? x + 1 : x;
+            int sx0 = (int)((int64_t)x * srcW / w);
+            int sx1 = (int)((int64_t)x1 * srcW / w);
+            int r = (row0[sx0 * 4 + 0] + row0[sx1 * 4 + 0] + row1[sx0 * 4 + 0] + row1[sx1 * 4 + 0]) >> 2;
+            int g = (row0[sx0 * 4 + 1] + row0[sx1 * 4 + 1] + row1[sx0 * 4 + 1] + row1[sx1 * 4 + 1]) >> 2;
+            int b = (row0[sx0 * 4 + 2] + row0[sx1 * 4 + 2] + row1[sx0 * 4 + 2] + row1[sx1 * 4 + 2]) >> 2;
+            int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+            int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            u = u < 0 ? 0 : (u > 255 ? 255 : u);
+            v = v < 0 ? 0 : (v > 255 ? 255 : v);
+            uRow[(x / 2) * cStep] = (uint8_t)u;
+            vRow[(x / 2) * cStep] = (uint8_t)v;
+        }
+    }
+}
+
 static void copyFrameBetweenBuffers(
         const camera3_stream_buffer_t* src, const camera3_stream_buffer_t* dst) {
     if (!src || !dst || !src->buffer || !dst->buffer) return;
-    if (src->stream->format != dst->stream->format) {
-        ALOGW("copyFrameBetweenBuffers: format mismatch src=%d dst=%d",
+    const bool srcRgba = (src->stream->format == HAL_PIXEL_FORMAT_RGBA_8888);
+    const bool dstYuv  = (dst->stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888);
+    if (src->stream->format != dst->stream->format && !(srcRgba && dstYuv)) {
+        ALOGW("copyFrameBetweenBuffers: unsupported format %d -> %d",
               src->stream->format, dst->stream->format);
         return;
     }
-    if (src->stream->width != dst->stream->width || src->stream->height != dst->stream->height) {
-        ALOGW("copyFrameBetweenBuffers: dimension mismatch src=%ux%u dst=%ux%u",
-              src->stream->width, src->stream->height, dst->stream->width, dst->stream->height);
-        return;
+    const bool needScale =
+            (src->stream->width != dst->stream->width ||
+             src->stream->height != dst->stream->height);
+    if (needScale) {
+        /* 不再直接放弃：缩放到目标流分辨率（见 scaleRgbaNearest 注释）。
+         * 只在尺寸组合变化时打一条日志，避免每帧刷屏。 */
+        static uint32_t lastSrcW = 0, lastSrcH = 0, lastDstW = 0, lastDstH = 0;
+        if (lastSrcW != src->stream->width || lastSrcH != src->stream->height ||
+            lastDstW != dst->stream->width || lastDstH != dst->stream->height) {
+            lastSrcW = src->stream->width; lastSrcH = src->stream->height;
+            lastDstW = dst->stream->width; lastDstH = dst->stream->height;
+            ALOGI("copyFrameBetweenBuffers: scaling %ux%u -> %ux%u",
+                  src->stream->width, src->stream->height,
+                  dst->stream->width, dst->stream->height);
+        }
     }
     void* srcVaddr = nullptr;
     void* dstVaddr = nullptr;
@@ -1099,6 +1207,26 @@ static void copyFrameBetweenBuffers(
         ALOGE("copyFrameBetweenBuffers: failed to lock src buffer: %d", ret);
         return;
     }
+    if (dstYuv) {
+        /* 目标是编码器那条 YUV 流：用 lockYCbCr 拿到平面布局，
+         * 再把 RGBA 转成 YUV420 写进去（同时按需缩放）。 */
+        struct android_ycbcr ycbcr;
+        memset(&ycbcr, 0, sizeof(ycbcr));
+        ret = android::GraphicBufferMapper::get().lockYCbCr(*dst->buffer,
+                    GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &ycbcr);
+        if (ret == 0 && ycbcr.y) {
+            rgbaToYuv420Scaled(static_cast<const uint8_t*>(srcVaddr),
+                               (int)src->stream->width, (int)src->stream->height,
+                               (int)dst->stream->width, (int)dst->stream->height,
+                               &ycbcr);
+            android::GraphicBufferMapper::get().unlock(*dst->buffer);
+        } else {
+            ALOGE("copyFrameBetweenBuffers: lockYCbCr failed: %d", ret);
+        }
+        android::GraphicBufferMapper::get().unlock(*src->buffer);
+        return;
+    }
+
     ret = android::GraphicBufferMapper::get().lock(*dst->buffer,
                 GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &dstVaddr);
     if (ret != 0 || !dstVaddr) {
@@ -1106,9 +1234,16 @@ static void copyFrameBetweenBuffers(
         ALOGE("copyFrameBetweenBuffers: failed to lock dst buffer: %d", ret);
         return;
     }
-    // RGBA_8888: 4 bytes/pixel. (Both preview and video streams are RGBA_8888 here.)
-    size_t size = (size_t)dst->stream->width * dst->stream->height * 4;
-    memcpy(dstVaddr, srcVaddr, size);
+    // RGBA_8888: 4 bytes/pixel（configure_streams 已把所有非 BLOB 流改成 RGBA_8888）
+    if (needScale) {
+        scaleRgbaNearest(static_cast<const uint8_t*>(srcVaddr),
+                         (int)src->stream->width, (int)src->stream->height,
+                         static_cast<uint8_t*>(dstVaddr),
+                         (int)dst->stream->width, (int)dst->stream->height);
+    } else {
+        size_t size = (size_t)dst->stream->width * dst->stream->height * 4;
+        memcpy(dstVaddr, srcVaddr, size);
+    }
     android::GraphicBufferMapper::get().unlock(*dst->buffer);
     android::GraphicBufferMapper::get().unlock(*src->buffer);
 }
@@ -1195,7 +1330,19 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         }
     }
 
-    const camera3_stream_buffer_t& buf = request->output_buffers[0];
+    /* 【录像修复 2026-11-17】优先用 RGBA 的流做采集目标。
+     * 录像时两条流里编码器那条是 YUV，如果从它开始采集，fan-out 就得做
+     * YUV->RGBA 转换（没实现、也更贵）；反过来以 RGBA 预览流为源、向编码器
+     * 流做 RGBA->YUV，两条流都能拿到正确内容，代价也小。 */
+    const camera3_stream_buffer_t* captureBuf = &request->output_buffers[0];
+    for (uint32_t bi = 0; bi < request->num_output_buffers; bi++) {
+        if (request->output_buffers[bi].stream &&
+            request->output_buffers[bi].stream->format == HAL_PIXEL_FORMAT_RGBA_8888) {
+            captureBuf = &request->output_buffers[bi];
+            break;
+        }
+    }
+    const camera3_stream_buffer_t& buf = *captureBuf;
     
     if (!buf.buffer) {
         ALOGE("Invalid buffer");
@@ -1343,7 +1490,9 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         // The framework configures TWO output streams during recording (preview + video);
         // we only captured into output_buffers[0], so copy it to the rest.
         if (frameCaptured && buf.stream->format != HAL_PIXEL_FORMAT_BLOB) {
-            for (uint32_t i = 1; i < request->num_output_buffers; i++) {
+            for (uint32_t i = 0; i < request->num_output_buffers; i++) {
+                if (&request->output_buffers[i] == captureBuf)
+                    continue;
                 copyFrameBetweenBuffers(&buf, &request->output_buffers[i]);
             }
         }
