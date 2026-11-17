@@ -33,6 +33,25 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/audio/nvaudio_conf.xml:$(TARGET_COPY_OUT_VENDOR)/etc/nvaudio_conf.xml  \
     $(LOCAL_PATH)/audio/audio_effects.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_effects.xml
 
+# 【2026-11-18 修复，影响录屏/录像】必须显式带上 vndservicemanager。
+#
+# 本 product 是 system-as-root、没有独立 vendor 分区，从来没有 inherit
+# base_vendor.mk，而 vndservicemanager 只在 base_vendor 里（见
+# build/make/target/product/base_vendor.mk:95）。结果 /vendor/bin 下没有这个
+# 二进制，init.rc 的 `start vndservicemanager` 每次都失败，/dev/vndbinder 上
+# 没有任何 service manager 在监听。
+#
+# 后果（真机实证）：任何 vendor 进程只要走了 AIDL/vndbinder 就会永久阻塞。
+#   media.codec 里 GraphicBufferMapper 先试 Gralloc5（AIDL）路径，
+#   AServiceManager_isDeclared() 这一句就要去问 vndservicemanager，
+#   拿不到 context object 就每秒重试一次、永不返回
+#   （日志：Waiting 1s on context object on /dev/vndbinder），
+#   于是 BufferQueueProducer::dequeueBuffer 卡死 —— 编码器输入 Surface 一帧
+#   都拿不到，screenrecord 显示 "recorded 0 frames"，相机录像同样 0 帧。
+# 补上这个包后 Gralloc5 探测会立刻失败并回退到 HDFIDL/Gralloc2 老路径。
+PRODUCT_PACKAGES += \
+    vndservicemanager
+
 PRODUCT_PACKAGES += \
     android.hardware.audio.service \
     android.hardware.audio@7.1-impl \
