@@ -58,6 +58,17 @@
 #define LOCKTIME                        40000           // wait 40ms for card to lock on
 #define MAX_FREQS                       50              // number of max freq buffer for a full scan
 #define DEFAULT_THRESHOLD               500             // threshold for scan
+/* 【自动搜台修复 2026-11-17】原本全频段只用一个固定门限 500 比较信号强度。
+ * 本机实测（fmtest --antenna + 搜台日志）：整段频带噪声底约 335~374，
+ * 最强的真实电台（95.0MHz）也只有 437 —— 永远低于 500，所以"刷新/自动搜台"
+ * 一个台都找不到，而手动调过去能正常收听。
+ * 改为自适应：先完整测一遍频带，用均值当噪声底、用"均值 + 峰高的一半"当门限，
+ * 再挑局部峰值。信号平坦（没插耳机天线）时退回配置门限，保持原行为。 */
+#define SCAN_MAX_POINTS                 256             // 全频段最多采样点数（87.5~108MHz/100kHz = 206）
+#define SCAN_MIN_ABS                    250             // 自适应门限的下限（0~1000 刻度）
+#define SCAN_MIN_SPAN                   30              // 峰高不足这个值视为全频带平坦（无台）
+#define SCAN_PEAK_SEP                   250             // 相邻两个台的合并间距（kHz，标准刻度）
+#define SCAN_NOISE_PRIME                4               // seek 时先用几个样本估噪声底
 
 /* session struct holded by the FM SE stack */
 typedef struct fm_v4l2_data_t {
@@ -268,6 +279,9 @@ int v4l2_is_playing_in_stereo (void ** session_data){
 int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
    fm_v4l2_data* session;
    int increment, rate, freqi, ret;
+   int noise = -1;          /* 动态噪声底（0~1000 刻度），-1 表示还没估出来 */
+   int primed = 0;          /* 已用于估噪声底的样本数 */
+   int dyn;                 /* 当前动态门限 */
 
    ALOGI("%s:\n", __FUNCTION__);
    session = get_session_data(session_data);
@@ -278,9 +292,9 @@ int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
    else                                      //FMRADIO_SEEK_UP
      increment =  session->grid;
 
-  freqi = session->freq + increment;         //drop the current frequency
-  ALOGI("Starting scanning...\n");
-  while (session->scan_band_run==SCAN_RUN){
+   freqi = session->freq + increment;         //drop the current frequency
+   ALOGI("Starting scanning...\n");
+   while (session->scan_band_run==SCAN_RUN){
 
       ret= set_freq(session->fd, freqi);
       if (ret<0)
@@ -291,13 +305,38 @@ int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
       if (rate < 0)
          return -1;
 
-      ALOGI("final rate %d > %d \n", rate , session->threshold);
+      /* 【下一个/上一个电台修复】旧实现拿固定 500 当门限比较，本机实测最强的
+       * 电台也只有 ~437，按一次永远找不到台。这里改成边扫边估噪声底：
+       * 先用前 SCAN_NOISE_PRIME 个样本的最小值估底（起点可能正好压在强台上，
+       * 取最小值比取第一个样本稳），之后用"噪声底 + 剩余头部空间的 1/8"
+       * 当动态门限，命中后再复测一次该频点以排除噪声尖峰。 */
+      if (primed < SCAN_NOISE_PRIME) {
+          if (noise < 0 || rate < noise)
+              noise = rate;
+          primed++;
+          ALOGI("seek prime %d/%d rate %d -> noise %d", primed, SCAN_NOISE_PRIME, rate, noise);
+      } else {
+          dyn = noise + (1000 - noise) / 8;
+          if (dyn < SCAN_MIN_ABS)
+              dyn = SCAN_MIN_ABS;
+          ALOGI("seek %d: rate %d dyn %d noise %d", freqi, rate, dyn, noise);
 
-      if (rate >  session->threshold){
-      ALOGI("Found freq, %d\n", freqi);
-      session->scan_band_run=SCAN_STOP;
-      session->freq = freqi;
-      return get_standard_freq(freqi, session->fact);
+          if (rate > dyn) {
+              int confirm;
+              usleep(LOCKTIME);
+              confirm = get_signal_strength(session->fd, &session->vt);
+              if (confirm < 0)
+                  return -1;
+              if (confirm > dyn) {
+                  ALOGI("Found freq, %d (rate %d/%d > %d)\n", freqi, rate, confirm, dyn);
+                  session->scan_band_run=SCAN_STOP;
+                  session->freq = freqi;
+                  return get_standard_freq(freqi, session->fact);
+              }
+          } else {
+              /* 只在非候选点更新噪声底，避免被强台把底抬高 */
+              noise = (noise * 3 + rate) / 4;
+          }
       }
 
       freqi +=  increment;
@@ -305,32 +344,39 @@ int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
          freqi =  session->low_freq;
       if ( freqi <  session->low_freq)
           freqi =  session->high_freq;
-  }
-  ALOGI("End scan\n");
-  return 0;
+   }
+   ALOGI("End scan\n");
+   return 0;
 }
 
 int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_strenghts){
   fm_v4l2_data* session;
-  int founded, i, ret;
+  int founded, i, ret, n;
   int freqi, rate;
   int *temp_freq, *temp_strenght;
+  int all_freq[SCAN_MAX_POINTS];
+  int all_rate[SCAN_MAX_POINTS];
+  int total, mean, maxr, minr, span, thr;
+  long long sum;
 
   ALOGI("%s:\n", __FUNCTION__);
   session = get_session_data(session_data);
 
   session->scan_band_run=SCAN_RUN;
 
-  temp_freq = (int *) malloc(sizeof(int) *MAX_FREQS);
-  temp_strenght = (int *) malloc(sizeof(int) *MAX_FREQS);
-  if (temp_freq == NULL || temp_strenght==NULL){
-    ALOGE("error on allocate");
-    return -1;
-  }
+  total = (session->high_freq - session->low_freq) / session->grid + 1;
+  if (total > SCAN_MAX_POINTS)
+      total = SCAN_MAX_POINTS;
+  if (total < 3)
+      return 0;
 
-  ALOGI("Starting full scanning...low freq:%d, high freq:%d\n", session->low_freq, session->high_freq);
-
-  for (freqi =  session->low_freq, founded=0 ; ((freqi < session->high_freq)  && (founded < MAX_FREQS) && (session->scan_band_run==SCAN_RUN)) ; freqi += session->grid){
+  /* 【自动搜台修复】第一遍：把整段频带完整测一遍并缓存。
+   * 旧实现是边测边和固定门限 500 比，本机最强电台只有 437，必然搜不到；
+   * 只有拿到整段数据后才能算出真实的噪声底和峰高。 */
+  n = 0;
+  for (freqi = session->low_freq;
+       (freqi < session->high_freq) && (n < total) && (session->scan_band_run==SCAN_RUN);
+       freqi += session->grid) {
 
       ret = set_freq(session->fd, freqi);
       if (ret<0)
@@ -341,20 +387,87 @@ int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_stre
       if (rate < 0)
           return -1;
 
-      ALOGI("final rate %d > %d \n", rate ,session->threshold);
-
-      if (rate > session->threshold){
-          ALOGI("Founded index %d, freq %d\n", founded, freqi);
-          temp_freq[founded]= freqi;
-          temp_strenght[founded]= rate;
-          founded++;
-      }
+      all_freq[n] = freqi;
+      all_rate[n] = rate;
+      n++;
   }
 
-  *found_freqs = (int *) malloc(sizeof(int) * founded);
-  *signal_strenghts = (int *) malloc(sizeof(int) * founded);
+  if (n < 3) {
+      ALOGE("band too short (%d points)", n);
+      session->scan_band_run=SCAN_STOP;
+      return 0;
+  }
+
+  /* 统计噪声底与最强点：均值代表整段底噪，max - mean 代表最强台的峰高 */
+  sum = 0;
+  maxr = all_rate[0];
+  minr = all_rate[0];
+  for (i = 0; i < n; i++) {
+      sum += all_rate[i];
+      if (all_rate[i] > maxr) maxr = all_rate[i];
+      if (all_rate[i] < minr) minr = all_rate[i];
+  }
+  mean = (int)(sum / n);
+  span = maxr - mean;
+
+  if (span < SCAN_MIN_SPAN) {
+      /* 全频带平坦：要么没插耳机当天线，要么这一带确实没有台。
+       * 退回用户/默认门限，保持原有"搜不到"的语义，避免刷出一堆假台。 */
+      thr = session->threshold;
+      ALOGI("band flat: noise %d min %d max %d span %d < %d, keep threshold %d",
+            mean, minr, maxr, span, SCAN_MIN_SPAN, thr);
+  } else {
+      thr = mean + span / 2;
+      if (thr < SCAN_MIN_ABS)
+          thr = SCAN_MIN_ABS;
+      ALOGI("adaptive threshold: noise %d max %d span %d -> %d",
+            mean, maxr, span, thr);
+  }
+
+  temp_freq = (int *) malloc(sizeof(int) *MAX_FREQS);
+  temp_strenght = (int *) malloc(sizeof(int) *MAX_FREQS);
+  if (temp_freq == NULL || temp_strenght==NULL){
+    ALOGE("error on allocate");
+    return -1;
+  }
+
+  /* 第二遍：只挑"高于自适应门限的局部峰值"，并把靠得太近的峰合并
+   * （同一个台跨 1~2 个频道，保留最强的那个）。 */
+  founded = 0;
+  for (i = 1; i < n - 1 && founded < MAX_FREQS; i++) {
+      if (session->scan_band_run != SCAN_RUN)
+          break;
+      if (all_rate[i] < thr)
+          continue;
+      /* 局部峰值判定：不低于左右邻居（平台峰两侧相等也算） */
+      if (all_rate[i] < all_rate[i-1] || all_rate[i] < all_rate[i+1])
+          continue;
+
+      if (founded > 0 &&
+          (all_freq[i] - temp_freq[founded-1]) < get_proprietary_freq(SCAN_PEAK_SEP, session->fact)) {
+          /* 与上一个台太近：只保留更强的 */
+          if (all_rate[i] > temp_strenght[founded-1]) {
+              temp_freq[founded-1] = all_freq[i];
+              temp_strenght[founded-1] = all_rate[i];
+          }
+          continue;
+      }
+
+      ALOGI("peak index %d, freq %d, rate %d", founded, all_freq[i], all_rate[i]);
+      temp_freq[founded] = all_freq[i];
+      temp_strenght[founded] = all_rate[i];
+      founded++;
+  }
+
+  ALOGI("band scan done: %d points, %d station(s), noise %d max %d thr %d",
+        n, founded, mean, maxr, thr);
+
+  *found_freqs = (int *) malloc(sizeof(int) * (founded > 0 ? founded : 1));
+  *signal_strenghts = (int *) malloc(sizeof(int) * (founded > 0 ? founded : 1));
   if (*found_freqs == NULL || *signal_strenghts==NULL){
     ALOGE("error on allocate");
+    free(temp_freq);
+    free(temp_strenght);
     return -1;
   }
 
