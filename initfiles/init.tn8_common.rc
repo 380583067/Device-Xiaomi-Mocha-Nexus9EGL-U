@@ -32,14 +32,10 @@ on fs
     setprop ro.crypto.umount_sd false
     setprop ro.crypto.fuse_sdcard true
     setprop audio.custompolicy 1
-    # add a cpuset for the camera daemon
-    # we want all the little cores for camera
-    mkdir /dev/cpuset/camera-daemon
-    write /dev/cpuset/camera-daemon/cpus 0
-    write /dev/cpuset/camera-daemon/mems 0
-    chown system system /dev/cpuset/camera-daemon
-    chown system system /dev/cpuset/camera-daemon/tasks
-    chmod 0664 /dev/cpuset/camera-daemon/tasks
+    # 【2026-11-17 修正】原来这里创建 /dev/cpuset/camera-daemon 并写 cpus/mems。
+    # 本机内核只开了 CONFIG_CGROUPS、没开 CONFIG_CPUSETS（开了会开机死锁到 MI logo），
+    # /dev/cpuset 根本不存在，这些 mkdir/write 每次开机必然失败刷错误日志。
+    # camera-daemon 的 cpuset 由 frameworks 侧在 cpuset 可用时才创建，这里直接删掉。
 
 on post-fs-data
     # Set SELinux security contexts for NvCPL keylayout files.
@@ -97,6 +93,21 @@ service charger_led /system/bin/sh /system/bin/charger_led.sh
 
 on charger
     start charger_led
+
+    # 【2026-11-18 诊断】关机充电卡在 MI logo，需要留下证据。
+    #
+    # charger 模式只跑 `early-init`/`init`/`charger` 三个触发器，`on fs` 不会执行，
+    # 所以 /cache 平时是**没有挂载**的 —— 这就是之前一直查不到 charger 日志的原因
+    # （init 里的 logger 服务是 class main，charger 模式也不会启动）。
+    # 这里手动把 CAC 分区挂到 /cache，并在 12 秒后把内核日志（charger 用 klog 输出）
+    # 和 fb 设备状态落盘，下次进系统或 TWRP 都能直接读 /cache/charger_dbg.txt。
+    mkdir /cache 0770 system cache
+    mount ext4 /dev/block/platform/sdhci-tegra.3/by-name/CAC /cache noatime nosuid nodev
+    exec - root root -- /system/bin/sh -c "/system/bin/sleep 12; { echo '=== bootmode ==='; getprop ro.bootmode; echo '=== fb ==='; ls -la /dev/graphics/ 2>&1; echo '=== minui props ==='; getprop | grep -i minui; echo '=== klog ==='; dmesg; } > /cache/charger_dbg.txt 2>&1"
+
+    # 诊断用：让 charger 模式下也能枚举 USB，插线后 host 能看到设备（best effort）。
+    # 真正生效还依赖 adbd 服务，这里只是把 usb 配置切出来便于观察。
+    setprop sys.usb.config adb
 
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 300000

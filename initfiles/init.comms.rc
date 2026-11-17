@@ -20,7 +20,9 @@ on boot
     chown bluetooth bluetooth /sys/class/rfkill/rfkill0/type
 
     # bluetooth MAC address programming
-    chown bluetooth bluetooth ro.bt.bdaddr_path
+    # 【2026-11-17 修正】原来这行是 `chown bluetooth bluetooth ro.bt.bdaddr_path`，
+    # 把属性名当文件路径传给 chown，每次开机必报 no such file。属性本身无法 chown，
+    # 真正需要可写的是 bt 地址文件，权限由 bt_vendor 自己处理，这里直接去掉。
     chown bluetooth bluetooth /system/etc/bluetooth
 
     # P2P device

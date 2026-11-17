@@ -46,10 +46,12 @@ on post-fs-data
     mkdir /data/misc/phs 0775 system system
 
 # unified scaling process
+# 【2026-11-17 修正】去掉 `writepid /dev/cpuset/system-background/tasks`：
+# 本机内核未开 CONFIG_CPUSETS（开了会开机死锁），该路径不存在，每次开机 init 都会
+# 报 "Failed to write pid"，且 ussrd 落不进任何 cpuset，属于无意义配置。
 service ussrd /vendor/bin/ussrd
     user system
     group system
     class main
     socket phsd stream 0666 system system
-    writepid /dev/cpuset/system-background/tasks
 

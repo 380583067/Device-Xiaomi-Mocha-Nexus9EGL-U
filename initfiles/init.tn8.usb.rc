@@ -7,6 +7,12 @@ on boot
     write /sys/class/android_usb/android0/f_rndis/vendorID 0955
     write /sys/class/android_usb/android0/f_rndis/wceis 1
 
+    # 【2026-11-17 加固】persist.sys.usb.config 是持久属性：一旦被设成纯 adb（CF09），
+    # 后面所有开机都会沿用，而纯 adb 模式在部分 host/hub 组合下 adb 握手会卡在
+    # offline。这里在开机早期把它纠正为 mtp,adb（CF05，本机验证可用的组合）。
+    # 用户主动改过 USB 模式时 UsbDeviceManager 仍会再次覆盖，不影响正常切换。
+    setprop persist.sys.usb.config mtp,adb
+
 on fs
     mkdir /dev/usb-ffs 0770 shell shell
     mkdir /dev/usb-ffs/adb 0770 shell shell

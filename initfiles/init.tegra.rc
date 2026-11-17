@@ -270,12 +270,17 @@ service bugreport /system/bin/dumpstate -d -p -B -z -o /data/user_de/0/com.andro
 import /vendor/etc/init/hw/init.ussrd.rc
 
 # Logcat in cache folder while is in bootanimation
-service logger /system/bin/logcat -b all -D -f /cache/boot_log.txt
+# 【2026-11-17 修正】原来没有轮转参数，开机阶段把所有 buffer 全量写 /cache/boot_log.txt，
+# 实测能涨到 345MB，把只有 353MB 的 /cache 撑满，导致 TWRP 安装 OTA 时
+# "No space left on device" 失败。这里限制单文件 4MB、保留 2 个，上限 8MB。
+# 【2026-11-18 修正】这个服务原来带 `disabled` + `oneshot`，等于**从来没运行过**
+# （init 不会自动拉起 disabled 的服务，且全树也没有 start logger），所以开机日志
+# 一直是空的 —— 之前排查"开机动画循环"时没有现场可看就是这个原因。
+# 现在去掉这两个关键字：随 class main 自启并常驻，配合 -r/-n 自动轮转，上限 8MB。
+service logger /system/bin/logcat -b all -D -r 4096 -n 2 -f /cache/boot_log.txt
     class main
     user root
     group root system
-    disabled
-    oneshot
 
 # adb 自检：开机后延迟检测 adbd 的 USB transport 是否成功与 host 握手，
 # 若检测到 offline（系统已启动完成但 adbd 始终无授权/连接迹象），
