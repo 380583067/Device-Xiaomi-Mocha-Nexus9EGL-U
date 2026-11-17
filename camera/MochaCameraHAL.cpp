@@ -45,8 +45,12 @@ extern camera_module_t HMI;
 namespace mocha {
 
 // Camera configurations
+// 【2026-11-17】补上前摄 ov5693：内核侧已 probe 成功并绑定到 channel 1
+//（tegra-vi-1 -> /dev/video1），CameraPipeline 也已按 cameraId 选 video0/video1，
+// 此前只是 kCameras 里没登记，导致 getNumberOfCameras() 只返回 1。
 const MochaCameraInfo MochaCameraHAL::kCameras[] = {
     { 0, "IMX179", CAMERA_FACING_BACK, 90, 3280, false },
+    { 1, "OV5693", CAMERA_FACING_FRONT, 270, 2592, false },
 };
 
 const int MochaCameraHAL::kNumCameras = sizeof(MochaCameraHAL::kCameras) / sizeof(MochaCameraHAL::kCameras[0]);
@@ -1168,6 +1172,19 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE) {
             if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_START && !dev->af_trigger_handled) {
                 ALOGI("AF TRIGGER START received");
+                p->startAfScan();
+                dev->af_trigger_handled = true;
+            } else if (dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
+                       dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_IDLE &&
+                       !dev->af_trigger_handled) {
+                /* 【修复 2026-11-17】CONTINUOUS_PICTURE 模式下 framework 只发
+                 * mode=4/trigger=0（IDLE），从不发 AF_TRIGGER_START —— 它期望
+                 * HAL 自动持续对焦。原代码只在 trigger==START 时扫描，于是
+                 * Aperture 全程不对焦、画面一直糊（实测 10:05 日志
+                 * "AF request: mode=4 trigger=0" 连续出现，无任何 AF: coarse）。
+                 * 这里在连续对焦模式下也主动跑一次扫描（场景变化由后续
+                 * 重新打开或 preview 重启再触发），至少让用户拍到合焦画面。 */
+                ALOGI("AF: CONTINUOUS_PICTURE, running initial scan");
                 p->startAfScan();
                 dev->af_trigger_handled = true;
             } else if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL) {
