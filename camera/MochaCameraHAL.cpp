@@ -149,7 +149,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // 采集端（IMPL_DEF/YCbCr/YV12）只保留 1280x720：那是 V4L2 真正能出的尺寸。
     int32_t configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
@@ -159,7 +161,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available min frame durations
     int64_t durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
@@ -170,7 +174,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available stall durations (format, width, height, stall_ns)
     int64_t stall_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 0,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
@@ -180,6 +186,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available processed sizes (for CameraWrapper synthesis of YUV_420_888)
     int32_t processed_sizes[] = {
         1280, 720,
+        1920, 1080,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES, processed_sizes, sizeof(processed_sizes)/sizeof(int32_t));
 
