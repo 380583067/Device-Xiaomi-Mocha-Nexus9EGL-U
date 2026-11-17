@@ -109,11 +109,9 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <cutils/native_handle.h>
 #include <cutils/properties.h>
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
@@ -151,9 +149,6 @@ static int (*gVendorLockAsyncYCbCr)(const gralloc_module_t *, buffer_handle_t,
 
 static int (*gVendorUnlockAsync)(const gralloc_module_t *, buffer_handle_t,
                                  int *) = NULL;
-
-static int (*gVendorRegisterBuffer)(const gralloc_module_t *,
-                                    buffer_handle_t) = NULL;
 
 /*
  * The allocator as the vendor wrote it, kept before its pointer is replaced.
@@ -372,43 +367,6 @@ static int tegra_unlock_async(const gralloc_module_t *module,
     return result;
 }
 
-/*
- * A register that leaves the cross-process LockState usable.
- *
- * The vendor's registerBuffer() writes -1 into the shared LockState that
- * lives at offset 0x40 of the first dmabuf's metadata page (fd[0]). An
- * application locking that buffer with a hardware usage bit then spins on
- * AcquireBufferLock until it times out, because the lock path requires the
- * word to be 0 and registerBuffer left it at -1. Measured on still capture:
- * the HAL writes the JPEG fine, but the app's ImageReader lock reports
- * "AcquireBufferLock timed out ... LockState -1" and the photo is never
- * saved.
- *
- * Reset the word to 0 after the vendor register, so the next lock sees a
- * free buffer. The word is the very thing the lock path uses, so writing it
- * back to 0 is exactly the state a freshly allocated buffer should have.
- */
-static int tegra_register_buffer(const gralloc_module_t *module,
-                                 buffer_handle_t handle) {
-    int result = gVendorRegisterBuffer(module, handle);
-
-    /* Reset the shared LockState (offset 0x40 of the first dmabuf's
-     * metadata page) to 0 so a subsequent lock with a hardware usage bit
-     * finds a free buffer. Harmless when the word is already 0. */
-    const native_handle_t *nh = handle;
-    if (nh != NULL && nh->numFds >= 1) {
-        void *mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED,
-                             nh->data[0], 0);
-        if (mapping != MAP_FAILED) {
-            *reinterpret_cast<int *>(
-                    reinterpret_cast<char *>(mapping) + 0x40) = 0;
-            munmap(mapping, 4096);
-        }
-    }
-
-    return result;
-}
-
 static int tegra_open(const hw_module_t *module, const char *name,
                       hw_device_t **device) {
     if (gVendorOpen == NULL) {
@@ -508,16 +466,5 @@ __attribute__((constructor)) static void tegra_take_vendor_module() {
     if (HAL_MODULE_INFO_SYM.base.unlockAsync != NULL) {
         gVendorUnlockAsync = HAL_MODULE_INFO_SYM.base.unlockAsync;
         HAL_MODULE_INFO_SYM.base.unlockAsync = tegra_unlock_async;
-    }
-
-    /*
-     * registerBuffer is taken over to reset the cross-process LockState the
-     * vendor leaves at -1 (see tegra_register_buffer). Without this, an app
-     * locking a BLOB buffer with a hardware usage bit spins on
-     * AcquireBufferLock until it times out.
-     */
-    if (HAL_MODULE_INFO_SYM.base.registerBuffer != NULL) {
-        gVendorRegisterBuffer = HAL_MODULE_INFO_SYM.base.registerBuffer;
-        HAL_MODULE_INFO_SYM.base.registerBuffer = tegra_register_buffer;
     }
 }
