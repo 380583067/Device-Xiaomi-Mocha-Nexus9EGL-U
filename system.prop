@@ -132,3 +132,15 @@ persist.sys.binary_xml=false
 
 # Disable unlock
 ro.oem_unlock_supported=false
+
+# 【开机动画循环修复 2026-11-17】原厂 NVIDIA gralloc（Android 7/8 时代的 blob）
+# 在 NvGrUnregisterBuffer 里会对一个已经关闭的 fd 再 close 一次（实测报
+# "attempted to close file descriptor 0"）。Android 14 的 bionic 默认对该情况
+# 直接 fdsan abort，于是 SurfaceFlinger 收到 SIGABRT → init 重启 SF →
+# SF 启动时重新拉起开机动画 → 用户看到开机动画反复播放（四清后的第二次开机
+# 尤其明显，因为此时 buffer 生命周期与首次开机不同）。
+# bionic 支持用 debug.fdsan 属性调整这个检查的严重级别（见
+# bionic/libc/bionic/fdsan.cpp 的 android_fdsan_set_error_level_from_property）：
+#   warn_once = 只在第一次记一条日志，之后不再 abort
+# 这样老的 gralloc blob 可以继续工作，不再把 SurfaceFlinger 打死。
+debug.fdsan=warn_once
