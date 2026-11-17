@@ -139,24 +139,30 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_ORIENTATION, &orientation, 1);
 
     // Available stream configurations
+    // 【2026-11-18 对齐 A12】A12 那台（能正常拍照/录像）对外只报两种尺寸：
+    // 1920x1080 与 1280x720，格式只有 BLOB / IMPLEMENTATION_DEFINED / YCbCr_420_888，
+    // 而且**没有任何大于 1080p 的 BLOB**（它的 jpeg.maxSize 就是 1920*1080*2）。
+    // 我们之前报了 3280x2464 的 8MP BLOB，Aperture 每次都挑它，于是走进
+    // NVIDIA 老 gralloc 的 8MP BLOB 加锁路径（AcquireBufferLock ... LockState -1），
+    // 拍照永远存不下来。这里按 A12 收敛尺寸，同时把 4:3 换成 16:9 —— 传感器
+    // 实际只输出 720p，多出来的尺寸本来就是最近邻放大出来的。
+    // 采集端（IMPL_DEF/YCbCr/YV12）只保留 1280x720：那是 V4L2 真正能出的尺寸。
     int32_t configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_YCbCr_420_888, 1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_YV12, 1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB, 1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB, 1920, 1080, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB, 3280, 2464, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, configs, sizeof(configs)/sizeof(int32_t));
 
     // Available min frame durations
     int64_t durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_YCbCr_420_888, 1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_YV12, 1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_BLOB, 1280, 720, 500000000LL,
-        HAL_PIXEL_FORMAT_BLOB, 1920, 1080, 500000000LL,
-        HAL_PIXEL_FORMAT_BLOB, 3280, 2464, 500000000LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
     };
     int ret = add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, durations, sizeof(durations)/sizeof(int64_t));
     ALOGI("DEBUG: Added min frame durations, ret=%d", ret);
@@ -164,11 +170,10 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available stall durations (format, width, height, stall_ns)
     int64_t stall_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
-        HAL_PIXEL_FORMAT_YCbCr_420_888, 1280, 720, 0,
-        HAL_PIXEL_FORMAT_YV12, 1280, 720, 0,
-        HAL_PIXEL_FORMAT_BLOB, 1280, 720, 500000000LL,
-        HAL_PIXEL_FORMAT_BLOB, 1920, 1080, 500000000LL,
-        HAL_PIXEL_FORMAT_BLOB, 3280, 2464, 500000000LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, stall_durations, sizeof(stall_durations)/sizeof(int64_t));
 
@@ -182,7 +187,6 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     int32_t jpeg_sizes[] = {
         1280, 720,
         1920, 1080,
-        3280, 2464,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_JPEG_SIZES, jpeg_sizes, sizeof(jpeg_sizes)/sizeof(int32_t));
 
@@ -204,9 +208,15 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // 会出现找不到匹配项、回落奇怪分辨率的情况。
     int32_t sensor_width = cam.maxResolution;
     int32_t sensor_height = (cam.maxResolution == 3280) ? 2464 : 1956;
-    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, sensor_height}, 4);
+    /* 【2026-11-18 对齐 A12】有效阵列改成 16:9。A12 的 activeArraySize 是
+     * [20 320 3240 1823]（约 3260x1823，1.79:1），pixelArray 仍是 3280x2464，
+     * 也就是说它把传感器裁成 16:9 再用。我们原来按整块 4:3 报，Aperture 出来的
+     * 取景框是 4:3，和 A12 的观感对不上（"画面比例"问题的由来）。
+     * 这里 3280/16*9 = 1845，取整到 1845。 */
+    int32_t active_height = (cam.maxResolution == 3280) ? 1845 : 1104;
+    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, active_height}, 4);
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE, (int32_t[]){sensor_width, sensor_height}, 2);
-    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, sensor_height}, 4);
+    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, active_height}, 4);
 
     // Physical sensor size (required for FOV calculation)
     // 【2026-11-17 修正】原来两路写反了：后摄写 3.676x2.757（那其实是 OV5693
@@ -426,7 +436,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_MAX_ANALOG_SENSITIVITY, &max_analog_sensitivity, 1);
 
     // JPEG max size (required)
-    int32_t jpeg_max_size = 3280 * 2464 * 2;
+    // 【2026-11-18 对齐 A12】A12 的 jpeg.maxSize 是 4149248（约 1920x1080x2），
+    // 我们原来按 8MP 报 16163840，framework 会据此给 BLOB 分配超大缓冲。
+    int32_t jpeg_max_size = 4149248;
     add_camera_metadata_entry(metadata, ANDROID_JPEG_MAX_SIZE, &jpeg_max_size, 1);
 
     // Pipeline max depth (required)
@@ -1094,10 +1106,10 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
     int32_t requestId = (int32_t)frameNumber;
     add_camera_metadata_entry(metadata, ANDROID_REQUEST_ID, &requestId, 1);
 
-    /* ANDROID_SCALER_CROP_REGION - full active array of the camera being used */
-    /* 【2026-11-18】原来硬编码 3280x2464（后摄），前摄也照抄，crop 比传感器大。 */
+    /* ANDROID_SCALER_CROP_REGION - full active array (16:9, see init_static_characteristics) */
+    /* 【2026-11-18】原来硬编码 3280x2464（4:3），前摄也照抄；现在跟随 16:9 有效阵列。 */
     int32_t crop_w = (gActiveCameraId == 0) ? 3280 : 2624;
-    int32_t crop_h = (gActiveCameraId == 0) ? 2464 : 1956;
+    int32_t crop_h = (gActiveCameraId == 0) ? 1845 : 1104;
     int32_t cropRegion[] = {0, 0, crop_w, crop_h};
     add_camera_metadata_entry(metadata, ANDROID_SCALER_CROP_REGION, cropRegion, 4);
 
