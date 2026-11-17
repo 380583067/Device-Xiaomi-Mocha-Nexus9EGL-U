@@ -51,13 +51,17 @@ namespace mocha {
 // 此前只是 kCameras 里没登记，导致 getNumberOfCameras() 只返回 1。
 const MochaCameraInfo MochaCameraHAL::kCameras[] = {
     { 0, "IMX179", CAMERA_FACING_BACK, 90, 3280, false },
-    { 1, "OV5693", CAMERA_FACING_FRONT, 270, 2592, false },
+    { 1, "OV5693", CAMERA_FACING_FRONT, 270, 2624, false },
 };
 
 const int MochaCameraHAL::kNumCameras = sizeof(MochaCameraHAL::kCameras) / sizeof(MochaCameraHAL::kCameras[0]);
 
 // Static camera characteristics cache
 static camera_metadata_t* gCameraCharacteristics[2] = { nullptr, nullptr };
+
+/* 当前打开的相机 id，供 build_result_metadata() 拼 crop region 用（见 gActiveCameraId
+ * 的赋值处 camera_device_open）。默认 0 = 后摄。 */
+static int gActiveCameraId = 0;
 
 // Module callbacks
 static camera_module_callbacks_t gModuleCallbacks;
@@ -193,21 +197,31 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_FLASH_INFO_AVAILABLE, &flash_available, 1);
 
     // Sensor info
+    // 【2026-11-17 修正】前摄 pixelArray 由 2592x1944 改为 2624x1956。
+    // 依据：Android 12 参考机（Shield 图形栈那台）实测
+    //   android.sensor.info.pixelArraySize = 2624x1956（OV5693）
+    // 之前按 2592x1944 上报，导致 4:3 之外的宽高比对不上，Aperture 选尺寸时
+    // 会出现找不到匹配项、回落奇怪分辨率的情况。
     int32_t sensor_width = cam.maxResolution;
-    int32_t sensor_height = (cam.maxResolution == 3280) ? 2464 : 1944;
+    int32_t sensor_height = (cam.maxResolution == 3280) ? 2464 : 1956;
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, sensor_height}, 4);
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE, (int32_t[]){sensor_width, sensor_height}, 2);
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, sensor_height}, 4);
 
     // Physical sensor size (required for FOV calculation)
-    // IMX179: 3.676mm x 2.757mm (1/3.2"), OV5693: 2.8mm x 2.1mm (1/4")
+    // 【2026-11-17 修正】原来两路写反了：后摄写 3.676x2.757（那其实是 OV5693
+    // 的量级），前摄写 2.8x2.1。按 Android 12 参考机实测值改回：
+    //   IMX179（后）: 4.5920 x 3.4496 mm  (1/3.2", 1.4um)
+    //   OV5693（前）: 3.6736 x 2.7384 mm
+    // 物理尺寸直接参与 FOV / 等效焦距换算，写反会让取景视野和"隐藏参数"里的
+    // 参数对不上。
     float phys_size[2];
     if (cameraId == 0) {
-        phys_size[0] = 3.676f;
-        phys_size[1] = 2.757f;
+        phys_size[0] = 4.5920f;
+        phys_size[1] = 3.4496f;
     } else {
-        phys_size[0] = 2.8f;
-        phys_size[1] = 2.1f;
+        phys_size[0] = 3.6736f;
+        phys_size[1] = 2.7384f;
     }
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PHYSICAL_SIZE, phys_size, 2);
 
@@ -285,12 +299,24 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_CONTROL_AE_AVAILABLE_MODES, ae_modes, sizeof(ae_modes)/sizeof(uint8_t));
 
     // Available AF modes (required by deriveCameraCharacteristicsKeys)
-    uint8_t af_modes[] = {
-        ANDROID_CONTROL_AF_MODE_OFF,
-        ANDROID_CONTROL_AF_MODE_AUTO,
-        ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE,
-    };
-    add_camera_metadata_entry(metadata, ANDROID_CONTROL_AF_AVAILABLE_MODES, af_modes, sizeof(af_modes)/sizeof(uint8_t));
+    // 【2026-11-17 修正】前摄 OV5693 是定焦（没有 VCM，AD5823 只挂在后摄
+    // channel 0 上），原来两路都上报 AF，导致"隐藏参数"里前摄显示成
+    // "1-Front:5MP f/2.8, AF"，且 Aperture 会给前摄发 AF 请求、HAL 空跑扫描。
+    // 按 Android 12 参考机实测：后摄 afAvailableModes = {OFF, AUTO, CONTINUOUS_PICTURE}，
+    // 前摄只有 {OFF}。
+    if (cameraId == 0) {
+        uint8_t af_modes[] = {
+            ANDROID_CONTROL_AF_MODE_OFF,
+            ANDROID_CONTROL_AF_MODE_AUTO,
+            ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+        };
+        add_camera_metadata_entry(metadata, ANDROID_CONTROL_AF_AVAILABLE_MODES, af_modes, sizeof(af_modes)/sizeof(uint8_t));
+    } else {
+        uint8_t af_modes[] = {
+            ANDROID_CONTROL_AF_MODE_OFF,
+        };
+        add_camera_metadata_entry(metadata, ANDROID_CONTROL_AF_AVAILABLE_MODES, af_modes, sizeof(af_modes)/sizeof(uint8_t));
+    }
 
     // Available AWB modes (required by deriveCameraCharacteristicsKeys)
     uint8_t awb_modes[] = {
@@ -457,11 +483,17 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_AVAILABLE_TEST_PATTERN_MODES, test_pattern_modes, sizeof(test_pattern_modes)/sizeof(uint8_t));
 
     // Lens focal length (required by buildFastInfo)
-    float focal_lengths[] = { 3.5f };  // ~3.5mm typical for tablet cameras
-    add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, focal_lengths, sizeof(focal_lengths)/sizeof(float));
+    // 【2026-11-17 修正】原来两路都写 3.5mm（占位值）。按 Android 12 参考机实测：
+    // 后摄 IMX179 = 3.36mm，前摄 OV5693 = 2.1mm。焦距参与 FOV 计算，
+    // 写错会让"隐藏参数"里显示的镜头信息和实际不符。
+    float focal_lengths[1];
+    focal_lengths[0] = (cameraId == 0) ? 3.36f : 2.10f;
+    add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, focal_lengths, 1);
 
     // Lens aperture (required by some framework paths)
-    float apertures[] = { 2.8f };
+    // 【2026-11-17 修正】原来写 2.8（占位值）。两颗模组实际都是 f/2.0，
+    // Android 12 参考机实测 availableApertures = {2.0}，这里对齐。
+    float apertures[] = { 2.0f };
     add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_APERTURES, apertures, sizeof(apertures)/sizeof(float));
 
     // Filter density
@@ -1062,8 +1094,11 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
     int32_t requestId = (int32_t)frameNumber;
     add_camera_metadata_entry(metadata, ANDROID_REQUEST_ID, &requestId, 1);
 
-    /* ANDROID_SCALER_CROP_REGION - full sensor */
-    int32_t cropRegion[] = {0, 0, 3280, 2464};
+    /* ANDROID_SCALER_CROP_REGION - full active array of the camera being used */
+    /* 【2026-11-18】原来硬编码 3280x2464（后摄），前摄也照抄，crop 比传感器大。 */
+    int32_t crop_w = (gActiveCameraId == 0) ? 3280 : 2624;
+    int32_t crop_h = (gActiveCameraId == 0) ? 2464 : 1956;
+    int32_t cropRegion[] = {0, 0, crop_w, crop_h};
     add_camera_metadata_entry(metadata, ANDROID_SCALER_CROP_REGION, cropRegion, 4);
 
     /* ANDROID_SENSOR_EXPOSURE_TIME (ns) */
@@ -1208,20 +1243,67 @@ static void copyFrameBetweenBuffers(
         return;
     }
     if (dstYuv) {
-        /* 目标是编码器那条 YUV 流：用 lockYCbCr 拿到平面布局，
-         * 再把 RGBA 转成 YUV420 写进去（同时按需缩放）。 */
+        /* 目标是编码器那条 YUV 流：先用 lockYCbCr 拿到真实的平面布局，
+         * 再把 RGBA 转成 YUV420 写进去（同时按需缩放）。
+         *
+         * 【录像修复 2026-11-17】原厂 gralloc 是新旧混杂的：README 里记着它对
+         * YV12 的 lockYCbCr 直接返回 -ENOSYS（SoftwareRenderer 那次遇到过），
+         * 但 HAL_PIXEL_FORMAT_YCBCR_420_888 走的是另一条分支，未必也不支持。
+         * 所以这里两条路都走：lockYCbCr 能用就用它给的 ystride/cstride/
+         * chroma_step；用不了就退化成 lock() + 按 YV12 手工铺平面。
+         * 不管走哪条，第一次都打一行布局日志——下次真机验证时一眼就能看出
+         * 编码器那条流到底是哪种布局。 */
         struct android_ycbcr ycbcr;
         memset(&ycbcr, 0, sizeof(ycbcr));
         ret = android::GraphicBufferMapper::get().lockYCbCr(*dst->buffer,
                     GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &ycbcr);
         if (ret == 0 && ycbcr.y) {
+            static bool layoutLogged = false;
+            if (!layoutLogged) {
+                layoutLogged = true;
+                ALOGI("encoder YUV via lockYCbCr: ystride=%zu cstride=%zu "
+                      "chroma_step=%zu", (size_t)ycbcr.ystride,
+                      (size_t)ycbcr.cstride, (size_t)ycbcr.chroma_step);
+            }
             rgbaToYuv420Scaled(static_cast<const uint8_t*>(srcVaddr),
                                (int)src->stream->width, (int)src->stream->height,
                                (int)dst->stream->width, (int)dst->stream->height,
                                &ycbcr);
             android::GraphicBufferMapper::get().unlock(*dst->buffer);
         } else {
-            ALOGE("copyFrameBetweenBuffers: lockYCbCr failed: %d", ret);
+            /* 退化路径：gralloc 不支持对这条流 lockYCbCr。
+             * 假设内部就是 YV12（Y 平面 + V + U），stride 取宽——录像用的
+             * 1280/1920 都是 32 的整数倍，原厂 YV12 stride 就是按 32 对齐的，
+             * 这两个分辨率下 stride == width 成立。 */
+            void* yuvVaddr = nullptr;
+            int lockRet = android::GraphicBufferMapper::get().lock(*dst->buffer,
+                    GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &yuvVaddr);
+            static bool fallbackLogged = false;
+            if (lockRet == 0 && yuvVaddr) {
+                const int w = (int)dst->stream->width;
+                const int h = (int)dst->stream->height;
+                const size_t ySize = (size_t)w * h;
+                memset(&ycbcr, 0, sizeof(ycbcr));
+                ycbcr.ystride = (size_t)w;
+                ycbcr.cstride = (size_t)w / 2;
+                ycbcr.chroma_step = 1;
+                ycbcr.y = static_cast<uint8_t*>(yuvVaddr);
+                /* YV12：V 平面在前，U 平面在后，各占 w*h/4 */
+                ycbcr.cr = static_cast<uint8_t*>(yuvVaddr) + ySize;
+                ycbcr.cb = static_cast<uint8_t*>(yuvVaddr) + ySize + ySize / 4;
+                if (!fallbackLogged) {
+                    fallbackLogged = true;
+                    ALOGW("encoder YUV via lockYCbCr failed (%d), falling back "
+                          "to lock() with an assumed YV12 layout, stride=%d", ret, w);
+                }
+                rgbaToYuv420Scaled(static_cast<const uint8_t*>(srcVaddr),
+                                   (int)src->stream->width, (int)src->stream->height,
+                                   w, h, &ycbcr);
+                android::GraphicBufferMapper::get().unlock(*dst->buffer);
+            } else {
+                ALOGE("copyFrameBetweenBuffers: encoder buffer not lockable: "
+                      "lockYCbCr=%d lock=%d", ret, lockRet);
+            }
         }
         android::GraphicBufferMapper::get().unlock(*src->buffer);
         return;
@@ -1301,7 +1383,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         ALOGI("AF request: mode=%d trigger=%d focusDist=%.2f", dev->af_mode, dev->af_trigger, focusDist);
     }
 
-    if (dev->pipeline) {
+    // 【2026-11-17 修正】前摄 OV5693 定焦、没有 VCM，这里只让后摄走 AF 流程。
+    // 前摄就算 framework 误发 AF 请求也不再空跑对比度扫描（每次扫描要独占
+    // V4L2 若干帧，会让前摄预览卡顿）。
+    if (dev->pipeline && dev->camera_id == 0) {
         mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (dev->af_mode == ANDROID_CONTROL_AF_MODE_AUTO ||
             dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE) {
@@ -1655,6 +1740,11 @@ int MochaCameraHAL::openCamera(int cameraId, hw_device_t **device) {
 
     mocha_camera_device_t *dev = (mocha_camera_device_t *)*device;
     dev->camera_id = cameraId;
+    /* 【2026-11-18】result metadata 里要用到本路传感器的有效阵列尺寸（crop region），
+     * 而 build_result_metadata() 拿不到 cameraId，这里用一个文件级变量记住当前
+     * 打开的相机。以前那里硬编码 3280x2464，前摄（2624x1956）上报的 crop region
+     * 比实际传感器还大，CameraX 做裁剪换算会算错。 */
+    gActiveCameraId = cameraId;
 
     ALOGI("Camera %d opened successfully", cameraId);
     return 0;
