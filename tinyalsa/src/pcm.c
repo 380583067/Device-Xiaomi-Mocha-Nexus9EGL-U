@@ -202,10 +202,15 @@ struct pcm {
     int fd;
     /** Flags that were passed to @ref pcm_open */
     unsigned int flags;
-    /** Whether the PCM is running or not */
-    int running:1;
+    /** Whether the PCM is running or not
+     * 【2026-11-17】原来是 `int running:1`——有符号一位位域只有 {-1,0} 两个取值，
+     * `pcm->running = 1` 实际被截断成 -1，编译期报
+     * -Wsingle-bit-bitfield-constant-conversion（6 处）。当前代码全部用真值判断
+     * （if (pcm->running)），行为正确；改成 unsigned 消除隐患，避免以后有人写
+     * `== 1` 比较时永远不成立。 */
+    unsigned int running:1;
     /** Whether or not the PCM has been prepared */
-    int prepared:1;
+    unsigned int prepared:1;
     /** The number of underruns that have occured */
     int underruns;
     /** Size of the buffer */
