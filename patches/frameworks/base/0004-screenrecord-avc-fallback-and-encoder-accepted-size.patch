@@ -1,0 +1,251 @@
+diff --git a/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenMediaRecorder.java b/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenMediaRecorder.java
+index 3d0cabd71..25bd9e01b 100644
+--- a/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenMediaRecorder.java
++++ b/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenMediaRecorder.java
+@@ -33,6 +33,7 @@ import android.hardware.display.DisplayManager;
+ import android.hardware.display.VirtualDisplay;
+ import android.media.MediaCodec;
+ import android.media.MediaCodecInfo;
++import android.media.MediaCodecList;
+ import android.media.MediaFormat;
+ import android.media.MediaMuxer;
+ import android.media.MediaRecorder;
+@@ -164,6 +165,12 @@ public class ScreenMediaRecorder extends MediaProjection.Callback {
+         mMediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+ 
+ 
++        // HEVC is optional, including on devices with an HEVC decoder.
++        if (mHEVC && !isHardwareHevcEncoderAvailable()) {
++            Log.w(TAG, "No hardware HEVC encoder; using AVC for screen recording");
++            mHEVC = false;
++        }
++
+         // Set up video
+         DisplayMetrics metrics = new DisplayMetrics();
+         WindowManager wm = (WindowManager) mContext.getSystemService(Context.WINDOW_SERVICE);
+@@ -181,16 +188,29 @@ public class ScreenMediaRecorder extends MediaProjection.Callback {
+         long maxFilesize = mLongerDuration ? MAX_FILESIZE_BYTES_LONGER : MAX_FILESIZE_BYTES;
+         if (!mHEVC) {
+             mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
+-            mMediaRecorder.setVideoEncodingProfileLevel(
+-                    MediaCodecInfo.CodecProfileLevel.AVCProfileMain,
+-                    mLowQuality ? MediaCodecInfo.CodecProfileLevel.AVCLevel32
+-                    : getAvcProfileLevelCodeByName(mAvcProfileLevel));
++            int profile = MediaCodecInfo.CodecProfileLevel.AVCProfileMain;
++            int level = mLowQuality ? MediaCodecInfo.CodecProfileLevel.AVCLevel32
++                    : getAvcProfileLevelCodeByName(mAvcProfileLevel);
++            // Asking for a profile/level the encoder does not advertise makes the OMX
++            // software encoder fail the whole configure with insufficient resources, so
++            // only pin it when the component really lists it.
++            if (supportsProfileLevel(MediaFormat.MIMETYPE_VIDEO_AVC, profile, level)) {
++                mMediaRecorder.setVideoEncodingProfileLevel(profile, level);
++            } else {
++                Log.w(TAG, "Encoder does not advertise AVC Main/" + level
++                        + ", leaving it at the encoder default");
++            }
+         } else {
+             mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC);
+-            mMediaRecorder.setVideoEncodingProfileLevel(
+-                    MediaCodecInfo.CodecProfileLevel.HEVCProfileMain,
+-                    mLowQuality ? MediaCodecInfo.CodecProfileLevel.HEVCHighTierLevel31
+-                    : MediaCodecInfo.CodecProfileLevel.HEVCHighTierLevel41);
++            int profile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain;
++            int level = mLowQuality ? MediaCodecInfo.CodecProfileLevel.HEVCHighTierLevel31
++                    : MediaCodecInfo.CodecProfileLevel.HEVCHighTierLevel41;
++            if (supportsProfileLevel(MediaFormat.MIMETYPE_VIDEO_HEVC, profile, level)) {
++                mMediaRecorder.setVideoEncodingProfileLevel(profile, level);
++            } else {
++                Log.w(TAG, "Encoder does not advertise HEVC Main/" + level
++                        + ", leaving it at the encoder default");
++            }
+         }
+         mMediaRecorder.setVideoSize(width, height);
+         mMediaRecorder.setVideoFrameRate(refreshRate);
+@@ -251,6 +271,39 @@ public class ScreenMediaRecorder extends MediaProjection.Callback {
+         }
+     }
+ 
++    static boolean isHardwareHevcEncoderAvailable() {
++        for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) {
++            if (!info.isEncoder() || !info.isHardwareAccelerated()) continue;
++            for (String type : info.getSupportedTypes()) {
++                if (MediaFormat.MIMETYPE_VIDEO_HEVC.equalsIgnoreCase(type)) return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * True when an encoder for {@code mime} advertises {@code profile} at {@code level} or
++     * better. MediaRecorder takes one profile/level pair for all candidates, so a single match
++     * is enough to know the value is accepted.
++     */
++    static boolean supportsProfileLevel(String mime, int profile, int level) {
++        for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) {
++            if (!info.isEncoder()) continue;
++            for (String type : info.getSupportedTypes()) {
++                if (!type.equalsIgnoreCase(mime)) continue;
++                try {
++                    for (MediaCodecInfo.CodecProfileLevel pl
++                            : info.getCapabilitiesForType(type).profileLevels) {
++                        if (pl.profile == profile && pl.level >= level) return true;
++                    }
++                } catch (IllegalArgumentException ignored) {
++                    // Type not actually supported for this component.
++                }
++            }
++        }
++        return false;
++    }
++
+     /**
+      * Find the highest supported screen resolution and refresh rate for the given dimensions on
+      * this device, up to actual size and given rate.
+@@ -264,63 +317,85 @@ public class ScreenMediaRecorder extends MediaProjection.Callback {
+      */
+     private int[] getSupportedSize(final int screenWidth, final int screenHeight, int refreshRate)
+             throws IOException {
+-        String videoType = MediaFormat.MIMETYPE_VIDEO_AVC;
++        String videoType = mHEVC ? MediaFormat.MIMETYPE_VIDEO_HEVC
++                : MediaFormat.MIMETYPE_VIDEO_AVC;
+ 
+-        // Get max size from the decoder, to ensure recordings will be playable on device
+-        MediaCodec decoder = MediaCodec.createDecoderByType(videoType);
+-        MediaCodecInfo.VideoCapabilities vc = decoder.getCodecInfo()
++        // The encoder's alignment, size and frame-rate limits constrain capture.
++        MediaCodec encoder = MediaCodec.createEncoderByType(videoType);
++        MediaCodecInfo.VideoCapabilities vc = encoder.getCodecInfo()
+                 .getCapabilitiesForType(videoType).getVideoCapabilities();
+-        decoder.release();
+-
+-        // Check if we can support screen size as-is
+-        int width = vc.getSupportedWidths().getUpper();
+-        int height = vc.getSupportedHeights().getUpper();
+-
+-        int screenWidthAligned = screenWidth;
+-        if (screenWidthAligned % vc.getWidthAlignment() != 0) {
+-            screenWidthAligned -= (screenWidthAligned % vc.getWidthAlignment());
++        encoder.release();
++
++        // Preferred: the panel size itself, but only while it stays inside 1080p.
++        int[] exact = (screenWidth <= 1920 && screenHeight <= 1080)
++                ? trySupportedSize(vc, screenWidth, screenHeight, refreshRate)
++                : null;
++        if (exact != null) {
++            Log.d(TAG, "Screen size supported: " + exact[0] + "x" + exact[1]
++                    + " at rate " + exact[2]);
++            return exact;
+         }
+-        int screenHeightAligned = screenHeight;
+-        if (screenHeightAligned % vc.getHeightAlignment() != 0) {
+-            screenHeightAligned -= (screenHeightAligned % vc.getHeightAlignment());
+-        }
+-
+-        if (width >= screenWidthAligned && height >= screenHeightAligned
+-                && vc.isSizeSupported(screenWidthAligned, screenHeightAligned)) {
+-            // Desired size is supported, now get the rate
+-            int maxRate = vc.getSupportedFrameRatesFor(screenWidthAligned,
+-                    screenHeightAligned).getUpper().intValue();
+ 
+-            if (maxRate < refreshRate) {
+-                refreshRate = maxRate;
++        // The capability table of the software encoder is not always self-consistent: it can
++        // accept a size and still reject the frame-rate query for that same size, and scaling
++        // by the independent width/height limits can land outside the joint block limit.
++        // Walk a ladder of common sizes instead of trusting one computed value. Everything is
++        // kept within 1920x1080, which is what the AVC level we ask for actually allows; the
++        // OMX software encoder refuses (insufficient resources) anything above it. 4:3 comes
++        // first because this panel is 4:3, so the recording keeps the screen aspect.
++        int[][] ladder = {
++                {1440, 1080}, {1280, 960}, {1280, 720}, {1024, 768}, {960, 720}, {640, 480},
++        };
++        for (int[] candidate : ladder) {
++            if (candidate[0] > screenWidth || candidate[1] > screenHeight) {
++                continue;  // never upscale beyond the panel
++            }
++            int[] size = trySupportedSize(vc, candidate[0], candidate[1], refreshRate);
++            if (size != null) {
++                Log.d(TAG, "Recording at reduced size " + size[0] + "x" + size[1]
++                        + " at rate " + size[2]);
++                return size;
+             }
+-            Log.d(TAG, "Screen size supported at rate " + refreshRate);
+-            return new int[]{screenWidthAligned, screenHeightAligned, refreshRate};
+         }
+ 
+-        // Otherwise, resize for max supported size
+-        double scale = Math.min(((double) width / screenWidth),
+-                ((double) height / screenHeight));
++        // Nothing the encoder advertises works; start the recording at a size every AVC
++        // encoder in this tree accepts rather than failing the whole capture.
++        Log.w(TAG, "No advertised size accepted, falling back to 1280x720");
++        return new int[]{1280, 720, Math.min(refreshRate, 30)};
++    }
+ 
+-        int scaledWidth = (int) (screenWidth * scale);
+-        int scaledHeight = (int) (screenHeight * scale);
+-        if (scaledWidth % vc.getWidthAlignment() != 0) {
+-            scaledWidth -= (scaledWidth % vc.getWidthAlignment());
++    /**
++     * Align the requested size down to the encoder alignment and return it only when the
++     * encoder accepts both the size and a positive frame rate for it.
++     */
++    private static int[] trySupportedSize(MediaCodecInfo.VideoCapabilities vc,
++            int width, int height, int refreshRate) {
++        int w = alignDown(width, vc.getWidthAlignment());
++        int h = alignDown(height, vc.getHeightAlignment());
++        if (w <= 0 || h <= 0) {
++            return null;
+         }
+-        if (scaledHeight % vc.getHeightAlignment() != 0) {
+-            scaledHeight -= (scaledHeight % vc.getHeightAlignment());
++        try {
++            if (!vc.isSizeSupported(w, h)) {
++                return null;
++            }
++            int maxRate = vc.getSupportedFrameRatesFor(w, h).getUpper().intValue();
++            if (maxRate <= 0) {
++                return null;
++            }
++            // 30 fps is plenty for screen content and keeps the software encoder inside its
++            // real-time budget; the panel reports 60 and the table sometimes answers higher.
++            return new int[]{w, h, Math.min(Math.min(refreshRate, maxRate), 30)};
++        } catch (IllegalArgumentException e) {
++            return null;
+         }
++    }
+ 
+-        // Find max supported rate for size
+-        int maxRate = vc.getSupportedFrameRatesFor(scaledWidth, scaledHeight)
+-                .getUpper().intValue();
+-        if (maxRate < refreshRate) {
+-            refreshRate = maxRate;
++    private static int alignDown(int value, int alignment) {
++        if (alignment <= 1) {
++            return value;
+         }
+-
+-        Log.d(TAG, "Resized by " + scale + ": " + scaledWidth + ", " + scaledHeight
+-                + ", " + refreshRate);
+-        return new int[]{scaledWidth, scaledHeight, refreshRate};
++        return value - (value % alignment);
+     }
+ 
+     /**
+@@ -341,10 +416,12 @@ public class ScreenMediaRecorder extends MediaProjection.Callback {
+ 
+         // MediaRecorder might throw RuntimeException if stopped immediately after starting
+         // We should remove the recording in this case as it will be invalid
+-        closer.register(mMediaRecorder::stop);
+-        closer.register(mMediaRecorder::release);
+-        closer.register(mInputSurface::release);
+-        closer.register(mVirtualDisplay::release);
++        if (mMediaRecorder != null) {
++            closer.register(mMediaRecorder::stop);
++            closer.register(mMediaRecorder::release);
++        }
++        if (mVirtualDisplay != null) closer.register(mVirtualDisplay::release);
++        if (mInputSurface != null) closer.register(mInputSurface::release);
+         closer.register(mMediaProjection::stop);
+         closer.register(this::stopInternalAudioRecording);
+ 

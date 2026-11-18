@@ -1,0 +1,23 @@
+diff --git a/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenRecordDialog.java b/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenRecordDialog.java
+index 0478d9e8b..9742b2d95 100644
+--- a/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenRecordDialog.java
++++ b/packages/SystemUI/src/com/android/systemui/screenrecord/ScreenRecordDialog.java
+@@ -109,6 +109,7 @@ public class ScreenRecordDialog extends SystemUIDialog {
+ 
+         setContentView(R.layout.screen_record_dialog);
+ 
++
+         TextView cancelBtn = findViewById(R.id.button_cancel);
+         cancelBtn.setOnClickListener(v -> dismiss());
+         TextView startBtn = findViewById(R.id.button_start);
+@@ -226,6 +227,9 @@ public class ScreenRecordDialog extends SystemUIDialog {
+         mAudioSwitch.setChecked(Prefs.getInt(userContext, PREFS + PREF_AUDIO, 0) == 1);
+         mOptions.setSelection(Prefs.getInt(userContext, PREFS + PREF_AUDIO_SOURCE, 0));
+         mSkipSwitch.setChecked(Prefs.getInt(userContext, PREFS + PREF_SKIP, 0) == 1);
+-        mHEVCSwitch.setChecked(Prefs.getInt(userContext, PREFS + PREF_HEVC, 1) == 1);
++        boolean hevcAvailable = ScreenMediaRecorder.isHardwareHevcEncoderAvailable();
++        mHEVCSwitch.setEnabled(hevcAvailable);
++        mHEVCSwitch.setChecked(hevcAvailable
++                && Prefs.getInt(userContext, PREFS + PREF_HEVC, 1) == 1);
+     }
+ }

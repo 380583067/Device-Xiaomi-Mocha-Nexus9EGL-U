@@ -1,0 +1,89 @@
+diff --git a/packages/SystemUI/res/layout/screen_share_dialog.xml b/packages/SystemUI/res/layout/screen_share_dialog.xml
+index 2616e8ae2..30ee0326e 100644
+--- a/packages/SystemUI/res/layout/screen_share_dialog.xml
++++ b/packages/SystemUI/res/layout/screen_share_dialog.xml
+@@ -15,11 +15,17 @@
+   -->
+ 
+ <!-- Scrollview is necessary to fit everything in landscape layout -->
+-<ScrollView  xmlns:android="http://schemas.android.com/apk/res/android"
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:androidprv="http://schemas.android.com/apk/prv/res/android"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:orientation="vertical">
++
++<ScrollView
+     android:id="@+id/screen_share_permission_dialog"
+     android:layout_width="match_parent"
+-    android:layout_height="match_parent">
++    android:layout_height="0dp"
++    android:layout_weight="1">
+ 
+     <LinearLayout
+         android:layout_width="match_parent"
+@@ -65,31 +71,36 @@
+             android:text="@string/screenrecord_permission_dialog_warning_entire_screen"
+             style="@style/TextAppearance.Dialog.Body.Message"
+             android:gravity="start"/>
++    </LinearLayout>
++</ScrollView>
+ 
+-        <!-- Buttons -->
+-        <com.android.internal.widget.ButtonBarLayout
+-            android:layout_width="match_parent"
++    <!-- Buttons stay outside the ScrollView: this panel is 4:3 and 768dp tall, so the option
++         list alone is taller than the screen and used to leave no visible way to start. -->
++    <com.android.internal.widget.ButtonBarLayout
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:orientation="horizontal"
++        android:layout_marginTop="@dimen/screenrecord_buttons_margin_top"
++        android:paddingStart="@dimen/dialog_side_padding"
++        android:paddingEnd="@dimen/dialog_side_padding"
++        android:paddingBottom="@dimen/dialog_bottom_padding">
++        <Button
++            android:id="@android:id/button2"
++            android:layout_width="wrap_content"
+             android:layout_height="wrap_content"
+-            android:orientation="horizontal"
+-            android:layout_marginTop="@dimen/screenrecord_buttons_margin_top">
+-            <Button
+-                android:id="@android:id/button2"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:layout_weight="0"
+-                android:text="@string/cancel"
+-                style="@style/Widget.Dialog.Button.BorderButton" />
+-            <Space
+-                android:layout_width="0dp"
+-                android:layout_height="match_parent"
+-                android:layout_weight="1"/>
+-            <Button
+-                android:id="@android:id/button1"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:layout_weight="0"
+-                android:text="@string/screenrecord_continue"
+-                style="@style/Widget.Dialog.Button" />
+-        </com.android.internal.widget.ButtonBarLayout>
+-    </LinearLayout>
+-</ScrollView>
+\ No newline at end of file
++            android:layout_weight="0"
++            android:text="@string/cancel"
++            style="@style/Widget.Dialog.Button.BorderButton" />
++        <Space
++            android:layout_width="0dp"
++            android:layout_height="match_parent"
++            android:layout_weight="1"/>
++        <Button
++            android:id="@android:id/button1"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_weight="0"
++            android:text="@string/screenrecord_continue"
++            style="@style/Widget.Dialog.Button" />
++    </com.android.internal.widget.ButtonBarLayout>
++</LinearLayout>
+\ No newline at end of file
