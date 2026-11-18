@@ -1,0 +1,43 @@
+diff --git a/bcmdhd/wifi_hal/Android.bp b/bcmdhd/wifi_hal/Android.bp
+index 4994828..a6737c3 100644
+--- a/bcmdhd/wifi_hal/Android.bp
++++ b/bcmdhd/wifi_hal/Android.bp
+@@ -43,6 +43,38 @@ wifi_cc_defaults {
+ cc_library_static {
+     name: "libwifi-hal-bcm",
+ 
++    // ========================================================================
++    // CFI 一致性修复（2026-11-16 真机实测，解决 wifi HAL 崩溃 + 开机动画循环）
++    //
++    // 背景：最终产物 libwifi-hal.so（frameworks/opt/net/wifi/libwifi_hal/Android.bp）
++    //   显式打开了 sanitize: { cfi: true, integer_overflow: true }，
++    //   而本模块正是它的 whole_static_libs 依赖。
++    //
++    // 问题：Soong **不会**把 sanitize 沿 whole_static_libs 传递给 static library。
++    //   于是本模块编出来的 wifi_cleanup() 等函数入口没有 CFI type hash 前缀，
++    //   但 libwifi-hal.so 里的调用点（WifiLegacyHal::stop）仍按 CFI 规则做检查。
++    //   检查时会把函数机器码当成 type hash 读取，必然不匹配 → __cfi_slowpath → abort。
++    //
++    // 真机崩溃栈（/vendor/bin/hw/android.hardware.wifi@1.0-service.legacy）：
++    //   #00 libdl.so (__cfi_slowpath+14)
++    //         r0=0x98a318fe r1=0x826cd3ae  ← 两个不同的 type hash，正是签名不匹配的铁证
++    //   #01 libwifi-hal.so (wifi_cleanup.cfi+800)
++    //   #02 WifiLegacyHal::stop(...)+306
++    //
++    // 连锁后果（这才是"开机动画循环"的关键推手）：
++    //   wifi HAL 进程被 abort
++    //     → system_server 的 WifiHalHidlImpl.registerHalCallback 拿到 null IWifi
++    //     → java.lang.NullPointerException: Attempt to invoke interface method
++    //       'IWifi.registerEventCallback(...)' on a null object reference
++    //     → FATAL EXCEPTION IN SYSTEM PROCESS → 整个 Android 框架重启 → 开机动画重放
++    //
++    // 修复：让本模块与 libwifi-hal 使用同一套 CFI 配置，
++    //   使 wifi_cleanup() 等函数的入口带上正确的 type hash，检查即可通过。
++    // ========================================================================
++    sanitize: {
++        cfi: true,
++    },
++
+     cflags: [
+         "-Wall",
+         "-Werror",
