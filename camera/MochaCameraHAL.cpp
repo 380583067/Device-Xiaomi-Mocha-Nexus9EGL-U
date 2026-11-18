@@ -905,15 +905,22 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
              * 这里把编码器流保留为 YCbCr_420_888，pipeline 原生支持写 YUV；
              * 预览流仍然用 RGBA_8888。 */
             if ((stream->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) != 0) {
-                /* 【2026-11-18 方案1】不再改写格式，改为登记成"编码器流"。
-                 * 同时把 max_buffers 提到 4：MediaCodec 的输入队列需要足够的
-                 * 空闲槽位，2 个容易在起播瞬间取不到缓冲。 */
+                /* 【2026-11-18】真机 GraphiBuffer 构造日志已定性：
+                 *   err=3 (GRALLOC1_ERROR_UNSUPPORTED) fmt=0x23 usage=0x10033 mapperVersion=2
+                 * 即 **vendor gralloc1 不支持 YCbCr_420_888 + HW_VIDEO_ENCODER** 这个组合，
+                 * 编码器输入缓冲根本分配不出来。改用 YV12 —— 老 NVIDIA 相机/编码路径
+                 * 一直支持的格式，我们的 fan-out 也有 YV12 铺平面的兜底分支。 */
+                stream->format = HAL_PIXEL_FORMAT_YV12;
+                stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
                 for (int k = 0; k < 4; k++) {
                     if (gEncoderStreams[k] == nullptr) {
                         gEncoderStreams[k] = stream;
                         break;
                     }
                 }
+                /* 【2026-11-18】回到 4：实测 max_buffers=2 时 Camera3 的 dequeue 直接
+                 * 返回 -EINVAL（mocha-dequeue 日志：max_buffers=2 total=4 handedOut=0），
+                 * 4 个槽位时至少能正常 dequeue、录制能起来。 */
                 if (stream->max_buffers < 4) {
                     stream->max_buffers = 4;
                 }
