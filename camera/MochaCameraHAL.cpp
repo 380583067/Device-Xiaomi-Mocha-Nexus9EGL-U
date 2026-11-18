@@ -63,6 +63,23 @@ static camera_metadata_t* gCameraCharacteristics[2] = { nullptr, nullptr };
  * 的赋值处 camera_device_open）。默认 0 = 后摄。 */
 static int gActiveCameraId = 0;
 
+/* 【2026-11-18 录像方案1】编码器输入流标记。
+ *
+ * 之前是把这条流的 format 改写成 YCbCr_420_888，让拷贝路径走 YUV；但那样
+ * framework 要和 ACodec 建好的 BufferQueue 对齐时谈不拢，一取缓冲就
+ * `Stream 2: Can't dequeue next output buffer: -22`。
+ * 现在改成：**格式保持 IMPLEMENTATION_DEFINED 不动**（让 gralloc 自己决定
+ * 布局），只在这里记下指针，拷贝时用 isEncoderStream() 判断走 YUV 写入。 */
+static camera3_stream_t* gEncoderStreams[4] = { nullptr, nullptr, nullptr, nullptr };
+
+static bool isEncoderStream(const camera3_stream_t* s) {
+    if (s == nullptr) return false;
+    for (int i = 0; i < 4; i++) {
+        if (gEncoderStreams[i] == s) return true;
+    }
+    return false;
+}
+
 // Module callbacks
 static camera_module_callbacks_t gModuleCallbacks;
 
@@ -874,6 +891,8 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
  
     // Override IMPLEMENTATION_DEFINED to RGBA_8888 (Tegra gralloc allocates
     // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
+    /* 每次 configure 前清空编码器流登记，避免上次会话的悬空指针。 */
+    for (int k = 0; k < 4; k++) gEncoderStreams[k] = nullptr;
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type == CAMERA3_STREAM_OUTPUT &&
@@ -886,8 +905,20 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
              * 这里把编码器流保留为 YCbCr_420_888，pipeline 原生支持写 YUV；
              * 预览流仍然用 RGBA_8888。 */
             if ((stream->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) != 0) {
-                stream->format = HAL_PIXEL_FORMAT_YCBCR_420_888;
-                ALOGI("stream %u is the video encoder input -> YCbCr_420_888", i);
+                /* 【2026-11-18 方案1】不再改写格式，改为登记成"编码器流"。
+                 * 同时把 max_buffers 提到 4：MediaCodec 的输入队列需要足够的
+                 * 空闲槽位，2 个容易在起播瞬间取不到缓冲。 */
+                for (int k = 0; k < 4; k++) {
+                    if (gEncoderStreams[k] == nullptr) {
+                        gEncoderStreams[k] = stream;
+                        break;
+                    }
+                }
+                if (stream->max_buffers < 4) {
+                    stream->max_buffers = 4;
+                }
+                ALOGI("stream %u is the video encoder input (format stays %#x, max_buffers=%u)",
+                      i, stream->format, stream->max_buffers);
             } else {
                 stream->format = HAL_PIXEL_FORMAT_RGBA_8888;
             }
@@ -1226,7 +1257,10 @@ static void copyFrameBetweenBuffers(
         const camera3_stream_buffer_t* src, const camera3_stream_buffer_t* dst) {
     if (!src || !dst || !src->buffer || !dst->buffer) return;
     const bool srcRgba = (src->stream->format == HAL_PIXEL_FORMAT_RGBA_8888);
-    const bool dstYuv  = (dst->stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888);
+    /* 【2026-11-18 方案1】编码器流的 format 现在是 IMPLEMENTATION_DEFINED（没改写），
+     * 这里用内部标记把它仍然按 YUV 目标处理，走 NV12/YV12 写入路径。 */
+    const bool dstYuv  = (dst->stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) ||
+                         isEncoderStream(dst->stream);
     if (src->stream->format != dst->stream->format && !(srcRgba && dstYuv)) {
         ALOGW("copyFrameBetweenBuffers: unsupported format %d -> %d",
               src->stream->format, dst->stream->format);
