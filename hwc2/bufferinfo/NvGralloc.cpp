@@ -52,11 +52,22 @@ enum SurfaceWord {
   kWidth = 0,
   kHeight = 1,
   kColorFormat = 2,
-  kLayout = 4,
-  kPitch = 5,
-  kOffset = 7,
-  kKind = 8,
-  kBlockHeightLog2 = 9,
+  kLayout = 3,
+  kPitch = 4,
+  /* The word the author's table reads as the pitch. On the mocha build it
+   * is not: nvgr_dump against this allocator shows word 5 climbing by one
+   * on every freshly allocated buffer -- a sequence number, not a layout
+   * byte -- with the pitch sitting one word below the author's index and
+   * every later field shifted with it. The author's dump predates the
+   * system-wide compression ban; whatever changed the trailing fields
+   * inserted or repurposed this one. Established against this build by
+   * nvgr_dump (debugtool_nvgr_dump/), not assumed from the old one:
+   * word 4 holds 6144 for a 1536-wide RGBA surface, which is 1536 * 4, and
+   * word 3 holds 3 (blocklinear) for a GPU render target. */
+  kSequence = 5,
+  kOffset = 6,
+  kKind = 7,
+  kBlockHeightLog2 = 8,
 };
 
 template <typename Fn>
