@@ -316,7 +316,7 @@ PRODUCT_PROPERTY_OVERRIDES += \
 
 # Overlay
 DEVICE_PACKAGE_OVERLAYS += \
-    $(LOCAL_PATH)/overlay 
+    $(LOCAL_PATH)/overlay
 
 # Partitions
 $(call inherit-product, $(SRC_TARGET_DIR)/product/non_ab_device.mk)
