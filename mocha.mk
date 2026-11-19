@@ -407,14 +407,7 @@ PRODUCT_COPY_FILES += \
 
 # Seccomp
 PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/initfiles/init.renderer.sh:$(TARGET_COPY_OUT_VENDOR)/bin/init.renderer.sh \
     $(LOCAL_PATH)/initfiles/ussr_setup.sh:/system/bin/ussr_setup.sh
-
-# adb 自检脚本：开机后延迟检测 adbd USB transport 是否正常，异常自动重启到
-# recovery(TWRP)，避免修复失败时需要用户手动按键进入 TWRP 拉日志。
-# 由 init.tegra.rc 中的 adb_selfcheck 服务在 sys.boot_completed=1 后触发。
-PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/initfiles/adb_selfcheck.sh:$(TARGET_COPY_OUT_VENDOR)/bin/adb_selfcheck.sh
 
 # 开机向导跳过脚本：由 init.tn8.rc 里的 mocha_provision oneshot 服务在
 # sys.boot_completed=1 时执行，把 device_provisioned / user_setup_complete

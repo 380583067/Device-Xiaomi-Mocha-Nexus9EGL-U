@@ -126,6 +126,11 @@ on post-fs-data
     # backlight
     chown system system /sys/class/backlight/lcd-backlight/brightness
 
+    # 开机日志：清掉上次的现场再拉起 logger（服务定义见文件末尾）。
+    # 顺序很重要 —— 先 rm 再 start，否则会把新日志删掉。
+    rm /cache/boot_log.txt
+    start logger
+
 # Set up HDCP
 import /vendor/etc/init/hw/init.hdcp.rc
 
@@ -282,23 +287,6 @@ service logger /system/bin/logcat -b all -D -r 4096 -n 2 -f /cache/boot_log.txt
     user root
     group root system
 
-# adb 自检：开机后延迟检测 adbd 的 USB transport 是否成功与 host 握手，
-# 若检测到 offline（系统已启动完成但 adbd 始终无授权/连接迹象），
-# 自动重启到 recovery(TWRP)，避免手动按键进 TWRP 拉日志。
-# 详见 /vendor/bin/adb_selfcheck.sh。
-service adb_selfcheck /vendor/bin/adb_selfcheck.sh
-    user root
-    group root system log
-    disabled
-    oneshot
-
-on post-fs-data
-    # Clear existing log and start the service
-    rm /cache/boot_log.txt
-    start logger
-
 on property:sys.boot_completed=1
     # Stop the logger service
     stop logger
-    # 系统启动完成后触发 adb 自检（脚本内部再延迟等待 host 连接）
-    start adb_selfcheck

@@ -420,9 +420,6 @@
 /sys/fs/cgroup/.*                     u:object_r:sysfs:s0
 /acct/uid                              u:object_r:tmpfs:s0
 
-# adb selfcheck script
-(/system)?/vendor/bin/adb_selfcheck\.sh	u:object_r:adb-selfcheck_exec:s0
-
 # FM (Broadcom BCM4354)
 # FIX NOTE: brcm-uim-sysfs switches the BT chip into FM mode; give uim its own exec type.
 # Note /vendor here is /system/vendor (old TN8 layout, no separate partition),
