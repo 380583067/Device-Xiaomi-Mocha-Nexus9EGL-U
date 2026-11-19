@@ -285,6 +285,10 @@ BOARD_SEPOLICY_DIRS += \
 # cursor plane，全部走 window plane 或 client 合成），行为安全。
 TARGET_HWC_NO_VIC := true
 
+# 调试开关（2026-11-19 黑屏排查）：HWC2 的 per-frame trace（每帧的 plane 规划、
+# 描述符去向、硬件应答）。运行时由 setprop vendor.hwc.trace 1 控制是否输出。
+TARGET_HWC_TRACE := true
+
 TARGET_LD_SHIM_LIBS := \
     /system/vendor/lib/libnvcap_video.so|libshims_ui.so \
     /system/vendor/lib/libnvgr.so|libshim_atomic.so \
