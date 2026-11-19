@@ -57,7 +57,8 @@
  *  - std::string 的 COW 符号（_ZNSs*）：实测计数为 0，blob 没有踩 GNU libstdc++ 的
  *    std::string ABI。
  *
- * 注意（血泪教训，摘自 libbeautify_stub.cpp / mocha_cpp_shim.cpp）
+ * 注意（血泪教训，摘自 libbeautify_stub.cpp / mocha_cpp_shim.cpp；
+ * mocha_cpp_shim.cpp 已随相机方案切换删除，见 git 历史）
  * ---------------------------------------------------------------------------
  * 本 shim 通过 TARGET_LD_SHIM_LIBS 预加载，会进入进程的 *shared group*，也就是说
  * 它导出的符号对 cameraserver 里所有库可见。因此这里只定义"系统里确实不存在"的

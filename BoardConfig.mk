@@ -329,8 +329,9 @@ TARGET_LD_SHIM_LIBS := \
 #   CameraPipeline.cpp + isp/ + v4l2/ + tuning/），而不是继续修 blob。
 #   在 HAL 切换完成之前，这里不能打开 shim 映射，否则开机就会卡死。
 #
-# 恢复方法：把下面两行取消注释即可（同时需要把 CameraWrapper.cpp 里的
-# getprop 开关 persist.mocha.camera.blob_preload 设为 1）。
+# 恢复方法：把下面两行取消注释，并把 CameraWrapper.cpp 从 git 历史取回
+# （commit 937cb6c 之前），同时把其中的 getprop 开关
+# persist.mocha.camera.blob_preload 设为 1。
 # TARGET_LD_SHIM_LIBS += \
 #     /system/lib/hw/camera.vendor.tegra.so|libmocha_camera_shim.so \
 #     /system/lib/hw/camera.vendor.tegra.so|libcameraservice_mocha.so

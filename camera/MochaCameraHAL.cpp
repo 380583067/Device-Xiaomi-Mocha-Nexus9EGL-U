@@ -228,14 +228,14 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, stall_durations, sizeof(stall_durations)/sizeof(int64_t));
 
-    // Available processed sizes (for CameraWrapper synthesis of YUV_420_888)
+    // Available processed sizes
     int32_t processed_sizes[] = {
         1280, 720,
         1920, 1080,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES, processed_sizes, sizeof(processed_sizes)/sizeof(int32_t));
 
-    // Available JPEG sizes (for CameraWrapper synthesis)
+    // Available JPEG sizes
     int32_t jpeg_sizes[] = {
         1280, 720,
         1920, 1080,

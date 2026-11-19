@@ -12,8 +12,8 @@ LOCAL_PATH := $(call my-dir)
 #   JpegEncoder.cpp      libjpeg-turbo 把 Bayer 转换后的帧编码成 JPEG
 #   isp/*.cpp            NEON demosaic / 色彩转换
 # 产物名必须是 camera.<ro.hardware>（= camera.tegra.so），camera provider
-# 才会以 passthrough 方式加载它。原 CameraWrapper/Camera3Wrapper 保留在
-# 源码里但不再编译。
+# 才会以 passthrough 方式加载它。原 CameraWrapper/Camera3Wrapper 包装方案
+# 已从源码树删除（见 git 历史），不要再混回来。
 # ============================================================================
 
 include $(CLEAR_VARS)

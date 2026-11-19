@@ -119,7 +119,7 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/camera/model_frontal.xml:system/etc/model_frontal.xml
 
 # 注：相机 wrapper（camera.tegra）为设备树原始方案（CameraWrapper + Camera3Wrapper
-# 包装原厂 blob）。
+# 包装原厂 blob），该方案已随自研 V4L2 HAL3 上线删除源码（见 git 历史）。
 #
 # 修复说明（相机设备数 = 0）：
 #   原厂 blob camera.vendor.tegra.so 在 Android 14 上 dlopen 失败，缺 2 个 DT_NEEDED
