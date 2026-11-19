@@ -40,6 +40,37 @@
 
 using namespace android;
 
+// ---------------------------------------------------------------------------
+// JPEG (BLOB) output buffer layout
+// ---------------------------------------------------------------------------
+// 【2026-11-19 拍照文件被 4MB 零填充】framework 为 BLOB 流分配的缓冲，
+// 其“宽”就等于字节容量、“高”为 1（Camera3Device::getJpegBufferSize()
+// 算容量，Camera3OutputStream::setBufferSizeLocked() 用
+// native_window_set_buffers_dimensions(mMaxSize, 1) 分配）。缓冲回收时
+// Camera3OutputStream::fixUpHidlJpegBlobHeader() 只在【缓冲最后 8 字节】
+// 里找 camera3_jpeg_blob_t 尾标；找不到就报 "jpeg blob id 0 is not correct"
+// 并回退用 ANDROID_JPEG_MAX_SIZE 当图像长度，于是照片被 4MB 零填充。
+// 以前我们把尾标写在 blobW*blobH*2 处（1280x720 只有 1.8MB），位置偏前，
+// 所以永远命中不了。这里按照 framework 的公式复算容量：
+//   capacity(w,h) = scale * (maxSize - kMin) + kMin
+//   scale         = (w * h) / (maxJpegW * maxJpegH)
+// 其中 kMin = 256KiB + sizeof(CameraBlob)，maxJpeg* 是本 HAL 对外声明的
+// 最大 BLOB 分辨率（见 ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS）。
+// 三处数值必须与静态元数据保持一致，否则尾标又会错位。
+static constexpr int32_t kMaxJpegSize = 4149248;
+static constexpr size_t kMinJpegBufferSize = 256 * 1024 + 8;
+static constexpr uint32_t kMaxJpegWidth = 1920;
+static constexpr uint32_t kMaxJpegHeight = 1080;
+
+// 按 framework 的算法复算 BLOB 缓冲容量（字节）。注意必须整体做一次
+// float 求值再截断，不能先截断乘积——否则会和 framework 差几个字节。
+static size_t jpegBufferCapacity(uint32_t width, uint32_t height) {
+    const float scale = static_cast<float>(width * height) /
+                        static_cast<float>(kMaxJpegWidth * kMaxJpegHeight);
+    return static_cast<size_t>(scale * (kMaxJpegSize - kMinJpegBufferSize) +
+                               kMinJpegBufferSize);
+}
+
 // Forward declaration of HAL module info (defined at end of file)
 extern camera_module_t HMI;
 
@@ -459,7 +490,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // JPEG max size (required)
     // 【2026-11-18 对齐 A12】A12 的 jpeg.maxSize 是 4149248（约 1920x1080x2），
     // 我们原来按 8MP 报 16163840，framework 会据此给 BLOB 分配超大缓冲。
-    int32_t jpeg_max_size = 4149248;
+    int32_t jpeg_max_size = kMaxJpegSize;
     add_camera_metadata_entry(metadata, ANDROID_JPEG_MAX_SIZE, &jpeg_max_size, 1);
 
     // Pipeline max depth (required)
@@ -1552,10 +1583,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             } else {
                 int captureRet = pipeline->captureFrame(dev->temp_rgba, HAL_PIXEL_FORMAT_RGBA_8888);
                 if (captureRet == 0) {
-                    /* Lock the output blob buffer using its own dimensions */
+                    /* BLOB 缓冲由 framework 按 (字节容量, 1) 分配，锁的时候必须
+                     * 用同样的尺寸，否则部分 gralloc 会按 1280x720 算出别的 stride。 */
                     uint32_t blobW = buf.stream->width;
                     uint32_t blobH = buf.stream->height;
-                    const android::Rect blobRect((int)blobW, (int)blobH);
+                    const size_t blobCapacity = jpegBufferCapacity(blobW, blobH);
+                    const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
+                    const android::Rect blobRect((int)blobCapacity, 1);
                     int ret = android::GraphicBufferMapper::get().lock(handle,
                                    GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr);
                     if (ret == 0 && vaddr) {
@@ -1565,21 +1599,22 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                         }
                         /* Encode RGBA to JPEG at pipeline resolution into blob buffer */
                         size_t jpegSize = 0;
-                        uint32_t blobSize = blobW * blobH * 2;
                         ret = dev->jpeg_encoder->encodeRGBA(dev->temp_rgba,
                                                               dev->pipeline_width, dev->pipeline_height,
-                                                              90, (uint8_t*)vaddr, blobSize, &jpegSize);
+                                                              90, (uint8_t*)vaddr, payloadCapacity, &jpegSize);
                         if (ret == 0 && jpegSize > 0) {
-                            /* Write camera3_jpeg_blob at the end */
+                            /* 尾标必须写在缓冲最后 8 字节：framework 会从
+                             * getWidth()-sizeof(camera3_jpeg_blob_t) 处读它，
+                             * 再转成 AIDL 的 CameraBlob 头交给 App。 */
                             camera3_jpeg_blob_t blob;
                             blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
-                            blob.jpeg_size = jpegSize;
-                            uint8_t* blobPtr = (uint8_t*)vaddr + blobSize - sizeof(blob);
+                            blob.jpeg_size = (uint32_t)jpegSize;
+                            uint8_t* blobPtr = (uint8_t*)vaddr + payloadCapacity;
                             memcpy(blobPtr, &blob, sizeof(blob));
                             frameCaptured = true;
-                            ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d -> %zu bytes",
+                            ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d capacity=%zu -> %zu bytes",
                                   dev->pipeline_width, dev->pipeline_height,
-                                  blobW, blobH, jpegSize);
+                                  blobW, blobH, blobCapacity, jpegSize);
                         } else {
                             ALOGE("JPEG encode failed: %d", ret);
                         }
