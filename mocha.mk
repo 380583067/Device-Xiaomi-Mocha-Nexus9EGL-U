@@ -207,7 +207,28 @@ PRODUCT_PACKAGES += \
     android.hardware.graphics.composer@2.1-service \
     android.hardware.graphics.mapper@2.0-impl-2.1 \
     android.hardware.renderscript@1.0-impl \
-    gralloc.tegra
+    gralloc.tegra \
+    hwcomposer.tegra \
+    hwcgovernor.tegra
+
+# HWC2 硬件合成器（2026-11-19 引入，替换原厂 HWC1 blob）
+# 来源：github.com/arttttt/android_hardware_nvidia_hwcomposer（Apache-2.0），
+# 源码在 hwc2/ 子目录。这是给 Tegra K1 写的 HWC2 原生实现：
+#   - 直接走 TEGRA_DC_EXT_FLIP4 ioctl（内核 lineageos-21-hwc2 分支已加 FLIP4 入口）
+#   - 把 layer 映射到 display plane 扫描输出，SurfaceFlinger 不再每帧合成
+# 为什么换掉原厂 HWC1 blob：
+#   ① 原厂模块把 acquire fence 从 layer 里取走并清零、回收 layer 时内部关 fence，
+#      HWC2On1Adapter 都不跟踪 → 每个合成帧泄漏几个 fd → 撞上限 → SF 死。
+#      这就是"必须强制 GPU 合成"（init.renderer.sh 的 service call SurfaceFlinger 1008）
+#      才能不进 userspace reboot 循环的原因。
+#   ② 换 HWC2 后 fence 生命周期正确，届时可去掉强制 GPU 合成，
+#      视频流畅度 / 功耗 / 稳定性同时改善。
+# 原厂 blob 保留为 hwcomposer.tegra_legacy.so（vendor 仓库），不会被 HAL loader 加载；
+# 回退方法：TWRP 里把 hwcomposer.tegra 与 hwcomposer.tegra_legacy.so 文件名互换。
+# 注意：hwcomposer.tegra 模块名与 TARGET_LD_SHIM_LIBS 无关——新实现直接链接系统
+# libui，不需要 libshims_ui 的 7 参 GraphicBuffer 桥（那是给 blob 的）。
+# hwcvk.tegra（Vulkan GPU 兜底合成）本机 Vulkan 不可用（NvRm 代际断层，见 MEMORY），
+# 不打包；composer 找不到它会自动降级，无影响。
 
 # Shims
 # 修复说明：新增 libnvomxadaptor_shim，为 NVIDIA 硬件 OMX 解码 adaptor 提供缺失的

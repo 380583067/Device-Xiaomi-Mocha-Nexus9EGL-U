@@ -278,12 +278,24 @@ BOARD_SEPOLICY_DIRS += \
 # libnvomxadaptor.so（NVIDIA 硬件 OMX 解码 adaptor）引用旧 ABI 符号
 # GraphicBuffer(ANativeWindowBuffer*, bool)，Android 10+ 已移除，需预加载 shim
 # 补齐符号，否则媒体硬件解码不可用。
+# HWC2（hwc2/ 子目录，mocha.mk 有完整说明）：
+# VIC 硬件合成引擎禁用 —— mocha 的 libnvddk_vic.so 在 NvDdkVicCreateSession
+# 内部直接 SIGSEGV（NvRm 代际断层，同 Vulkan 不可用的根因），错误码都来不及
+# 返回。TegraDisplayPipeline 对 mVic==null 有完整降级路径（不合并/不捕获/无
+# cursor plane，全部走 window plane 或 client 合成），行为安全。
+TARGET_HWC_NO_VIC := true
+
 TARGET_LD_SHIM_LIBS := \
-    /system/vendor/lib/hw/hwcomposer.tegra.so|libshims_ui.so \
     /system/vendor/lib/libnvcap_video.so|libshims_ui.so \
     /system/vendor/lib/libnvgr.so|libshim_atomic.so \
     /system/vendor/lib/libnvomxadaptor.so|libnvomxadaptor_shim.so \
     /system/vendor/lib/libsensors.lsm6db0.so|libsensors_fastsys_shim.so
+# 修复说明（HWC2，2026-11-19）：hwcomposer.tegra.so 现在是源码 HWC2 实现
+# （hwc2/ 子目录，mocha.mk 有完整说明），直接链接系统 libui，不再需要
+# libshims_ui 的 7 参 GraphicBuffer 桥 —— 该桥只服务于原厂 HWC1 blob。
+# 原厂 blob 改名 hwcomposer.tegra_legacy.so 保留（vendor 仓库）；
+# 若要切回 blob 路线，除了 TWRP 换文件名，还要把下面这行加回来：
+#     /system/vendor/lib/hw/hwcomposer.tegra.so|libshims_ui.so \
 # 修复说明（开机速度，2026-11-16）：新增传感器 HAL blob 的 shim 映射。
 # libsensors.lsm6db0.so 初始化时调 system("rm -rf /sys/bus/iio/devices/...")，
 # 在 Android 14 上一次要 1.5~2 秒（posix_spawn sh + waitpid），而它要删的是
