@@ -39,6 +39,19 @@ persist.tegra.didim.enable=1
 persist.tegra.didim.video=5
 persist.tegra.didim.normal=3
 
+# DNS
+# 【2026-11-19 域名解析偶发卡十几秒】家用路由的 RA 会把链路本地地址
+# fe80::100 当首选 DNS 下发（LinkProperties 里是
+# DnsAddresses=[fe80::100%wlan0, 192.168.2.1]），实测该地址 100% 不可达
+# （IPv6 上游是断的，只有 RA 还在宣告）。netd 的解析器是串行试服务器的，
+# 撞到死地址时每次尝试都要等满 RES_TIMEOUT（5 秒）才轮到下一个，
+# 冷查询因此被拖到 13~20 秒。
+# netd 允许用 device_config 覆盖这个重传间隔（见
+# packages/modules/DnsResolver/res_cache.cpp：base_timeout_msec 为 0 时读
+# netd_native 实验标志），这里把单次等待压到 1 秒。局域网/公网 DNS 正常
+# 都在 200ms 内应答，不影响正常解析，而不可达的服务器最多只耽误 1 秒。
+persist.device_config.netd_native.retransmission_time_interval=1000
+
 # DRM
 drm.service.enabled=true
 
