@@ -8,6 +8,12 @@ the directory matching its repository path, for example:
   frameworks/base/*.patch
   system/core/*.patch
 
+File names follow `NNNN-<short-slug>.patch`, where NNNN is the position of the
+patch inside its project directory and the slug summarises the change (it is
+the same wording used in the commit subject of the upstream project). Scripts
+glob for `*.patch` and sort by path, so the numeric prefix alone decides the
+apply order inside a project.
+
 Run these scripts from any directory; they locate the source root relative to
 their own location:
 
@@ -32,18 +38,24 @@ Removed entries and why
 -----------------------
 
 Patches whose target change is already present upstream were dropped, because
-they blocked a forward application of the series while contributing nothing:
+they blocked a forward application of the series while contributing nothing.
+None of the files below exist in this directory any more; the names are kept
+only so that an older build log can still be matched:
 
-* frameworks/av/0032...patch.disabled targeted bqhelper files that no longer
-  exist in this LineageOS 21 checkout.
+* frameworks/av/0032-omx-bqhelper...patch.disabled targeted bqhelper files that
+  no longer exist in this LineageOS 21 checkout.
 * frameworks/av/0034...patch was a 2017 Qualcomm patch for
   OMXNodeInstance::freeNode and was never applied by install.sh.
 * hardware/lineage/interfaces/0001, 0003, 0004 were already fully present in
   the checked-out LineageOS 21 source; verified line by line against HEAD.
 * hardware/lineage/interfaces/0002...patch.disabled was superseded by the same
   upstream changes.
-* packages/modules/adb/0001...patch.disabled is superseded by the legacy
-  FunctionFS implementation already present in the checked-out source.
+* packages/modules/adb/0001-hidl-transport...patch.disabled (the earlier HIDL
+  rewrite attempt) is superseded by the legacy FunctionFS implementation
+  already present in the checked-out source. The currently applied adb fix is
+  `0001-adb-fix-legacy-functionfs-offline-transport-detached.patch`, which is
+  a different change: it stops the legacy transport from reporting the USB
+  endpoint as detached while the host is still probing it.
 
 
 Note on frameworks/av/0041
