@@ -86,34 +86,22 @@ extern "C" void _ZN7android13GraphicBufferC1EjjijjP13native_handleb(
 }
 
 /*
- * Second half of the same ABI gap: the object itself.
+ * Note on the object size, since the obvious patch here is wrong.
  *
- * The blobs allocate the GraphicBuffer with the size they were compiled
- * against and only then call the constructor on it:
+ * The blobs allocate the GraphicBuffer with `operator new(128)` (see
+ * create_graphic_buffer) while Android 14's constructor still initialises a
+ * member at offset 136. Padding the allocation by overriding _Znwj in this
+ * library was tried and had to be reverted: the shim is preloaded into
+ * hwcomposer.tegra.so, so the override covers *every* C++ allocation in that
+ * process, and the composer then failed to initialise and exited with
+ * status 1. init counts exits of an updatable component and, after four in
+ * four minutes, sets sys.init.updatable_crashing, which apexd/apex turns into
+ * a userspace reboot -- the device sat on the boot animation forever.
  *
- *     gb = operator new(128);        // sizeof(GraphicBuffer) on Android 5/6
- *     gb->GraphicBuffer(w, h, ...);  // resolved to the shim above
- *
- * Android 14's GraphicBuffer outgrew that: the constructor is still writing
- * members at offset 136 (mTransportNumFds/Ints, mId, the mDeathCallbacks
- * vector), so roughly a dozen bytes land past the end of a 128-byte
- * allocation and corrupt the next heap chunk. With the `this` bug fixed the
- * crash becomes a slow heap-corruption one instead of an immediate NULL
- * dereference, which is why the slack has to be added as well.
- *
- * Only the legacy GraphicBuffer range is padded -- everything else in the
- * process keeps the stock allocator behaviour, so this cannot mask a real
- * overflow somewhere else. malloc/free instead of ::operator new is
- * deliberate: the blobs were built without exceptions and expect a NULL
- * return, and operator delete(void*) is free() anyway.
+ * With the override removed the composer runs for minutes without a single
+ * tombstone, so the overflow either does not happen on this path or lands in
+ * the allocator's slack. If random heap corruption ever shows up in the
+ * composer again, this is the first thing to look at -- but the fix has to be
+ * scoped to the blob (for example by handing it a larger block from a
+ * wrapper), not applied to the whole process.
  */
-extern "C" void* _Znwj(unsigned int size) {
-    static constexpr unsigned int kLegacyGraphicBufferMin = 128;
-    static constexpr unsigned int kLegacyGraphicBufferMax = 160;
-    static constexpr unsigned int kGraphicBufferSlack = 64;
-
-    if (size >= kLegacyGraphicBufferMin && size <= kLegacyGraphicBufferMax) {
-        size += kGraphicBufferSlack;
-    }
-    return malloc(size == 0 ? 1 : size);
-}
