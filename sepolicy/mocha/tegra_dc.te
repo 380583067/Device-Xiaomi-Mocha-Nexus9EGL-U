@@ -1,0 +1,21 @@
+# Tegra display controller nodes (/dev/tegra_dc_0..N, /dev/tegra_dc_ctrl).
+#
+# The HWC2 composer drives the display controller directly through these:
+# it opens the head for the per-frame FLIP4 commit and a second node
+# (/dev/tegra_dc_ctrl) for the blank-event stream its vsync worker reads.
+# Under the generic device label those ioctls are refused, and it only
+# looks harmless because this build runs permissive -- the denials are in
+# the log on every frame (ioctlcmd 441d is FLIP4, 4415 the vblank
+# subscription). The label and the rules below are what lets the
+# composer run with SELinux enforcing.
+#
+# The stock HWC1 blob, kept for the fallback path, drives the same nodes
+# and needs the same access. hal_graphics_composer is the attribute both
+# the server and client domains belong to, and the pattern AOSP itself
+# uses for this HAL's gpu_device and fb0 rules.
+
+type tegra_dc_device, dev_type;
+
+allow hal_graphics_composer tegra_dc_device:chr_file {
+    open read write ioctl getattr map
+};

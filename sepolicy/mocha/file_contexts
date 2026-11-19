@@ -1,0 +1,4 @@
+# Tegra display controller: one node per head plus the event/control node.
+# See tegra_dc.te for why they are not left on the generic device label.
+/dev/tegra_dc_ctrl        u:object_r:tegra_dc_device:s0
+/dev/tegra_dc_[0-9]+      u:object_r:tegra_dc_device:s0
