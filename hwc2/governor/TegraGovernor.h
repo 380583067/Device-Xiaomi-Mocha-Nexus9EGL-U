@@ -1,0 +1,168 @@
+/*
+ * Copyright (C) 2026 Artem Bambalov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+#include <atomic>
+#include <thread>
+#include <vector>
+
+#include "governor/CpuFloor.h"
+#include "governor/EngineClock.h"
+#include "governor/FenceWatch.h"
+#include "governor/FloorLane.h"
+#include "governor/GpuClock.h"
+#include "governor/HwcGovernor.h"
+#include "governor/Mailbox.h"
+#include "governor/MergePlan.h"
+#include "governor/PerfProfile.h"
+#include "governor/Tuning.h"
+
+/* The composition load governor for Tegra K1: hwcgovernor.tegra.so.
+ *
+ * What it decides, once per planned merge: whether to wake a powered-down
+ * engine ahead of the merge, what clock floor to ask of the engine for the
+ * merge's duration -- how much of it before the composer's submit and how
+ * much after -- and whether to lift the processor's floor for the few
+ * milliseconds until the submit. The kernel does the rest -- the memory
+ * clock follows the engine's floor, and the display's isochronous share
+ * follows the engine being on.
+ *
+ * The same, once per drawing of the composer's own GPU: what floor to ask
+ * of the GPU for it, against the latch of the frame it belongs to, no
+ * higher than the owner's cap. How a floor is held is the same for both
+ * engines (FloorLane); what is asked is each one's own.
+ *
+ * The parts: the model (MergePlan) turns a snapshot into a step; the engine
+ * clock (EngineClock) and the processor floor (CpuFloor) are the two doors
+ * into the kernel; the profile (PerfProfile) says whether the device is
+ * saving power; the tuning (Tuning) holds the numbers; the mailbox
+ * (Mailbox) is where the composer's threads leave their news, and the
+ * engine's lane (FloorLane) holds its floor while merges are in flight and
+ * lets it go after. This class is the thread that joins them.
+ *
+ * Everything that may sleep -- the clock request, the warm-up pass, the
+ * processor floor -- runs on this thread. The thread waits in one place,
+ * poll(), on the mailbox's descriptor and on the fences, so a merge
+ * finishing and a frame being planned are the same kind of wake-up.
+ *
+ * The processor's lift comes last, after the warm-up and the floor: put
+ * first it ran the processor's whole scaling step -- three milliseconds
+ * when the memory clock had to follow -- ahead of both. In the transition
+ * runs it found the processor already at its top and changed nothing;
+ * it is kept, by the owner's decision, for the scenes where the processor
+ * idles low when a merge comes.
+ */
+
+namespace android::hwc::governor::tegra {
+
+class TegraGovernor final : public Governor {
+ public:
+  explicit TegraGovernor(GovernorHost &host);
+  ~TegraGovernor() override;
+
+  TegraGovernor(const TegraGovernor &) = delete;
+  TegraGovernor &operator=(const TegraGovernor &) = delete;
+
+  /* Reads the tuning, opens the kernel's doors and starts the thread.
+   * False only if the thread would have nothing to wait on. */
+  bool Start();
+
+  /* Governor: the composer's side. Each leaves its news in the mailbox
+   * and returns. */
+  void FramePlanned(const Frame &frame) override;
+  void MergeSubmitted(uint64_t seq, int merge_fence_fd) override;
+  void GpuPlanned(uint64_t seq, uint32_t pixels) override;
+  void GpuSubmitted(uint64_t seq, int gpu_fence_fd) override;
+  void FramePresented(uint64_t seq) override;
+  void PowerMode(Power mode) override;
+
+ private:
+  void ThreadFn();
+  int TimeoutMs(int64_t now) const;
+  /* `merge_reported` says the composer had already sent this frame's
+   * merge to the engine when the plan was taken out of the mailbox: too
+   * late to wake the engine, not too late for the floor -- and nobody is
+   * waiting behind its ramp any more. */
+  void Decide(const Planned &planned, int64_t now, bool merge_reported);
+  /* The GPU's floor for the composer's drawing, against the latch of the
+   * frame it belongs to. */
+  void DecideGpu(const GpuPlan &plan, int64_t now);
+  void Trace(const MergeEstimate &estimate, bool cold, int profile,
+             int64_t lag_ns, int64_t now_ns);
+  void Warm(int64_t now);
+  void WarmAhead(const Frame &frame, int64_t now, int64_t gap_ns);
+  void DropCpu();
+  void DropEverything();
+  /* A merge reported: if it is the last plan's, the path from its
+   * validate to the report, in the processor's cycles of the time, is a
+   * measure of the submit's delay. */
+  void NoteSubmit(uint64_t seq, int64_t reported_ns);
+  /* The measured path read at the processor's present clock, in
+   * nanoseconds; nought without a measure or a clock. */
+  int64_t MeasuredSubmitNs(uint32_t cpu_khz) const;
+  void NoteColdSubmit(int64_t sample_ns);
+  int64_t MeasuredColdExtraNs(uint32_t path_khz) const;
+
+  GovernorHost &host_;
+  Tuning tuning_;
+
+  /* Set by the thread on its way out after a failure: from then on plans
+   * are ignored and fences are closed on arrival, since nobody would
+   * take them out of the mailbox. */
+  std::atomic<bool> dead_{false};
+
+  Mailbox mailbox_;
+  EngineClock engine_;
+  FloorLane vic_{engine_, tuning_, host_, "hwc_gov_deferred_mhz"};
+  GpuClock gpu_clock_;
+  FloorLane gpu_{gpu_clock_, tuning_, host_, "hwc_gov_gpu_owed_mhz"};
+  CpuFloor cpu_;
+  PerfProfile profile_;
+
+  std::thread thread_;
+
+  /* Thread-only state from here down. */
+  int64_t cpu_until_ns_ = 0;    /* processor lifted until, nought if not */
+  int64_t last_warm_ns_ = 0;
+  bool warm_refused_logged_ = false;
+  /* The previous frame's validate, merge or not; nought before the first. */
+  int64_t last_plan_ns_ = 0;
+  /* The last frame planned, members aside: the latch its GPU drawing is
+   * aimed at. */
+  Frame last_frame_ = {};
+
+  /* The last plan with a merge: which frame, when it was validated, the
+   * processor's clock then, and whether the engine was cold -- so that the
+   * merge's report can be timed against it. The validate time is cleared
+   * once used. */
+  uint64_t planned_seq_ = 0;
+  int64_t planned_validate_ns_ = 0;
+  /* The clock the plan read the submit at: the present one, or the
+   * lift's when the processor was lifted for it. */
+  uint32_t planned_cpu_khz_ = 0;
+  bool planned_cold_ = false;
+  /* The measured path from validate to the submit's report, in processor
+   * cycles, a running mean; nought until measured. */
+  int64_t submit_cycles_ = 0;
+  /* What a cold engine adds to that path, in the same cycles at the
+   * clock the plan read it at, a running mean; nought until measured. */
+  int64_t cold_extra_cycles_ = 0;
+};
+
+}  // namespace android::hwc::governor::tegra

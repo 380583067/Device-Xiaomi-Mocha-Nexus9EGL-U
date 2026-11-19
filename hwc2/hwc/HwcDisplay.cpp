@@ -1,0 +1,2931 @@
+/*
+ * Copyright (C) 2022 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
+
+#include "HwcDisplay.h"
+
+#include <cutils/trace.h>
+#include <hardware/gralloc.h>
+#include <drm/drm_mode.h>
+#include <linux/time.h>
+#include <ui/GraphicTypes.h>
+#include <utils/Trace.h>
+#include <xf86drmMode.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "backend/BackendDisplayCapabilities.h"
+#include "backend/BackendManager.h"
+#include "bufferinfo/BufferInfo.h"
+#include "bufferinfo/BufferInfoGetter.h"
+#include "bufferinfo/NvGralloc.h"
+#include "compositor/CompositionPlanner.h"
+#include "compositor/DisplayInfo.h"
+#include "compositor/FlatteningController.h"
+#include "compositor/HdcpController.h"
+#include "compositor/LayerData.h"
+#include "compositor/LayerToPlaneJoiningPlan.h"
+#include "compositor/PlanInvalidation.h"
+#include "display/AtomicCommitSink.h"
+#include "display/AtomicStateManager.h"
+#include "display/CommitStatus.h"
+#include "display/Connector.h"
+#include "display/Crtc.h"
+#include "display/Device.h"
+#include "display/DisplayPipeline.h"
+#include "display/FbImporter.h"
+#include "display/Plane.h"
+#include "display/VSyncWorker.h"
+#include "hwc/Hwc.h"
+#include "hwc/HwcDisplayConfigs.h"
+#include "hwc/HwcLayer.h"
+#include "stats/DisplayConfigurationResultReporter.h"
+#include "tegra/GpuExecutor.h"
+#include "tegra/MergeDescription.h"
+#include "tegra/PictureCapture.h"
+#include "stats/DisplayHotplugConnectModeDetectedAtomReporter.h"
+#include "stats/Stats.h"
+#include "utils/ColorUtil.h"
+#include "utils/EdidWrapper.h"
+#include "utils/Time.h"
+#include "utils/Tracing.h"
+#include "utils/SysfsBacklightController.h"
+#include "utils/fd.h"
+#include "utils/Logging.h"
+#include "utils/log.h"
+#include "utils/properties.h"
+
+namespace android::drm_hwcomposer {
+
+using FlattenReason = CompositionPlanner::FlattenReason;
+
+namespace {
+
+// NOLINTBEGIN(misc-include-cleaner)
+constexpr auto kFlatteningTimeout = 1s;
+constexpr auto kHdcpRetryTimeout = 30s;
+// NOLINTEND(misc-include-cleaner)
+
+bool float_equals(float a, float b) {
+  const float epsilon = 0.001F;
+  return std::abs(a - b) < epsilon;
+}
+
+bool TransformHasOffsetValue(const float *matrix) {
+  /* All three of the offset column: stopping at 13 let a blue-only offset
+   * through as though the matrix had none. */
+  for (int i = 12; i < 15; i++) {
+    if (!float_equals(matrix[i], 0.F)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TransformHasNegativeValue(const float *matrix) {
+  /* Only the 3x3 the hardware would be given: column-major, so rows 0-2 of
+   * columns 0-2. The offset column is judged separately and the projective
+   * row is never sent anywhere. */
+  for (int c = 0; c < 3; c++) {
+    for (int r = 0; r < 3; r++) {
+      if (matrix[c * 4 + r] < 0.F && !float_equals(matrix[c * 4 + r], 0.F)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Client target buffer may be updated since the composition was validated,
+// so get the latest LayerData.
+void UpdateClientTargetIfNeeded(const HwcLayer &client_layer,
+                                LayerToPlaneJoiningPlan *composition_plan) {
+  if (!composition_plan)
+    return;
+  const auto client_at = composition_plan->client_index;
+  if (client_at && *client_at >= 0 &&
+      static_cast<size_t>(*client_at) < composition_plan->plan.size())
+    composition_plan->plan[*client_at].layer = client_layer.GetLayerData();
+}
+
+}  // namespace
+
+namespace {
+
+/* The formats the GPU executor reads, by gralloc's own number; its bytes a
+ * pixel, or 0 for one it does not read. */
+uint32_t GpuReadableBytes(int hal_format) {
+  switch (hal_format) {
+    case HAL_PIXEL_FORMAT_RGBA_8888:
+    case HAL_PIXEL_FORMAT_RGBX_8888:
+    case HAL_PIXEL_FORMAT_BGRA_8888:
+      return 4;
+    case HAL_PIXEL_FORMAT_RGB_565:
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+/* The height to tell the executor's driver for a buffer, and where in the
+ * handle the allocator keeps the height it would otherwise read.
+ *
+ * The driver lays an imported buffer out by its own rule from that height
+ * and does not read the allocator's block height (libglcore FUN_006736aa,
+ * task-500): for most heights its rule picks smaller blocks than the
+ * allocator did, and the layer comes out in columns of misplaced rows --
+ * the taskbar at 145 rows, the status bar at 43. Rounded up to the
+ * allocator's block, the height is one the rule maps to the allocator's
+ * own arrangement for every height, and it is memory the buffer has. */
+void ImportHeight(buffer_handle_t handle, uint32_t height, uint32_t *out,
+                  int32_t *word) {
+  *out = height;
+  *word = -1;
+  NvGralloc::Surface surface{};
+  const void *raw = nullptr;
+  size_t count = 0;
+  auto *gralloc = NvGralloc::GetInstance();
+  if (gralloc == nullptr || !gralloc->DescribeSurface(handle, &surface) ||
+      surface.layout != NvGralloc::kLayoutBlocklinear ||
+      !gralloc->GetRawSurfaces(handle, &raw, &count))
+    return;
+  const uint32_t rows = 8u << surface.block_height_log2;
+  const uint32_t padded = (height + rows - 1) / rows * rows;
+  if (padded == height)
+    return;
+  /* The descriptor's height, as an index into the handle's data -- only
+   * if the descriptor lives there and says what the buffer says. */
+  const auto *words = reinterpret_cast<const int *>(raw);
+  const ptrdiff_t at = words + 1 - handle->data;
+  if (at < handle->numFds || at >= handle->numFds + handle->numInts ||
+      static_cast<uint32_t>(handle->data[at]) != height)
+    return;
+  *out = padded;
+  *word = static_cast<int32_t>(at);
+}
+
+/* A layer as the GPU executor takes it: placement, crop, turn, blending,
+ * the buffer or the solid colour, and the rounded corners. */
+hwc::vk::Layer ToVkLayer(const LayerData &ld, std::pair<uint32_t, uint32_t> size) {
+  hwc::vk::Layer l;
+  const auto &df = ld.pi.display_frame.i_rect;
+  l.dst_left = df ? df->left : 0;
+  l.dst_top = df ? df->top : 0;
+  l.dst_right = df ? df->right : static_cast<int32_t>(size.first);
+  l.dst_bottom = df ? df->bottom : static_cast<int32_t>(size.second);
+  l.alpha = ld.pi.alpha;
+  l.transform = (ld.pi.transform.hflip ? 1 : 0) | (ld.pi.transform.vflip ? 2 : 0) |
+                (ld.pi.transform.rotate90 ? 4 : 0);
+  if (ld.bi) {
+    const auto handle = static_cast<buffer_handle_t>(ld.bi->handle);
+    l.buffer = handle;
+    l.width = ld.bi->width;
+    ImportHeight(handle, ld.bi->height, &l.height, &l.height_word);
+    l.format = NvGralloc::GetInstance()->GetHalFormat(handle);
+    const uint32_t bytes = GpuReadableBytes(l.format);
+    l.stride = bytes != 0 ? ld.bi->pitches[0] / bytes : ld.bi->width;
+    /* A client layer's usage; the driver reads the layout from the
+     * handle itself. */
+    l.usage = GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER |
+              GRALLOC_USAGE_HW_COMPOSER;
+    l.owner = ld.serial;
+    l.acquire_fence = ld.acquire_fence ? *ld.acquire_fence : -1;
+    const auto &sc = ld.pi.source_crop.f_rect;
+    l.src_left = sc ? sc->left : 0.F;
+    l.src_top = sc ? sc->top : 0.F;
+    l.src_right = sc ? sc->right : static_cast<float>(ld.bi->width);
+    l.src_bottom = sc ? sc->bottom : static_cast<float>(ld.bi->height);
+    l.premultiplied = ld.bi->blend_mode != BufferBlendMode::kCoverage;
+    l.opaque = ld.bi->blend_mode == BufferBlendMode::kNone;
+  } else if (ld.solid_color) {
+    std::copy(ld.solid_color->begin(), ld.solid_color->end(), l.color);
+  }
+  if (ld.effects.HasTurn()) {
+    /* Drawn whole where its corners are told, from its own crop rather
+     * than the source crop, which is cut to the box around it; rounded
+     * corners, given as a rectangle of the screen, would not turn with it
+     * and are left. */
+    const auto &t = ld.effects.turned;
+    l.turned = true;
+    l.src_left = t[0];
+    l.src_top = t[1];
+    l.src_right = t[2];
+    l.src_bottom = t[3];
+    std::copy(t.begin() + 4, t.end(), l.turned_corners);
+  } else if (ld.effects.HasCorners()) {
+    l.corner_left = ld.effects.corners[0];
+    l.corner_top = ld.effects.corners[1];
+    l.corner_right = ld.effects.corners[2];
+    l.corner_bottom = ld.effects.corners[3];
+    l.corner_radius = ld.effects.corners[4];
+  }
+  return l;
+}
+
+/* A layer of the client range as the memory of drawn pictures takes it:
+ * whose pixels and which frame of them, and everything the executor was
+ * told about how to draw it. */
+PictureMemory::Member GpuMember(const LayerData &ld, const hwc::vk::Layer &l) {
+  PictureMemory::Member m;
+  m.source = ld.bi ? ld.bi->unique_id : 0;
+  m.generation = ld.generation;
+  m.serial = ld.serial;
+  m.solid = !ld.bi;
+  std::copy(std::begin(l.color), std::end(l.color), m.color.begin());
+  m.src = {l.src_left, l.src_top, l.src_right, l.src_bottom};
+  m.dst = {l.dst_left, l.dst_top, l.dst_right, l.dst_bottom};
+  m.alpha = l.alpha;
+  m.premultiplied = l.premultiplied;
+  m.opaque = l.opaque;
+  m.transform = l.transform;
+  m.corners = {l.corner_left, l.corner_top, l.corner_right, l.corner_bottom,
+               l.corner_radius};
+  if (l.turned)
+    std::copy(std::begin(l.turned_corners), std::end(l.turned_corners), m.turned.begin());
+  return m;
+}
+
+/* Every layer of the frame, bottom first, as the executor would take it:
+ * what the plan made of it, what the client asked for, and the geometry,
+ * blending and corners that went to the GPU. Which of them the GPU drew is
+ * the "client" in the first column. */
+/* A layer's damage in words: whole, nothing, or its rectangles. */
+std::string DamageWords(const DamageInfo &damage) {
+  if (damage.dmg_rects.empty())
+    return "whole";
+  std::string out;
+  for (const IRect &r : damage.dmg_rects) {
+    char one[48];
+    snprintf(one, sizeof(one), "%s%d,%d-%d,%d", out.empty() ? "" : " ",
+             r.left, r.top, r.right, r.bottom);
+    out += one;
+  }
+  return out == "0,0-0,0" ? "nothing" : out;
+}
+
+std::string DescribeLayers(
+    const CompositionPlanner::ValidatedComposition &composition,
+    std::pair<uint32_t, uint32_t> size) {
+  constexpr const char *kTypes[] = {"invalid", "client", "device",
+                                    "solid",   "cursor", "occluded"};
+  auto name = [&](CompositionType t) {
+    const auto i = static_cast<size_t>(t);
+    return i < std::size(kTypes) ? kTypes[i] : "?";
+  };
+  std::vector<std::pair<const HwcLayer *, CompositionType>> layers(
+      composition.composition_types.begin(),
+      composition.composition_types.end());
+  std::sort(layers.begin(), layers.end(), [](const auto &a, const auto &b) {
+    return a.first->GetZOrder() < b.first->GetZOrder();
+  });
+  std::string out;
+  for (const auto &[layer, type] : layers) {
+    const LayerData &ld = layer->GetLayerData();
+    const hwc::vk::Layer l = ToVkLayer(ld, size);
+    char line[384];
+    snprintf(line, sizeof(line),
+             "z %u %s (asked %s) id %" PRIu64 " buf %p %ux%u stride %u fmt %d "
+             "src %.1f,%.1f-%.1f,%.1f -> %d,%d-%d,%d alpha %.3f turn %u %s%s "
+             "corners %.0f,%.0f-%.0f,%.0f r %.1f fence %d\n",
+             layer->GetZOrder(), name(type), name(layer->GetSfType()),
+             ld.bi ? ld.bi->unique_id : 0,
+             static_cast<const void *>(l.buffer), l.width, l.height,
+             l.stride, l.format, l.src_left, l.src_top, l.src_right,
+             l.src_bottom, l.dst_left, l.dst_top, l.dst_right, l.dst_bottom,
+             l.alpha, l.transform, l.premultiplied ? "premult" : "coverage",
+             l.opaque ? " opaque" : "", l.corner_left, l.corner_top,
+             l.corner_right, l.corner_bottom, l.corner_radius,
+             l.acquire_fence);
+    out += line;
+    if (l.turned) {
+      snprintf(line, sizeof(line), "    turned %.1f,%.1f %.1f,%.1f %.1f,%.1f\n",
+               l.turned_corners[0], l.turned_corners[1], l.turned_corners[2],
+               l.turned_corners[3], l.turned_corners[4], l.turned_corners[5]);
+      out += line;
+    }
+    out += "    gen " + std::to_string(ld.generation) + " damage " +
+           DamageWords(ld.pi.damage) + "\n";
+  }
+  return out;
+}
+
+}  // namespace
+
+bool HwcDisplay::GpuCanDrawClient(
+    const CompositionPlanner::ValidatedComposition &composition) const {
+  /* A colour transform or layers in different colourspaces need colour
+   * work the executor does not do yet: those stay the client's. */
+  if (composition.flatten_reason == FlattenReason::kCtmWithOffset ||
+      composition.flatten_reason ==
+          FlattenReason::kNoPerPlaneColorspaceSupport)
+    return false;
+
+  bool any = false;
+  for (const auto &[layer, type] : composition.composition_types) {
+    if (type != CompositionType::kClient)
+      continue;
+    any = true;
+    const LayerData &ld = layer->GetLayerData();
+    if (!ld.bi) {
+      if (!ld.solid_color)
+        return false;
+      continue;
+    }
+    if (GpuReadableBytes(NvGralloc::GetInstance()->GetHalFormat(
+            static_cast<buffer_handle_t>(ld.bi->handle))) == 0)
+      return false;
+  }
+  return any;
+}
+
+void HwcDisplay::SeatGpuBuffer(buffer_handle_t buffer, SharedFd fence,
+                               const IRect &bounds) {
+  auto bo = BufferInfoGetter::GetInstance()->GetBoInfo(buffer);
+  if (!bo)
+    return;
+  HwcLayer::LayerProperties lp;
+  lp.buffer = HwcLayer::Buffer{
+      .bi = bo.value(),
+      .fb = GetPipe().importer->GetOrCreateFbId(&bo.value()),
+      .fence = std::move(fence),
+  };
+  /* The part the picture covers, or the whole buffer when nothing says;
+   * the rest of the buffer holds whatever an older picture left there,
+   * transparent where it lay on the screen, and is not shown. */
+  const auto size = GetSize();
+  IRect r{0, 0, static_cast<int32_t>(size.first), static_cast<int32_t>(size.second)};
+  if (bounds.right > bounds.left && bounds.bottom > bounds.top)
+    r = bounds;
+  lp.display_frame = DstRectInfo{r};
+  lp.source_crop = SrcRectInfo{FRect{static_cast<float>(r.left), static_cast<float>(r.top),
+                                     static_cast<float>(r.right), static_cast<float>(r.bottom)}};
+  client_layer_.SetLayerProperties(lp);
+}
+
+void HwcDisplay::BeginClientOnGpu(
+    const CompositionPlanner::ValidatedComposition &composition) {
+  auto *gpu = GetPipe().GetGpuExecutor();
+  if (gpu == nullptr)
+    return;
+
+  /* The client range, bottom first, as the client would have drawn it. */
+  std::vector<const HwcLayer *> range;
+  for (const auto &[layer, type] : composition.composition_types)
+    if (type == CompositionType::kClient)
+      range.push_back(layer);
+  std::sort(range.begin(), range.end(), [](const HwcLayer *a, const HwcLayer *b) {
+    return a->GetZOrder() < b->GetZOrder();
+  });
+
+  const auto size = GetSize();
+  std::vector<hwc::vk::Layer> layers;
+  std::vector<PictureMemory::Member> members;
+  layers.reserve(range.size());
+  members.reserve(range.size());
+  IRect bounds{};
+  for (const HwcLayer *layer : range) {
+    const LayerData &ld = layer->GetLayerData();
+    layers.push_back(ToVkLayer(ld, size));
+    members.push_back(GpuMember(ld, layers.back()));
+    gpu_slots_.Record(members.back(), ld.pi.damage.dmg_rects);
+    const auto &l = layers.back();
+    if (l.dst_right <= l.dst_left || l.dst_bottom <= l.dst_top)
+      continue;
+    bounds = bounds.right > bounds.left
+                 ? IRect{std::min(bounds.left, l.dst_left), std::min(bounds.top, l.dst_top),
+                         std::max(bounds.right, l.dst_right),
+                         std::max(bounds.bottom, l.dst_bottom)}
+                 : IRect{l.dst_left, l.dst_top, l.dst_right, l.dst_bottom};
+  }
+  gpu_next_bounds_ = {std::max(bounds.left, 0), std::max(bounds.top, 0),
+                      std::min(bounds.right, static_cast<int32_t>(size.first)),
+                      std::min(bounds.bottom, static_cast<int32_t>(size.second))};
+  gpu_keep_ = false;
+
+  /* The picture the executor last drew, wanted again: nothing is drawn,
+   * and its buffer goes up once more. */
+  if (gpu_memory_.Judge(size.first, size.second, members) ==
+      PictureMemory::Verdict::kSame) {
+    gpu_reuse_ = true;
+    return;
+  }
+  /* What of the next buffer to draw: it holds what it was last drawn
+   * with -- unless a drawing into it was begun and never finished, which
+   * the Begin below drops having written who knows how much. */
+  if (gpu->Pending())
+    gpu_slots_.Lost(gpu->NextSlot());
+  gpu_plan_ = partial::Plan{};
+  if (Properties::PartialRedraw())
+    gpu_plan_ = gpu_slots_.Decide(gpu->NextSlot(), size.first, size.second,
+                                  members);
+  gpu_pending_ = std::move(members);
+  if (gpu_plan_.kind == partial::Plan::Kind::kUnchanged) {
+    gpu_keep_ = true;
+    return;
+  }
+
+  /* What the drawing was begun with, kept only while a capture asks:
+   * the words written at present describe the layers as they are then. */
+  if (hwc::PictureCapture::Wanted(hwc::PictureCapture::Source::kGpu)) {
+    begun_words_.clear();
+    for (const auto &l : layers) {
+      char line[160];
+      snprintf(line, sizeof(line),
+               "begun: -> %d,%d-%d,%d corners %.0f,%.0f-%.0f,%.0f r %.1f\n",
+               l.dst_left, l.dst_top, l.dst_right, l.dst_bottom, l.corner_left,
+               l.corner_top, l.corner_right, l.corner_bottom, l.corner_radius);
+      begun_words_ += line;
+    }
+  }
+  static_assert(partial::kMostParts <= hwc::vk::Target::kMaxParts,
+                "the executor takes every part the redraw decides on");
+  /* What of the buffer to draw: the parts the redraw decided on -- where
+   * the members changed, or where they are and were -- and, for a buffer
+   * nothing is known of, still only the range's own part: the executor
+   * draws a buffer it has drawn before only inside what it is given, and
+   * one it has not drawn whole, as before. */
+  const bool bounded = gpu_next_bounds_.right > gpu_next_bounds_.left &&
+                       gpu_next_bounds_.bottom > gpu_next_bounds_.top;
+  const IRect *parts = !gpu_plan_.parts.empty() ? gpu_plan_.parts.data()
+                       : bounded               ? &gpu_next_bounds_
+                                               : nullptr;
+  const size_t count = !gpu_plan_.parts.empty() ? gpu_plan_.parts.size()
+                       : bounded                ? 1
+                                                : 0;
+  /* The GPU's clock is asked for before the drawing reaches its thread,
+   * which starts on it at once. */
+  uint64_t pixels = 0;
+  for (size_t k = 0; k < count; ++k)
+    pixels += static_cast<uint64_t>(parts[k].right - parts[k].left) *
+              static_cast<uint64_t>(parts[k].bottom - parts[k].top);
+  if (count == 0)
+    pixels = static_cast<uint64_t>(size.first) * size.second;
+  GetPipe().atomic_state_manager->GpuPlanned(static_cast<uint32_t>(pixels));
+  /* Droppable once there is a picture to show instead: the GPU still busy
+   * with the drawing before when this frame goes up, the executor shows
+   * that one again rather than queue this behind it. */
+  gpu_begun_ = gpu->Begin(layers, parts, count,
+                          static_cast<bool>(gpu_drawn_fence_));
+}
+
+bool HwcDisplay::DrawClientOnGpu(
+    const CompositionPlanner::ValidatedComposition &composition) {
+  auto *gpu = GetPipe().GetGpuExecutor();
+  if (gpu == nullptr)
+    return false;
+
+  /* Begun at validate, so the drawing ran while the client went from
+   * validate to present; begun here only for a frame that skipped it. */
+  const bool begun_at_validate = gpu_begun_ || gpu_reuse_ || gpu_keep_;
+  if (!gpu_begun_ && !gpu_reuse_ && !gpu_keep_)
+    BeginClientOnGpu(composition);
+  gpu_begun_ = false;
+
+  using hwc::PictureCapture;
+  if (gpu_reuse_) {
+    gpu_reuse_ = false;
+    if (PictureCapture::Wanted(PictureCapture::Source::kGpu)) {
+      char head[96];
+      snprintf(head, sizeof(head), "reused (judged at %s); panel buffer %p\n",
+               begun_at_validate ? "validate" : "present",
+               static_cast<const void *>(gpu->Current()));
+      PictureCapture::WriteText(PictureCapture::Source::kGpu,
+                                head + DescribeLayers(composition, GetSize()));
+    }
+    last_gpu_use_ns_ = GetTimeMonotonicNs();
+    gpu_shown_bounds_ = gpu_next_bounds_;
+    SeatGpuBuffer(gpu->Current(), gpu_drawn_fence_, gpu_shown_bounds_);
+    return true;
+  }
+
+  /* The buffer this frame goes into, named before the executor moves on
+   * to it. */
+  const void *slot = gpu->NextSlot();
+  const bool keep = gpu_keep_;
+  gpu_keep_ = false;
+  bool dropped = false;
+  auto drawn = keep ? std::optional<hwc::GpuExecutor::Drawn>(
+                          gpu->Keep(gpu_slots_.Fence(slot)))
+                    : gpu->Finish(&dropped);
+  if (PictureCapture::Wanted(PictureCapture::Source::kGpu)) {
+    char how[64] = "";
+    if (keep)
+      snprintf(how, sizeof(how), ", buffer already held it");
+    else if (gpu_plan_.kind == partial::Plan::Kind::kPartial)
+      snprintf(how, sizeof(how), ", in %zu part(s) within %d,%d-%d,%d",
+               gpu_plan_.parts.size(), partial::Bounds(gpu_plan_.parts).left,
+               partial::Bounds(gpu_plan_.parts).top,
+               partial::Bounds(gpu_plan_.parts).right,
+               partial::Bounds(gpu_plan_.parts).bottom);
+    char head[160];
+    snprintf(head, sizeof(head), "%s%s (begun at %s); panel buffer %p\n",
+             drawn ? "drawn" : "REFUSED, last picture stays", how,
+             begun_at_validate ? "validate" : "present",
+             static_cast<const void *>(drawn ? drawn->buffer
+                                             : gpu->Current()));
+    const std::string words =
+        head + DescribeLayers(composition, GetSize()) + begun_words_;
+    /* Words only: what the GPU drew is seen through the panel source with
+     * one window asked for, read by the image engine as the controller
+     * reads it. A processor lock of the executor's buffer does not hand
+     * back what the GPU wrote. */
+    PictureCapture::WriteText(PictureCapture::Source::kGpu, words);
+  }
+  if (!drawn && dropped) {
+    /* Dropped, the GPU still busy with the drawing before: the last
+     * picture goes up again, against the fence it was drawn with, where it
+     * stood -- one frame of the client range repeated, the rest of the
+     * panel moving on. What the slots and the memory hold is unchanged:
+     * nothing was drawn. */
+    gpu_dropped_++;
+    hwc::MarkDropped("gpu");
+    gpu_pending_.clear();
+    last_gpu_use_ns_ = GetTimeMonotonicNs();
+    SeatGpuBuffer(gpu->Current(), gpu_drawn_fence_, gpu_shown_bounds_);
+    return true;
+  }
+  if (!drawn) {
+    /* Refused: the client was told these layers are the device's, so the
+     * frame shows the executor's last picture. Said once a run of them. */
+    static bool said = false;
+    if (!said) {
+      ALOGW("gpu executor refused a frame; showing its last one");
+      said = true;
+    }
+    gpu_memory_.Forget();
+    gpu_slots_.Lost(slot);
+    return false;
+  }
+  last_gpu_use_ns_ = GetTimeMonotonicNs();
+  /* A kept picture was drawn frames ago; only a drawing has a fence the
+   * GPU's clock is held for. */
+  if (!keep)
+    GetPipe().atomic_state_manager->GpuSubmitted(drawn->fence);
+  const auto size = GetSize();
+  gpu_slots_.Drawn(slot, size.first, size.second, gpu_pending_, gpu_plan_,
+                   drawn->fence);
+  gpu_memory_.Remember(size.first, size.second, std::move(gpu_pending_));
+  gpu_pending_.clear();
+  gpu_drawn_fence_ = drawn->fence;
+  gpu_shown_bounds_ = gpu_next_bounds_;
+  SeatGpuBuffer(drawn->buffer, std::move(drawn->fence), gpu_shown_bounds_);
+  return true;
+}
+
+auto HwcDisplay::GetDisplayName() const -> std::string {
+  std::ostringstream stream;
+  if (IsInHeadlessMode()) {
+    stream << "null-display";
+  } else {
+    stream << "display-" << GetPipe().connector->Get()->GetId();
+  }
+  return stream.str();
+}
+
+auto HwcDisplay::GetDisplayConfigs() const -> std::vector<HwcDisplayConfig> {
+  std::vector<HwcDisplayConfig> display_configs;
+  display_configs.reserve(configs_.hwc_configs.size());
+  for (const auto &[_, config] : configs_.hwc_configs) {
+    display_configs.emplace_back(config);
+  }
+
+  return display_configs;
+}
+
+HwcDisplay::HwcDisplay(DisplayHandle handle, bool is_virtual, Hwc *hwc)
+    : hwc_(hwc), handle_(handle), is_virtual_(is_virtual), client_layer_(this) {
+  // Create writeback layer for both virtual displays and potential readback
+  // operations
+  writeback_layer_ = std::make_unique<HwcLayer>(this);
+
+  display_mode_reporter_ = DisplayHotplugConnectModeDetectedAtomReporter::
+      Create();
+  config_result_reporter_ = DisplayConfigurationResultReporter::Create();
+}
+
+void HwcDisplay::SetColorTransformMatrix(
+    const HalColorTransformMatrix &color_transform_matrix) {
+  if (IsInHeadlessMode())
+    return;
+
+  MarkPlanInvalid(kColorTransform);
+
+  const bool
+      color_transform_is_identity = std::equal(color_transform_matrix.begin(),
+                                               color_transform_matrix.end(),
+                                               kIdentityMatrix.begin(),
+                                               float_equals);
+  if (color_transform_is_identity) {
+    client_color_matrix_ = GetIdentityCtmPtr();
+    client_ctm_has_offset_ = false;
+    client_ctm_has_negative_ = false;
+  } else {
+    client_ctm_has_offset_ = TransformHasOffsetValue(
+        color_transform_matrix.data());
+    client_ctm_has_negative_ = TransformHasNegativeValue(
+        color_transform_matrix.data());
+    client_color_matrix_ = std::make_shared<HalColorTransformMatrix>(
+        color_transform_matrix);
+  }
+
+  UpdateColorTransformMatrix();
+}
+
+void HwcDisplay::UpdateColorTransformMatrix() {
+  /* Innermost, so the profile is what the other two are applied to rather
+   * than the other way round: it is the panel's chosen character, and the
+   * client's transform -- night light, calibration, accessibility -- is
+   * what the user asks for on top of whatever character that is. */
+  color_matrix_ = ColorUtil::Multiply(render_intent_matrix_,
+                                      ColorUtil::Multiply(client_color_matrix_,
+                                                          profile_matrix_));
+}
+
+bool HwcDisplay::RefreshDisplayProfile() {
+  const float wanted = Properties::DisplaySaturation();
+  if (wanted == profile_saturation_) {
+    return false;
+  }
+
+  profile_saturation_ = wanted;
+  profile_matrix_ = ColorUtil::SaturationMatrix(wanted);
+  MarkPlanInvalid(kColorTransform);
+  UpdateColorTransformMatrix();
+  ALOGI("Display %d profile saturation %.3f", static_cast<int>(handle_),
+        static_cast<double>(wanted));
+  return true;
+}
+
+HwcDisplay::~HwcDisplay() {
+  Deinit();
+};
+
+auto HwcDisplay::GetConfig(ConfigId config_id) const
+    -> const HwcDisplayConfig * {
+  auto config_iter = configs_.hwc_configs.find(config_id);
+  if (config_iter == configs_.hwc_configs.end()) {
+    return nullptr;
+  }
+
+  return &config_iter->second;
+}
+
+auto HwcDisplay::GetCurrentConfig() const -> const HwcDisplayConfig * {
+  return GetConfig(active_config_id_);
+}
+
+auto HwcDisplay::GetLastRequestedConfig() const -> const HwcDisplayConfig * {
+  return GetConfig(staged_mode_config_id_.value_or(active_config_id_));
+}
+
+const HwcDisplayConfig *HwcDisplay::GetNextConfig() const {
+  if (staged_mode_config_id_ &&
+      staged_mode_change_time_ <= vsync_worker_->GetNextVsyncTimestamp(
+                                      GetTimeMonotonicNs())) {
+    return GetLastRequestedConfig();
+  }
+  return GetCurrentConfig();
+}
+
+void HwcDisplay::SetHdrHeadroom() {
+  float hdr_luminance[3]{kDefaultMaxLuminance, kDefaultMaxLuminance, 0.F};
+  GetEdid()->GetHdrLuminance(&hdr_luminance[0], &hdr_luminance[1],
+                             &hdr_luminance[2]);
+  float max_lum = hdr_luminance[0] > 0.F ? hdr_luminance[0]
+                                         : kDefaultMaxLuminance;
+  hdr_headroom_ = max_lum / kHdrReferenceLuminance;
+}
+
+void HwcDisplay::SetOutputType(OutputType hdr_output_type) {
+  if (!has_hdr_support_) {
+    hdr_headroom_ = {};
+    hdr_metadata_ = std::make_shared<hdr_output_metadata>();
+    min_bpc_ = 6;
+    transfer_func_ = TransferFunction::kSrgb;
+    return;
+  }
+
+  switch (hdr_output_type) {
+    case OutputType::kHdr10: {
+      SetHdrHeadroom();
+      SetHdrOutputMetadata(ColorGamut::BT2020(), TransferFunction::kPq);
+      min_bpc_ = 8;
+      break;
+    }
+    case OutputType::kSystem: {
+      std::vector<ui::Hdr> hdr_types;
+      GetEdid()->GetSupportedHdrTypes(hdr_types);
+      if (hdr_types.empty() && !forced_color_mode_) {
+        SetHdrOutputMetadata(ColorGamut::BT2020(), TransferFunction::kSrgb);
+        min_bpc_ = 6;
+        break;
+      }
+
+      // TODO: pick appropriate HDR type
+      SetHdrHeadroom();
+      min_bpc_ = 8;
+      auto type = (hdr_types.empty() && forced_color_mode_) ? ui::Hdr::HDR10
+                                                            : hdr_types.front();
+      switch (type) {
+        case ui::Hdr::HDR10:
+          SetHdrOutputMetadata(ColorGamut::BT2020(), TransferFunction::kPq);
+          break;
+        case ui::Hdr::HLG:
+          SetHdrOutputMetadata(ColorGamut::BT2020(), TransferFunction::kHlg);
+          break;
+        default:
+          ALOGW("HDR type %d is not supported, using Display BT2020 instead.",
+                static_cast<int>(type));
+          SetHdrOutputMetadata(ColorGamut::BT2020(),
+                               TransferFunction::kSmpte170M);
+          break;
+      }
+      break;
+    }
+    case OutputType::kSdr:
+      hdr_headroom_ = {};
+      hdr_metadata_ = std::make_shared<hdr_output_metadata>();
+      min_bpc_ = 6;
+      transfer_func_ = TransferFunction::kSrgb;
+      break;
+    case OutputType::kInvalid:
+      [[fallthrough]];
+    default:
+      hdr_headroom_ = {};
+      hdr_metadata_ = std::make_shared<hdr_output_metadata>();
+      min_bpc_ = 6;
+      transfer_func_ = TransferFunction::kUnknown;
+  }
+}
+
+HwcDisplay::ConfigError HwcDisplay::SetConfig(ConfigId config) {
+  ATRACE_CALL();
+
+  MarkPlanInvalid(kDisplayConfig);
+
+  const HwcDisplayConfig *new_config = GetConfig(config);
+  if (new_config == nullptr) {
+    ALOGE("Could not find active mode for %u", config);
+    return ConfigError::kBadConfig;
+  }
+  if (IsInHeadlessMode()) {
+    active_config_id_ = config;
+    hwc_->LogRefreshRateChanges();
+    return ConfigError::kNone;
+  }
+
+  ALOGV("Create modeset commit.");
+  SetOutputType(new_config->output_type);
+
+  // Create atomic commit args for a blocking modeset. There's no need to do a
+  // separate test commit, since the commit does a test anyways.
+  std::optional<LayerData> modeset_layer_data = GetModesetLayerData(new_config);
+  AtomicCommitArgs commit_args = CreateModesetCommit(new_config,
+                                                     modeset_layer_data);
+  commit_args.blocking = true;
+  if (const auto result = ExecuteAtomicCommit(commit_args);
+      !result.IsSuccess()) {
+    ALOGE("Blocking config failed with err=%d.", result.GetStatus().error_code);
+    return HwcDisplay::ConfigError::kConfigFailed;
+  }
+
+  ALOGV("Blocking config succeeded.");
+  active_config_id_ = config;
+  staged_mode_config_id_.reset();
+  // set new vsync period
+  vsync_worker_->SetVsyncPeriodNs(new_config->mode.GetVSyncPeriodNs());
+  hwc_->LogRefreshRateChanges();
+  return ConfigError::kNone;
+}
+
+auto HwcDisplay::QueueConfig(ConfigId config, int64_t desired_time,
+                             QueuedConfigTiming *out_timing) -> ConfigError {
+  MarkPlanInvalid(kDisplayConfig);
+
+  const HwcDisplayConfig *new_config = GetConfig(config);
+  if (!new_config) {
+    ALOGE("Could not find active mode for %u", config);
+    return ConfigError::kBadConfig;
+  }
+
+  const HwcDisplayConfig *current_config = GetCurrentConfig();
+  if (!current_config || current_config->group_id != new_config->group_id) {
+    return ConfigError::kSeamlessNotAllowed;
+  }
+
+  // Estimate the timestamp of the next vsync after the desired time.
+  int64_t next_vsync = vsync_worker_->GetNextVsyncTimestamp(desired_time);
+
+  // Request a refresh from the client one vsync period before the estimated
+  // timestamp.
+  out_timing->refresh_time_ns = next_vsync -
+                                current_config->mode.GetVSyncPeriodNs();
+  out_timing->new_vsync_time_ns = next_vsync;
+
+  // Queue the config change timing to be consistent with the requested
+  // refresh time.
+  staged_mode_change_time_ = out_timing->refresh_time_ns;
+  staged_mode_config_id_ = config;
+
+  if (current_config) {
+    SetOutputType(current_config->output_type);
+  }
+
+  // Enable vsync events until the mode has been applied.
+  vsync_worker_->SetVsyncTimestampTracking(true);
+
+  hwc_->LogRefreshRateChanges();
+  return ConfigError::kNone;
+}
+
+auto HwcDisplay::ValidateStagedComposition() -> ValidateResult {
+  if (validated_composition_.has_value()) {
+    ALOGE("%s: Previously validated composition was not presented", __func__);
+    validated_composition_.reset();
+  }
+  /* A drawing begun for a validation that was never presented is not this
+   * frame's; the executor drops it when the next one begins. */
+  gpu_begun_ = false;
+  gpu_reuse_ = false;
+
+  /* How many layers the client offered, said when the number changes.
+   *
+   * The first question to ask of a composer that never uses its hardware is
+   * whether it was ever given anything to put there. Both ways out below
+   * return before the planner is reached, so nothing further downstream can
+   * report on a frame that ends here. */
+  {
+    static size_t last_offered = SIZE_MAX;
+    if (layers_.size() != last_offered) {
+      last_offered = layers_.size();
+      HWC_LOGX("client offered %zu layer(s)%s", layers_.size(),
+               IsInHeadlessMode() ? " (headless, nothing to show them on)"
+                                  : "");
+    }
+  }
+
+  if (IsInHeadlessMode()) {
+    return {};
+  }
+
+  if (layers_.empty()) {
+    ALOGV("No layers to validate.");
+    return {};
+  }
+
+  // Notify the flattening controller of a new frame.
+  static const bool flatten_wanted = Properties::FlattenWhenIdle();
+  if (layers_.size() <= 1 || !flatten_wanted) {
+    flatcon_->DisableFlattening();
+  } else if (plan_consolidated_ && !AnyLayerDrawing()) {
+    /* The plan standing is the consolidated one and nothing in the scene
+     * is drawing -- a small layer's single frame, say, redrawn in part
+     * inside the merge. Waiting out the timeout would only end in a
+     * refresh that wakes the framework to lay out the same plan again. */
+    flatcon_->SettledFrame();
+  } else {
+    flatcon_->NewFrame();
+  }
+
+  /* Before the plan is made rather than after: a profile that arrived
+   * between two frames changes what the controller must be told, and the
+   * plan is where that is decided. */
+  RefreshDisplayProfile();
+
+  /* What of each layer can be seen, before the plan: a hidden layer takes
+   * no window, no place in a merge and no GPU time, and one seen in part
+   * is shown cropped to that part. */
+  ResolveOcclusion();
+
+  /* With the GPU executor drawing what the client would have, the client
+   * never hands over a target -- so one of the executor's buffers stands in
+   * while the plan is weighed, the plan needing a usable client target to
+   * seat the client range at all. */
+  auto *gpu = GetPipe().GetGpuExecutor();
+  if (gpu != nullptr) {
+    if (!client_layer_.IsLayerUsableAsDevice())
+      SeatGpuBuffer(gpu->Current(), {}, gpu_shown_bounds_);
+    /* Every buffer handed to the executor's thread now, whatever window it
+     * may end on: its first import costs milliseconds and is paid there,
+     * off the frame, rather than in the commit that first draws it -- as
+     * SurfaceFlinger's threaded RenderEngine maps a buffer when it is set.
+     * A buffer already imported is a lookup on that thread. */
+    const auto size = GetSize();
+    for (const auto &[_, layer] : layers_) {
+      const LayerData &ld = layer.GetLayerData();
+      if (ld.bi && !layer.IsHidden())
+        gpu->Prepare(ToVkLayer(ld, size));
+    }
+  }
+
+  auto validation_result = pipeline_->planner->ValidateDisplay(this);
+  validated_composition_.emplace(std::move(validation_result.composition));
+  staged_composition_reused_ = validation_result.short_circuited;
+  /* The planner never saw the hidden layers; they are in the frame all the
+   * same, as layers nothing shows. */
+  for (const auto &[_, layer] : layers_)
+    if (layer.IsHidden())
+      validated_composition_->composition_types[&layer] =
+          CompositionType::kDeviceOccluded;
+
+  if (gpu != nullptr && GpuCanDrawClient(*validated_composition_)) {
+    validated_composition_->gpu_draws_client = true;
+    /* The GPU is brought up now if it has been idle long enough to have
+     * powered down: the frame's drawing comes at commit, and even the
+     * millisecond or two between is half the cost of a cold start
+     * (measured on tools/hwcvk_stand). When to warm is to move into the
+     * governor beside the merge engine's warm-up. */
+    constexpr int64_t kGpuIdleNs = 500'000'000;
+    if (GetTimeMonotonicNs() - last_gpu_use_ns_ > kGpuIdleNs)
+      gpu->Warm();
+    /* The plan is known and the client may not touch the layers again
+     * before it presents: the drawing starts now, on the executor's
+     * thread, and the commit only collects it. The client's own work
+     * between validate and present -- a millisecond or more -- is time the
+     * GPU and its driver no longer take out of the commit. */
+    BeginClientOnGpu(*validated_composition_);
+  }
+
+  // Iterate through the layers to find which layers actually changed.
+  std::vector<ChangedLayer> changed_layers;
+  for (auto &[id, layer] : layers_) {
+    // Set the validated type
+    auto it = validated_composition_->composition_types.find(&layer);
+    ALOGE_IF(it == validated_composition_->composition_types.end(),
+             "Backend did not composite layer %" PRId64 "", id);
+    if (it != validated_composition_->composition_types.end()) {
+      CompositionType type = it->second;
+      /* Drawn by the composer's GPU executor: the client is told the layer
+       * is the device's, so it composes nothing. A solid colour keeps its
+       * own type -- the framework does not change a solid colour into a
+       * device layer -- and is drawn all the same. */
+      if (validated_composition_->gpu_draws_client &&
+          type == CompositionType::kClient) {
+        type = layer.GetSfType() == CompositionType::kSolidColor
+                   ? CompositionType::kSolidColor
+                   : CompositionType::kDevice;
+      }
+      /* Hidden: the device's as far as the client knows, so it draws
+       * nothing of it either; the composer simply shows nothing of it. HWC2
+       * has no type of its own for this, and the internal one must not
+       * reach the client as a number it reads otherwise. */
+      if (type == CompositionType::kDeviceOccluded)
+        type = layer.GetSfType() == CompositionType::kSolidColor
+                   ? CompositionType::kSolidColor
+                   : CompositionType::kDevice;
+      layer.SetValidatedType(type);
+    }
+    if (layer.IsTypeChanged()) {
+      changed_layers.emplace_back(id, layer.GetValidatedType());
+    }
+  }
+
+  // Get the layer id for the punch out layers.
+  std::vector<ILayerId> punch_out_layers;
+  for (const auto *layer : validated_composition_->punch_out_layers) {
+    const auto it = std::find_if(layers_.begin(), layers_.end(),
+                                 [&](const auto &pair) {
+                                   return &pair.second == layer;
+                                 });
+    if (it != layers_.end()) {
+      punch_out_layers.push_back(it->first);
+    }
+  }
+
+  return ValidateResult{
+      .changed_layers = std::move(changed_layers),
+      .punch_out_layers = std::move(punch_out_layers),
+  };
+}
+
+auto HwcDisplay::GetDisplayBoundsMm() const -> std::pair<int32_t, int32_t> {
+  if (IsInHeadlessMode()) {
+    return {configs_.mm_width, -1};
+  }
+
+  const auto bounds = GetEdid()->GetBoundsMm();
+  if (bounds.first > 0 || bounds.second > 0) {
+    return bounds;
+  }
+
+  ALOGE("Failed to get display bounds for d=%d\n", int(handle_));
+  // mm_width and mm_height are unreliable. so only provide mm_width to avoid
+  // wrong dpi computations or other use of the values.
+  return {configs_.mm_width, -1};
+}
+
+auto HwcDisplay::AcceptValidatedComposition() -> void {
+  for (auto &[_, layer] : layers_) {
+    layer.AcceptTypeChange();
+  }
+}
+
+auto HwcDisplay::AnyLayerDrawing() const -> bool {
+  /* The class each layer is about to be judged into: the live ones that
+   * stay live and the quiet ones about to turn. */
+  auto drawing = [](const HwcLayer &layer) {
+    return layer.IsLive() != layer.LivenessWouldChange();
+  };
+  if (drawing(client_layer_))
+    return true;
+  return std::any_of(layers_.begin(), layers_.end(),
+                     [&](const auto &entry) { return drawing(entry.second); });
+}
+
+auto HwcDisplay::ValidateForPresentWithoutValidation() -> bool {
+  if (validated_composition_.has_value() || IsInHeadlessMode() ||
+      layers_.empty() || !reusable_plan_ ||
+      reusable_plan_->flatten_reason != FlattenReason::kNone)
+    return false;
+
+  /* Looked at, not taken: the bits stay for the validation the client will
+   * ask for if the answer here is no. */
+  if (plan_invalidators_ != 0 || client_layer_.PeekPlanInvalidators() != 0 ||
+      client_layer_.LivenessWouldChange())
+    return false;
+  for (const auto &[_, layer] : layers_)
+    if (layer.PeekPlanInvalidators() != 0 || layer.LivenessWouldChange())
+      return false;
+
+  /* Nothing the plan depends on moved, so the planner hands the last plan
+   * back -- unless one of its own reasons to flatten has come up, or a
+   * layer's type would change; then the client must validate after all,
+   * and does so from scratch. */
+  const auto validated = ValidateStagedComposition();
+  if (!staged_composition_reused_ || !validated.changed_layers.empty()) {
+    validated_composition_.reset();
+    MarkPlanInvalid(kAllDirty);
+    return false;
+  }
+  AcceptValidatedComposition();
+  return true;
+}
+
+auto HwcDisplay::PresentStagedComposition(
+    std::optional<int64_t> desired_present_time, SharedFd &out_present_fence,
+    std::vector<ReleaseFence> &out_release_fences) -> bool {
+  ATRACE_CALL();
+
+  if (IsInHeadlessMode()) {
+    return true;
+  }
+
+  if (layers_.empty()) {
+    ALOGV("No layers to present.");
+    /* A frame the flip machinery never saw: whatever it remembers on the
+     * strength of seeing every frame must not survive this one. */
+    GetPipe().atomic_state_manager->NoteFrameUnjudged();
+    gpu_memory_.Forget();
+    return true;
+  }
+
+  CompositionAttributes attributes{.display_handle = handle_};
+  CompositionStats stats{};
+  ++stats.total_frames;
+  stats.layer_count += layers_.size();
+
+  // With multiple displays configured at different refresh rates,
+  // desired_present_time can be up to almost 2 vsync periods away for the
+  // slower display. WaitLastFrame() should be called before
+  // WaitForPresenttime(), otherwise  can lead to a situation where hwc sleeps
+  // for up to 1.25 vsync period and blocks viable presents in SurfaceFlinger.
+  GetPipe().atomic_state_manager->WaitLastFrame();
+
+  uint32_t vperiod_ns = GetCurrentVsyncPeriodNs();
+  if (desired_present_time && vperiod_ns != 0) {
+    // DRM atomic uAPI does not support specifying that a commit should be
+    // applied to some future vsync. Until such uAPI is available, sleep in
+    // userspace until the next expected vsync time is consistent with the
+    // desired present time.
+    WaitForPresentTime(desired_present_time.value(), vperiod_ns);
+  }
+
+  // Check if validation was performed and update related stats. Otherwise
+  // populate the composition types now.
+  if (validated_composition_.has_value()) {
+    attributes.validation_result = validated_composition_->flatten_reason ==
+                                           FlattenReason::kValidateFailed
+                                       ? ValidationResult::kFailure
+                                       : ValidationResult::kSuccess;
+    attributes.validation_error_code = validated_composition_->error_code;
+    attributes.flatten_reason = validated_composition_->flatten_reason;
+    if (validated_composition_->flatten_reason ==
+        FlattenReason::kValidateFailed) {
+      ++stats.failed_kms_validate;
+    } else if (validated_composition_->flatten_reason != FlattenReason::kNone) {
+      ++stats.frames_flattened;
+    }
+    if (validated_composition_->cursor_plane_validated.has_value()) {
+      if (validated_composition_->cursor_plane_validated.value()) {
+        ++stats.cursor_plane_frames;
+      } else {
+        ++stats.failed_kms_cursor_validate;
+      }
+    }
+  } else {
+    attributes.validation_result = ValidationResult::kSkip;
+    validated_composition_ = CompositionPlanner::ValidatedComposition{};
+    for (const auto &[id, layer] : layers_) {
+      validated_composition_->composition_types
+          .emplace(&layer, layer.IsHidden() ? CompositionType::kDeviceOccluded
+                                            : layer.GetValidatedType());
+    }
+  }
+
+  bool has_client = false;
+  for (const auto &[id, layer] : layers_) {
+    stats.total_pixops += layer.GetPixOps();
+    switch (layer.GetValidatedType()) {
+      case CompositionType::kClient:
+        has_client = true;
+        stats.gpu_pixops += layer.GetPixOps();
+        break;
+      case CompositionType::kDevice:
+      case CompositionType::kCursor:
+        ++stats.used_plane_count;
+        break;
+      case CompositionType::kSolidColor:
+        break;
+      case CompositionType::kInvalid:
+        ALOGE("Invalid layer type: %d",
+              static_cast<int>(layer.GetValidatedType()));
+        break;
+      // Occlusion is achieved by dropping the layer.
+      case CompositionType::kDeviceOccluded:
+        break;
+    }
+  }
+
+  if (has_client) {
+    ++stats.used_plane_count;
+  }
+
+  const auto commit_status = CommitStagedComposition(out_present_fence);
+  if (!commit_status.success) {
+    attributes.present_failed = true;
+    attributes.present_error_code = commit_status.error_code;
+    ++stats.failed_kms_present;
+    comp_stats_[attributes] += stats;
+    return false;
+  }
+
+  attributes.present_failed = false;
+  attributes.present_error_code = 0;
+  comp_stats_[attributes] += stats;
+
+  // Reset the hdr output metadata blobs so we don't apply it repeatedly.
+  hdr_metadata_.reset();
+
+  ++frame_no_;
+
+  /* Only the timing of the frame depends on there being a present fence. What
+   * a layer is told about its buffer does not, and used to be skipped along
+   * with it -- so withholding the fence from the client, which is a question
+   * about timing, silently withheld every release fence as well, which is a
+   * question about safety. The two look alike and answer to different things;
+   * they were told apart in the commit that split them, and this is the last
+   * place that still ran them together. */
+  if (out_present_fence) {
+    vsync_worker_->AddLastPresentFence(out_present_fence);
+  }
+
+  /* Only a layer the client has just handed a new buffer has anything to
+   * release, and it is told once. Clearing here is what keeps it to once: a
+   * layer left alone for the next several frames is still showing the same
+   * buffer, and saying "you may have it back" a second time would be saying
+   * it about a buffer the controller is still reading.
+   */
+  for (auto &l : layers_) {
+    if (l.second.GetPriorBufferScanOutFlag()) {
+      /* Told when it is actually free, which is not the same answer for every
+       * layer. One the display was given is read for as long as it is on
+       * screen, so it is free when this frame replaces it -- the present
+       * fence. One that went to an engine was read once while the last frame
+       * was built, and has been free since that engine finished.
+       *
+       * Getting this wrong is not visible; it is only slow. The buffer comes
+       * back late, the client draws into one fewer than it owns, and a client
+       * with three of them that is handed back one late is drawing into two.
+       */
+      const auto engine = EngineFenceFor(l.second.GetPriorBuffer());
+      const auto &now = l.second.GetLayerData();
+      HWC_LOGD("layer %" PRId64 " %p: releases %p by the %s fence, now %p",
+               l.first, &l.second, l.second.GetPriorBuffer(),
+               engine ? "engine" : "flip",
+               now.bi ? now.bi->handle : nullptr);
+      out_release_fences.emplace_back(l.first, engine.value_or(release_fence_));
+      l.second.ClearPriorBufferScanOutFlag();
+    }
+  }
+
+  /* This frame's answers become the ones handed out next time. */
+  engine_last_frame_ = std::move(engine_this_frame_);
+  engine_this_frame_ = {};
+
+  return true;
+}
+
+auto HwcDisplay::EngineFenceFor(buffer_handle_t prior) const
+    -> std::optional<SharedFd> {
+  if (prior == nullptr || !engine_last_frame_.fence)
+    return {};
+
+  const auto &read = engine_last_frame_.buffers;
+  if (std::find(read.begin(), read.end(), prior) == read.end())
+    return {};
+
+  return engine_last_frame_.fence;
+}
+
+auto HwcDisplay::GetRawEdid() const -> std::vector<uint8_t> {
+  if (IsInHeadlessMode()) {
+    return {};
+  }
+
+  auto *connector = GetPipe().connector->Get();
+  auto blob = connector->GetEdidBlob();
+  if (!blob || blob->length == 0) {
+    return {};
+  }
+  const uint8_t *edid_data = static_cast<uint8_t *>(blob->data);
+  return {edid_data, edid_data + blob->length};
+}
+
+auto HwcDisplay::GetPort() const -> uint8_t {
+  if (IsInHeadlessMode()) {
+    return 0;
+  }
+
+  auto *connector = GetPipe().connector->Get();
+
+  constexpr uint8_t kDrmDeviceBitShift = 5U;
+  constexpr uint8_t kDrmDeviceBitMask = 0xE0;
+  constexpr uint8_t kConnectorBitMask = 0x1F;
+  const auto kDrmIdx = static_cast<uint8_t>(
+      connector->GetDev().GetIndexInDevArray());
+  const auto kConnectorIdx = static_cast<uint8_t>(
+      connector->GetIndexInResArray());
+  return (((kDrmIdx << kDrmDeviceBitShift) & kDrmDeviceBitMask) |
+          (kConnectorIdx & kConnectorBitMask));
+}
+
+auto HwcDisplay::GetDisplayType() const -> DisplayType {
+  if (is_virtual_) {
+    return kVirtual;
+  }
+
+  if (IsInHeadlessMode()) {
+    return kInternal;
+  }
+
+  /* Primary display should be always internal,
+   * otherwise SF will be unhappy and will crash
+   */
+  if (handle_ == kPrimaryDisplay) {
+    return kInternal;
+  }
+
+  auto displays = hwc_->GetInternalDisplayNames();
+  if (!displays.empty()) {
+    std::string name = GetPipe().connector->Get()->GetName();
+    const bool is_internal = (displays.find(name) != displays.end());
+    return is_internal ? kInternal : kExternal;
+  }
+
+  if (GetPipe().connector->Get()->IsInternal())
+    return kInternal;
+
+  ALOGW_IF(!GetPipe().connector->Get()->IsExternal(),
+           "Connector type is neither internal nor external.");
+  return kExternal;
+}
+
+void HwcDisplay::SetVsyncCallbacksEnabled(bool enabled) {
+  // Enabling vsync callbacks for a virtual display succeeds with no effect.
+  if (!vsync_worker_) {
+    ALOGE_IF(!is_virtual_, "Invalid VSyncWorker. Did HwcDisplay::Init fail?");
+    return;
+  }
+
+  vsync_event_en_ = enabled;
+  std::optional<VSyncWorker::VsyncTimestampCallback> callback = std::nullopt;
+  if (vsync_event_en_) {
+    Hwc *hwc = hwc_;
+    DisplayHandle id = handle_;
+    // Callback will be called from the vsync thread.
+    callback = [hwc, id](int64_t timestamp, uint32_t period_ns) {
+      hwc->SendVsyncEventToClient(id, timestamp, period_ns);
+    };
+  }
+  vsync_worker_->SetTimestampCallback(std::move(callback));
+}
+
+bool HwcDisplay::IsDozeSupported() const {
+  if (IsInHeadlessMode()) {
+    return false;
+  }
+  return GetPipe().device->GetBackend().SupportsDoze();
+}
+
+bool HwcDisplay::IsDozeSuspendSupported() const {
+  if (IsInHeadlessMode()) {
+    return false;
+  }
+  return GetPipe().device->GetBackend().SupportsDozeSuspend();
+}
+
+bool HwcDisplay::IsSuspendSupported() const {
+  if (IsInHeadlessMode()) {
+    return false;
+  }
+  return GetPipe().device->GetBackend().SupportsSuspend();
+}
+
+HwcDisplay::Error HwcDisplay::SetPowerMode(PowerMode mode) {
+  /* Conservatively before the support checks: a head that was off answers
+   * its capability questions differently once on, so any traffic here is
+   * reason enough to plan the next frame in full. */
+  MarkPlanInvalid(kPowerMode);
+
+  // Check support before headless because VTS expects headless mode to not
+  // support these.
+  if (mode == PowerMode::kDoze && !IsDozeSupported()) {
+    return HwcDisplay::Error::kUnsupported;
+  }
+  if (mode == PowerMode::kDozeSuspend && !IsDozeSuspendSupported()) {
+    return HwcDisplay::Error::kUnsupported;
+  }
+  if (mode == PowerMode::kSuspend && !IsSuspendSupported()) {
+    return HwcDisplay::Error::kUnsupported;
+  }
+
+  if (IsInHeadlessMode()) {
+    return HwcDisplay::Error::kNone;
+  }
+  bool enabled = mode != PowerMode::kOff;
+
+  // If the request is to enable the display, the CRTC is not active, and an
+  // active config is set, try to reconfigure the pipeline with SetConfig.
+  if (enabled && !GetPipe().atomic_state_manager->IsActive()) {
+    const HwcDisplayConfig *last_requested_config = GetLastRequestedConfig();
+    if (last_requested_config) {
+      if (SetConfig(last_requested_config->id) != ConfigError::kNone) {
+        ALOGE("Failed to set config to re-enable display after teardown.");
+        return HwcDisplay::Error::kBadParameter;
+      }
+    }
+  }
+
+  // Set the display active state.
+  AtomicCommitArgs a_args{};
+  a_args.blocking = true;
+  a_args.power_mode = mode;
+  if (!enabled) {
+    a_args.teardown = true;
+  }
+
+  const auto result = ExecuteAtomicCommit(a_args);
+  ALOGE_IF(!result.IsSuccess(), "Failed to set display active: %s. err=%d",
+           enabled ? "enabled" : "disabled", result.GetStatus().error_code);
+  // If setting to |enabled|, log the error and return success: the ON path
+  // is never answered from the cache, so the framework's next power request
+  // reaches the hardware again -- that is the retry.
+  if (!result.IsSuccess() && !enabled) {
+    return HwcDisplay::Error::kBadParameter;
+  }
+  if (vsync_worker_)
+    vsync_worker_->SetDisplayOn(enabled);
+  return HwcDisplay::Error::kNone;
+}
+
+bool HwcDisplay::GetDisplayEnabled() const {
+  if (IsInHeadlessMode()) {
+    return true;
+  }
+
+  return GetPipe().atomic_state_manager->IsActive();
+}
+
+void HwcDisplay::SetPipeline(std::shared_ptr<DisplayPipeline> pipeline) {
+  Deinit();
+
+  pipeline_ = std::move(pipeline);
+
+  if (pipeline_ == nullptr && handle_ != kPrimaryDisplay) {
+    hwc_->ScheduleHotplugEvent(handle_, Hwc::kDisconnected);
+    return;
+  }
+
+  bool success = Init();
+
+  /* The primary is announced at once, not after the retries below: this
+   * release checks, on the way out of RegisterCallback, that a primary
+   * display was announced during the call, and an announcement held back
+   * for even one retry could miss that window. It does not need to wait:
+   * from here on the display always answers from a consistent state --
+   * the live pipeline on success, the headless stand-in after the
+   * fallback below. */
+  if (handle_ == kPrimaryDisplay)
+    hwc_->ScheduleHotplugEvent(handle_, Hwc::kConnected);
+
+  /* The one way this backend's Init fails is transient: a predecessor on
+   * its way out still holds the head's windows, and the first modeset
+   * finds nothing to show with. The windows come back when the old
+   * process finishes dying -- a matter of milliseconds -- so the cure is
+   * to wait it out, bounded. Each attempt runs the whole Deinit/Init
+   * pair: a failed Init leaves half-built state behind (a vsync worker
+   * already running, real configs under a dangling active id), and Init
+   * on top of that is not a retry, it is a leak. */
+  for (int attempt = 0; !success && pipeline_ != nullptr && attempt < 3;
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Deinit();
+    success = Init();
+  }
+
+  if (!success && pipeline_ != nullptr) {
+    ALOGE("Failed to init the display pipeline; falling back to headless.");
+    /* The fallback restates, field by field, the state the headless
+     * branch of Init builds. Deinit alone is not enough: the failed Init
+     * may have left real configs behind, with the active id still
+     * pointing into the fake set they replaced -- and GetDisplayConfigs
+     * hands configs_ out verbatim, so the dangling id would outlive the
+     * teardown. */
+    Deinit();
+    pipeline_ = nullptr;
+    configs_ = configs_generator_.GetFakeMode(0, 0);
+    active_config_id_ = configs_.preferred_config_id;
+    staged_mode_config_id_.reset();
+  }
+
+  ALOGE_IF(!success, "Failed to init HwcDisplay after setting pipeline.");
+
+  /* Unlike the primary, a secondary display may tell the truth: nobody
+   * saw it connected yet, so a failed one simply never appears. */
+  if (handle_ != kPrimaryDisplay)
+    hwc_->ScheduleHotplugEvent(handle_, success ? Hwc::kConnected
+                                                : Hwc::kDisconnected);
+
+  if (pipeline_ != nullptr) {
+    LogModesOnHotplug();
+  }
+}
+
+void HwcDisplay::Deinit() {
+  if (pipeline_ != nullptr) {
+    AtomicCommitArgs a_args{};
+    a_args.composition = std::make_shared<LayerToPlaneJoiningPlan>();
+    ExecuteAtomicCommit(a_args);
+    a_args.composition = {};
+    a_args.power_mode = PowerMode::kOff;
+    a_args.teardown = true;
+    ExecuteAtomicCommit(a_args);
+
+    validated_composition_.reset();
+    flatcon_.reset();
+    hdcpcon_.reset();
+    backlight_controller_.reset();
+    reusable_plan_.reset();
+    MarkPlanInvalid(kAllDirty);
+  }
+
+  if (vsync_worker_) {
+    vsync_worker_->StopThread();
+    vsync_worker_ = {};
+  }
+}
+
+void HwcDisplay::InitForcedColorMode() {
+  if (IsInHeadlessMode()) {
+    return;
+  }
+
+  // Forced color modes only apply to the internal display
+  if (GetPipe().connector && GetPipe().connector->Get() &&
+      GetPipe().connector->Get()->IsExternal()) {
+    return;
+  }
+
+  if (hwc_->ForceColorMode() < 0) {
+    return;
+  }
+
+  auto force_color_mode = static_cast<ColorMode>(
+      hwc_->ForceColorMode());
+  if (force_color_mode < ColorMode::kNative ||
+      force_color_mode > ColorMode::kDisplayBt2020) {
+    return;
+  }
+
+  forced_color_mode_ = force_color_mode;
+}
+
+void HwcDisplay::InitUseColorPipeline() {
+  if (IsInHeadlessMode()) {
+    use_color_pipeline_ = false;
+    return;
+  }
+
+  use_color_pipeline_ = hwc_->UseColorPipeline() &&
+                        GetPipe().primary_plane &&
+                        GetPipe().primary_plane->Get() &&
+                        GetPipe().primary_plane->Get()->HasColorPipeline();
+}
+
+void HwcDisplay::InitWcgSupported() {
+  if (IsInHeadlessMode()) {
+    has_wcg_support_ = false;
+    return;
+  }
+
+  bool crtc_ctm = GetPipe().crtc && GetPipe().crtc->Get() &&
+                  GetPipe().crtc->Get()->GetCtmProperty();
+  std::vector<ColorMode> color_modes;
+  GetEdid()->GetColorModes(color_modes);
+  // TODO check for WCG modes
+  has_wcg_support_ = (use_color_pipeline_ || crtc_ctm) &&
+                     (!color_modes.empty() ||
+                      (forced_color_mode_ &&
+                       forced_color_mode_.value() != ColorMode::kNative));
+}
+
+void HwcDisplay::InitHdrSupported() {
+  if (IsInHeadlessMode()) {
+    has_hdr_support_ = false;
+    return;
+  }
+
+  if (pipeline_->capabilities) {
+    auto override_types = pipeline_->capabilities->GetHdrTypesOverride();
+    if (override_types.has_value()) {
+      has_hdr_support_ = !override_types->empty();
+      ALOGI("InitHdrSupported: using backend override: has_hdr_support_=%d",
+            has_hdr_support_);
+      return;
+    }
+  }
+
+  bool crtc_gamma = GetPipe().crtc && GetPipe().crtc->Get() &&
+                    GetPipe().crtc->Get()->GetGammaLutProperty() &&
+                    GetPipe().crtc->Get()->GetGammaLutSizeProperty();
+  std::vector<ui::Hdr> hdr_types;
+  GetEdid()->GetSupportedHdrTypes(hdr_types);
+
+  if (!GetPipe().connector || !GetPipe().connector->Get()) {
+    has_hdr_support_ = false;
+    return;
+  }
+
+  const bool hdr_sysprop_enabled = GetPipe().connector->Get()->IsExternal()
+                                       ? hwc_->ExternalHdrEnabled()
+                                       : hwc_->PersistentHdrEnabled();
+
+  // TODO check for HDR types
+  has_hdr_support_ = use_color_pipeline_ && crtc_gamma && has_wcg_support_ &&
+                     hdr_sysprop_enabled &&
+                     GetPipe()
+                         .connector->Get()
+                         ->GetHdrOutputMetadataProperty() &&
+                     GetPipe().connector->Get()->GetColorspaceProperty() &&
+                     (!hdr_types.empty() ||
+                      (forced_color_mode_ &&
+                       forced_color_mode_.value() != ColorMode::kNative));
+}
+
+bool HwcDisplay::Init() {
+  if (!is_virtual_) {
+    vsync_worker_ = VSyncWorker::CreateInstance(pipeline_);
+    if (!vsync_worker_) {
+      ALOGE("Failed to create event worker for d=%d\n", int(handle_));
+      return false;
+    }
+  }
+
+  if (!IsInHeadlessMode()) {
+    auto flatcbk = (struct FlatConCallbacks){
+        .trigger = [this]() { hwc_->SendRefreshEventToClient(handle_); }};
+    flatcon_ = std::make_unique<FlatteningController>(handle_, flatcbk,
+                                                      kFlatteningTimeout);
+
+    if (IsHdcpPropertyPresent()) {
+      ALOGI("HDCP properties found on display %d", int(handle_));
+      auto hdcpconcbks = (struct HdcpConCallbacks){
+          .notify_hdcp_status =
+              [this](std::optional<HdcpContentType> level) {
+                hwc_->SendHdcpLevelsChangedEventToClient(handle_, level);
+              },
+          .trigger_retry_frame =
+              [this]() { hwc_->SendRefreshEventToClient(handle_); }};
+      hdcpcon_ = std::make_unique<HdcpController>(&GetPipe(), hdcpconcbks,
+                                                  kHdcpRetryTimeout);
+    }
+
+#if HAS_LIBDISPLAY_INFO
+    auto edid = LibdisplayEdidWrapper::Create(
+        pipeline_->connector->Get()->GetEdidBlob());
+    if (edid) {
+      edid_wrapper_ = std::move(edid);
+    } else {
+      ALOGW("Failed to create a LibdisplayInfo parser.");
+    }
+#endif
+
+    // Attempt to initialize backlight
+    if (GetPipe().connector->Get()->IsInternal()) {
+      auto backlights = SysfsBacklightController::EnumerateBacklights();
+      for (const auto &name : backlights) {
+        // TODO(seanpaul): logic to associate backlight with connector
+        backlight_controller_ = SysfsBacklightController::CreateInstanceFromName(
+            name);
+        if (backlight_controller_) {
+          ALOGI("Associated backlight %s with display %d", name.c_str(),
+                static_cast<int>(handle_));
+          break;
+        }
+      }
+    }
+  }
+
+  HwcLayer::LayerProperties lp;
+  lp.blend_mode = BufferBlendMode::kPreMult;
+  client_layer_.SetLayerProperties(lp);
+
+  if (is_virtual_) {
+    configs_ = configs_generator_.GetFakeMode(virtual_disp_width_,
+                                              virtual_disp_height_);
+    pipeline_->writeback_connector = pipeline_->connector;
+  } else if (IsInHeadlessMode()) {
+    configs_ = configs_generator_.GetFakeMode(0, 0);
+  } else {
+    // Ensure one config is available for headless mode in case we end up with
+    // no real modes from the connector or if initialization fails.
+    configs_ = configs_generator_.GetFakeMode(0, 0);
+    active_config_id_ = configs_.preferred_config_id;
+
+    auto *connector = pipeline_->connector->Get();
+    auto ret = connector->UpdateModes();
+    if (ret != 0) {
+      ALOGE("Failed to update display modes with error: %d", ret);
+      return false;
+    }
+
+    const HwcConfigParameters params = {
+        .use_color_pipeline = Properties::UseColorPipeline(),
+        .persistent_hdr_enabled = Properties::PersistentHdrEnabled(),
+        .external_hdr_enabled = Properties::ExternalHdrEnabled(),
+        .capabilities = pipeline_->capabilities.get(),
+    };
+    auto configs = configs_generator_.GenerateDisplayConfigs(*connector,
+                                                             params);
+    if (!configs) {
+      return false;
+    }
+    configs_ = std::move(*configs);
+  }
+
+  InitForcedColorMode();
+  InitUseColorPipeline();
+  InitWcgSupported();
+  InitHdrSupported();
+
+  if (SetConfig(configs_.preferred_config_id) !=
+      HwcDisplay::ConfigError::kNone) {
+    return false;
+  }
+
+  if (!IsInHeadlessMode() && GetPipe().connector->Get()->IsInternal()) {
+    SetConfigGroupsForActiveConfig();
+  }
+
+  return true;
+}
+
+auto HwcDisplay::CreateLayer(ILayerId new_layer_id) -> bool {
+  if (layers_.count(new_layer_id) > 0)
+    return false;
+
+  layers_.emplace(new_layer_id, HwcLayer(this));
+  MarkPlanInvalid(kLayerAdded);
+
+  return true;
+}
+
+auto HwcDisplay::DestroyLayer(ILayerId layer_id) -> bool {
+  /* The GPU executor keeps a client buffer imported, for the next drawing
+   * that may read it, until its budget wants the room; a closed app's
+   * window would hold its buffers' memory until then. The layer is gone,
+   * so none of its buffers is drawn again: they are let go now. */
+  auto it = layers_.find(layer_id);
+  auto *gpu = pipeline_ ? GetPipe().GetGpuExecutor() : nullptr;
+  if (it != layers_.end() && gpu != nullptr)
+    gpu->Forget(it->second.GetLayerData().serial);
+
+  auto count = layers_.erase(layer_id);
+  if (count != 0) {
+    MarkPlanInvalid(kLayerRemoved);
+    /* The kept plan maps the dead layer's address. The raised bit already
+     * stops anyone reading it, but a map of dangling pointers guarded by a
+     * flag is a mine for whoever reads it next without asking -- so it is
+     * emptied, not merely fenced. */
+    reusable_plan_.reset();
+  }
+  return count != 0;
+}
+
+auto HwcDisplay::GetColorModes() const -> std::vector<ColorMode> {
+  if (IsInHeadlessMode()) {
+    return {ColorMode::kNative};
+  }
+
+  // Return the backend overrides if they exist.
+  if (GetPipe().capabilities != nullptr) {
+    auto color_mode_overrides = GetPipe().capabilities->GetColorModeOverrides();
+    if (color_mode_overrides) {
+      ALOGI("Using backend ColorMode overrides");
+      return color_mode_overrides.value();
+    }
+  }
+
+  // If forced_color_mode_ is set, override the color modes.
+  if (forced_color_mode_.has_value()) {
+    std::set<ColorMode> modes;
+    modes.emplace(ColorMode::kNative);
+    modes.emplace(ColorMode::kSrgb);
+    modes.emplace(forced_color_mode_.value());
+    return {modes.begin(), modes.end()};
+  }
+
+  if (!GetPipe().connector->Get()->GetColorspaceProperty()) {
+    return {ColorMode::kNative};
+  }
+
+  // TODO: refactor to use set instead of vector
+  std::vector<ColorMode> modes;
+  GetEdid()->GetColorModes(modes);
+
+  if (modes.empty()) {
+    return {ColorMode::kNative};
+  }
+
+  modes.emplace_back(ColorMode::kSrgb);
+  return modes;
+}
+
+auto HwcDisplay::GetRenderIntents(ColorMode /*color_mode*/) const
+    -> std::vector<ui::RenderIntent> {
+  render_intent_queries_++;
+  /* Two honest choices and their tone-mapped twins: colorimetric is the
+   * panel as calibrated, enhance is the boosted matrix on the display's
+   * own colour machinery. The vendor value is the same boost under the
+   * number LineageOS passes through numerically from its display
+   * setting. */
+  return {ui::RenderIntent::COLORIMETRIC, ui::RenderIntent::ENHANCE,
+          ui::RenderIntent::TONE_MAP_COLORIMETRIC, kVendorBoostedRenderIntent};
+}
+
+void HwcDisplay::SetColorMode(ColorMode mode, ui::RenderIntent render_intent) {
+  MarkPlanInvalid(kColorMode);
+  color_mode_sets_++;
+  last_color_mode_ = static_cast<int32_t>(mode);
+  last_render_intent_ = static_cast<int32_t>(render_intent);
+
+  // If force_color_mode is set, override the color modes.
+  colorspace_ = forced_color_mode_
+                    ? ColorUtil::ToHwcColorspace(forced_color_mode_.value())
+                    : ColorUtil::ToHwcColorspace(mode);
+
+  switch (render_intent) {
+    case ui::RenderIntent::COLORIMETRIC:
+    case ui::RenderIntent::TONE_MAP_COLORIMETRIC:
+      render_intent_matrix_ = GetIdentityCtmPtr();
+      break;
+    case ui::RenderIntent::ENHANCE:
+    case ui::RenderIntent::TONE_MAP_ENHANCE:
+      /* The framework's own name for what the vendor value asks for;
+       * one matrix answers both spellings. */
+      render_intent_matrix_ = GetBoostedCTMPtr();
+      break;
+    default:
+      if (render_intent == kVendorBoostedRenderIntent) {
+        render_intent_matrix_ = GetBoostedCTMPtr();
+      } else {
+        ALOGW("Unsupported render intent (%d). Fallback to identity CTM",
+              static_cast<int32_t>(render_intent));
+        render_intent_matrix_ = GetIdentityCtmPtr();
+      }
+  }
+
+  UpdateColorTransformMatrix();
+}
+
+void HwcDisplay::GetHdrCapabilities(std::vector<ui::Hdr> *types,
+                                    float *max_luminance,
+                                    float *max_average_luminance,
+                                    float *min_luminance) const {
+  if (IsInHeadlessMode() || !has_hdr_support_) {
+    /* An empty list of types is the honest answer for a panel with no high
+     * dynamic range, and the one the caller above turns into a display that
+     * reports none. The three luminances are part of that answer and were
+     * being left as they were found: a caller that had not cleared them
+     * first would read whatever its own stack held, for a display that has
+     * nothing to say about brightness in nits. */
+    *max_luminance = 0.0F;
+    *max_average_luminance = 0.0F;
+    *min_luminance = 0.0F;
+    return;
+  }
+
+  if (pipeline_->capabilities) {
+    auto override_types = pipeline_->capabilities->GetHdrTypesOverride();
+    if (override_types.has_value()) {
+      *types = *override_types;
+      if (GetEdid()) {
+        GetEdid()->GetHdrLuminance(max_luminance, max_average_luminance,
+                                   min_luminance);
+      }
+      return;
+    }
+  }
+
+  GetEdid()->GetHdrCapabilities(*types, max_luminance, max_average_luminance,
+                                min_luminance);
+  // TODO: pick appropriate HDR type
+  if (types->empty() && forced_color_mode_) {
+    types->emplace_back(ui::Hdr::HDR10);
+  }
+}
+
+auto HwcDisplay::IsHdcpPropertyPresent() -> bool {
+  if (IsInHeadlessMode()) {
+    return false;
+  }
+  if (!GetPipe().connector->Get()->GetContentProtectionProperty() ||
+      !GetPipe().connector->Get()->GetHdcpContentTypeProperty()) {
+    return false;
+  }
+  return true;
+}
+
+auto HwcDisplay::StartHdcp() -> bool {
+  /*
+   * Hdcp will be enabled on hotplug or client can request to start Hdcp
+   * With requests to start Hdcp, internal state is set to kDesired
+   * else the state stays as Undesired
+   * Since the HDCP Content and Content Protection prop are optional
+   * We need to make sure the connector has these properties else
+   * return a false to indicate that the request to start/stop
+   * HDCP cannot be completed.
+   */
+  if (hdcpcon_ == nullptr) {
+    ALOGE(
+        "HDCP requested, but HDCP properties not available on that "
+        "display");
+    return false;
+  }
+  ALOGI("HDCP requested to start");
+  hdcpcon_->Start();
+  return true;
+}
+
+auto HwcDisplay::StopHdcp() -> bool {
+  /*
+   * Client or Kernel can Terminate Hdcp
+   * If Client or kernel requests to terminate hdcp, internal state is set to
+   * Undesired Since the HDCP Content and Content Protection prop are optional
+   * We need to make sure the connector has these properties else
+   * return a false to indicate that the request to start/stop
+   * HDCP cannot be completed.
+   */
+  if (hdcpcon_ == nullptr) {
+    ALOGE(
+        "Client requested HDCP, but HDCP properties not available on that "
+        "display");
+    return false;
+  }
+  // Client or Kernel requested HDCP termination. Only act if HDCP is currently
+  // enabled.
+  if (hdcpcon_ &&
+      hdcpcon_->GetHdcpState() == HdcpController::HdcpState::kEnabled) {
+    ALOGI(" Client or Kernel requested to terminate HDCP");
+    hdcpcon_->Terminate();
+  }
+  return true;
+}
+
+AtomicCommitArgs HwcDisplay::CreateModesetCommit(
+    const HwcDisplayConfig *config,
+    const std::optional<LayerData> &modeset_layer) {
+  AtomicCommitArgs args{};
+
+  args.brightness = brightness_;
+  args.color_matrix = color_matrix_;
+  args.content_type = content_type_;
+  args.colorspace = colorspace_;
+  args.transfer_func = transfer_func_;
+  args.hdr_metadata = hdr_metadata_;
+  args.min_bpc = min_bpc_;
+  args.hdr_headroom = hdr_headroom_;
+
+  std::vector<LayerData> composition_layers;
+  if (modeset_layer) {
+    composition_layers.emplace_back(modeset_layer.value());
+  }
+
+  if (composition_layers.empty()) {
+    ALOGW("Attempting to create a modeset commit without a layer.");
+  }
+
+  args.display_mode = config->mode;
+  args.power_mode = PowerMode::kOn;
+  args.composition = LayerToPlaneJoiningPlan::
+      CreateLayerToPlaneJoiningPlan(GetPipe(), std::move(composition_layers));
+  ALOGW_IF(!args.composition, "No composition for blocking modeset");
+
+  return args;
+}
+
+CommitStatusOr<AtomicCommitResult> HwcDisplay::ExecuteAtomicCommit(
+    AtomicCommitArgs &a_args) const {
+  // Log successful modesets (seamless and full), including teardowns. Only
+  // those are timed: an ordinary frame has nothing to log.
+  const bool is_config_change = a_args.display_mode || a_args.power_mode ||
+                                a_args.teardown;
+  const int64_t commit_start_time =
+      is_config_change ? GetTimeMonotonicNs() : 0;
+  const auto status_or_result = GetPipe()
+                                    .device->GetAtomicCommitSink()
+                                    .ExecuteAtomicCommit(
+                                        {{GetPipe().atomic_state_manager.get(),
+                                          a_args}});
+  const int64_t commit_end_time = is_config_change ? GetTimeMonotonicNs() : 0;
+
+  if (is_config_change) {
+    LogConfigResult(a_args, status_or_result.IsSuccess(),
+                    commit_end_time - commit_start_time);
+  }
+
+  const auto &res = status_or_result.GetValue();
+  if (!res.has_value()) {
+    return CommitStatusOr<AtomicCommitResult>(status_or_result.GetStatus());
+  }
+
+  ALOGE_IF(res->size() > 1,
+           "More than one result returned for a singular display");
+  if (res->empty()) {
+    return CommitStatusOr<AtomicCommitResult>(CommitStatus::InternalFailure());
+  }
+  if (res->front().first != GetPipe().atomic_state_manager.get()) {
+    ALOGE("Results are for a different state manager.");
+    return CommitStatusOr<AtomicCommitResult>(CommitStatus::InternalFailure());
+  }
+  return CommitStatusOr<AtomicCommitResult>(res->front().second);
+}
+
+void HwcDisplay::WaitForPresentTime(int64_t present_time,
+                                    uint32_t vsync_period_ns) {
+  const int64_t current_time = GetTimeMonotonicNs();
+  int64_t next_vsync_time = vsync_worker_->GetNextVsyncTimestamp(current_time);
+
+  int64_t vsync_after_present_time = vsync_worker_->GetNextVsyncTimestamp(
+      present_time);
+  int64_t vsync_before_present_time = vsync_after_present_time -
+                                      vsync_period_ns;
+
+  // Check if |present_time| is closer to the expected vsync before or after.
+  int64_t desired_vsync = (vsync_after_present_time - present_time) <
+                                  (present_time - vsync_before_present_time)
+                              ? vsync_after_present_time
+                              : vsync_before_present_time;
+
+  // Don't sleep if desired_vsync is before or nearly equal to vsync_period of
+  // the next expected vsync.
+  const int64_t quarter_vsync_period = vsync_period_ns / 4;
+  if ((desired_vsync - next_vsync_time) < quarter_vsync_period) {
+    return;
+  }
+
+  // Sleep until 75% vsync_period before the desired_vsync.
+  int64_t sleep_until = desired_vsync - (quarter_vsync_period * 3);
+
+  ATRACE_NAME("WaitForPresentTime");
+
+  /* Built only when a tracer is attached: the string cost every timed
+   * present a few microseconds even with nobody listening. */
+  if (ATRACE_ENABLED()) {
+    // NOLINTBEGIN
+    std::stringstream oss;
+    oss << "current_time: " << current_time
+        << " next_vsync_time: " << next_vsync_time << " (rel "
+        << ((next_vsync_time - current_time) / 1000000.00) << "ms)"
+        << " desired_vsync: " << desired_vsync << " (rel "
+        << ((desired_vsync - current_time) / 1000000.00) << "ms)"
+        << " vsync_period_ns: " << vsync_period_ns
+        << " sleep_until: " << sleep_until << " (rel "
+        << ((sleep_until - current_time) / 1000000.00) << "ms)";
+    ATRACE_INSTANT(oss.str().c_str());
+    // NOLINTEND
+  }
+
+  struct timespec sleep_until_ts{};
+  constexpr int64_t kOneSecondNs = 1LL * 1000 * 1000 * 1000;
+  sleep_until_ts.tv_sec = int(sleep_until / kOneSecondNs);
+  sleep_until_ts.tv_nsec = int(sleep_until -
+                               (sleep_until_ts.tv_sec * kOneSecondNs));
+  // NOLINTNEXTLINE(misc-include-cleaner)
+  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &sleep_until_ts, nullptr);
+}
+
+uint32_t HwcDisplay::GetCurrentVsyncPeriodNs() const {
+  const HwcDisplayConfig *config = GetCurrentConfig();
+  if (config == nullptr) {
+    return 0;
+  }
+  return config->mode.GetVSyncPeriodNs();
+}
+
+uint32_t HwcDisplay::GetRunningVsyncPeriodNs() const {
+  if (vsync_worker_) {
+    const uint32_t running = vsync_worker_->GetVsyncPeriodNs();
+    if (running != 0)
+      return running;
+  }
+  return GetCurrentVsyncPeriodNs();
+}
+
+CommitStatus HwcDisplay::TestComposition(
+    CompositionPlanner::ValidatedComposition &composition) const {
+  ATRACE_CALL();
+
+  if (IsInHeadlessMode()) {
+    return CommitStatus::Success();
+  }
+
+  PrepareCompositionForCommit(composition);
+  auto a_args = CreateFrameUpdateCommit(composition);
+  if (!a_args) {
+    return CommitStatus::InternalFailure();
+  }
+
+  const auto result = GetPipe().device->GetAtomicCommitSink().TestAtomicCommit(
+      {{GetPipe().atomic_state_manager.get(), *a_args}});
+  if (result.success) {
+    // Put the composition plan into the newly-validated composition. Its owner
+    // is responsible for keeping it alive until commit.
+    composition.composition_plan = a_args->composition;
+  }
+
+  return result;
+}
+
+void HwcDisplay::PrepareCompositionForCommit(
+    CompositionPlanner::ValidatedComposition &composition) const {
+  UpdateClientTargetIfNeeded(client_layer_, composition.composition_plan.get());
+}
+
+std::optional<AtomicCommitArgs> HwcDisplay::CreateFrameUpdateCommit(
+    const CompositionPlanner::ValidatedComposition &composition) const {
+  if (IsInHeadlessMode()) {
+    ALOGE("%s: Display is in headless mode, should never reach here", __func__);
+    return AtomicCommitArgs{};
+  }
+
+  AtomicCommitArgs a_args;
+  a_args.brightness = brightness_;
+  a_args.color_matrix = color_matrix_;
+  a_args.content_type = content_type_;
+  a_args.colorspace = colorspace_;
+  a_args.transfer_func = transfer_func_;
+  a_args.hdr_metadata = hdr_metadata_;
+  a_args.min_bpc = min_bpc_;
+  a_args.hdr_headroom = hdr_headroom_;
+
+  if (staged_mode_config_id_ &&
+      staged_mode_change_time_ <= GetTimeMonotonicNs()) {
+    const auto *staged_config = GetConfig(staged_mode_config_id_.value());
+    if (staged_config == nullptr) {
+      return std::nullopt;
+    }
+
+    a_args.display_mode = staged_config->mode;
+    a_args.seamless = true;
+  }
+
+  auto hdcp_state = hdcpcon_ ? hdcpcon_->GetHdcpState()
+                             : HdcpController::HdcpState::kUndesired;
+  if (hdcp_state == HdcpController::HdcpState::kDesired) {
+    a_args.content_protection = ContentProtection::kDesired;
+    a_args.hdcp_content_type = HdcpContentType::kType1;
+  }
+  if (hdcp_state == HdcpController::HdcpState::kRetry) {
+    a_args.content_protection = ContentProtection::kDesired;
+    a_args.hdcp_content_type = HdcpContentType::kType0;
+  }
+
+  a_args.composition = composition.composition_plan
+                           ? composition.composition_plan
+                           : CreateLayerToPlaneJoiningPlan(
+                                 composition.composition_types);
+  if (!a_args.composition) {
+    return std::nullopt;
+  }
+
+  const bool all_client_layers = a_args.composition->client_index &&
+                                 a_args.composition->plan.size() == 1;
+  // On a frame composed entirely by the GPU, SurfaceFlinger applies the
+  // client's transform itself -- whenever there is no device composition
+  // and no claimed SKIP_CLIENT_COLOR_TRANSFORM capability -- so only the
+  // render intent's share may go to the display, or the frame is tinted
+  // twice. With the capability claimed the client never applies anything,
+  // and the display owns the transform on every frame alike.
+  if (all_client_layers && !Properties::CmuColorPipeline()) {
+    a_args.color_matrix = render_intent_matrix_;
+  }
+
+  // Whether a client CTM with an offset reaches the display is the
+  // controller's answer, and CtmByGpu already asks it per trait: the DRM
+  // CTM property has no addend, so there only the render intent's share
+  // may go down. Substituting unconditionally here silently contradicted
+  // that answer on a controller whose matrix stage does take an addend --
+  // the inversion matrix (offset column 1,1,1) was dropped on this side
+  // while the claimed SKIP_CLIENT_COLOR_TRANSFORM kept the client from
+  // ever applying it, so it applied nowhere.
+  if (client_ctm_has_offset_ && !UseColorPipeline() &&
+      !GetPipe().crtc->Get()->SupportsCtmOffset()) {
+    a_args.color_matrix = render_intent_matrix_;
+  }
+
+  if (pipeline_->writeback_connector) {
+    if (!writeback_layer_->IsLayerUsableAsDevice()) {
+      ALOGE("Writeback layer not usable by DRM/KMS - no valid buffer set");
+      return std::nullopt;
+    }
+    a_args.writeback_fb = writeback_layer_->GetLayerData().fb;
+    a_args.writeback_release_fence = writeback_layer_->GetLayerData()
+                                         .acquire_fence;
+  }
+  return a_args;
+}
+
+std::unique_ptr<LayerToPlaneJoiningPlan>
+HwcDisplay::CreateLayerToPlaneJoiningPlan(
+    const CompositionPlanner::CompositionTypeMap &composition_types) const {
+  std::optional<uint32_t> client_z_order;
+  bool client_range_live = false;
+  std::map<uint32_t, const HwcLayer *> z_map;
+  std::optional<LayerData> cursor_layer = std::nullopt;
+  for (const auto &[_, layer] : layers_) {
+    auto it = composition_types.find(&layer);
+    CompositionType type = it != composition_types.end()
+                               ? it->second
+                               : CompositionType::kInvalid;
+    switch (type) {
+      case CompositionType::kDevice:
+        z_map.emplace(layer.GetZOrder(), &layer);
+        break;
+      case CompositionType::kCursor:
+        if (!cursor_layer.has_value()) {
+          cursor_layer = layer.GetLayerData();
+        } else {
+          ALOGW("Detected multiple cursor layers");
+          z_map.emplace(layer.GetZOrder(), &layer);
+        }
+        break;
+      case CompositionType::kClient:
+        // Place it at the z_order of the lowest client layer
+        client_z_order = std::min(client_z_order.value_or(UINT32_MAX),
+                                  layer.GetZOrder());
+        client_range_live = client_range_live || layer.IsLive();
+        break;
+      case CompositionType::kDeviceOccluded:
+        // Occluded layers are neither client nor device composited. Since they
+        // are not visible, their absence should not have an impact on the
+        // correctness of the displayed frame.
+        break;
+      case CompositionType::kSolidColor:
+        // Skip solid color layers
+        continue;
+      case CompositionType::kInvalid:
+        ALOGE("Invalid layer type: %d", static_cast<int>(type));
+        continue;
+    }
+  }
+
+  if (client_z_order.has_value()) {
+    z_map.emplace(client_z_order.value(), &client_layer_);
+    if (!client_layer_.IsLayerUsableAsDevice()) {
+      /* This may be normally triggered on validation of the first frame
+       * containing CLIENT layer. At this moment client buffer is not yet
+       * provided by the CLIENT.
+       * This may be triggered once in HwcLayer lifecycle in case FB can't be
+       * imported. For example when non-contiguous buffer is imported into
+       * contiguous-only DRM/KMS driver.
+       */
+      return nullptr;
+    }
+  }
+
+  ALOGW_IF(z_map.empty() && !cursor_layer.has_value(), "Empty composition");
+
+  std::vector<LayerData> composition_layers;
+
+  /* The plan is indexed by rank, and a z-order is not a rank: the cursor
+   * is sorted out of the z map while still consuming a z, so every rank
+   * above it shifts. The client entry's seat is therefore recorded here,
+   * where the rank is the position it actually takes. */
+  std::optional<int> client_plan_index;
+
+  // now that they're ordered by z, add them to the composition
+  for (const auto &[_, layer] : z_map) {
+    if (!layer->IsLayerUsableAsDevice()) {
+      return nullptr;
+    }
+    if (layer == &client_layer_)
+      client_plan_index = static_cast<int>(composition_layers.size());
+    composition_layers.emplace_back(layer->GetLayerData());
+    /* The class the layer was last judged into, for the joining plan's
+     * steering. The client target is drawn again whenever anything of the
+     * client range moves, and that is known here, at validate -- its own
+     * buffer arrives only after, so judged by its own activity it reads
+     * quiet on the first frame of every busy spell and is put in the
+     * merge, which then waits on the GPU drawing it. */
+    composition_layers.back().live =
+        layer->IsLive() || (layer == &client_layer_ && client_range_live);
+  }
+  /* The seating preference is decided here, once, with everything it
+   * needs in view: the scene, and the flattening controller's own
+   * judgement of stillness. A still multi-layer scene consolidates
+   * into the merge -- the cheaper executor taking the GPU flatten's
+   * place, the panel ending on one scanned buffer either way -- and
+   * the first live frame reseats it onto the windows through the
+   * activity invalidator, nothing held back. The entry leans on the
+   * liveness crossing arriving with the trigger frame itself; a stream
+   * of validates without layer activity would leave it mute, and on
+   * this stack no such stream exists -- every frame SurfaceFlinger
+   * sends is born of a transaction or damage that stamps activity. */
+  const bool prefer_merge = flatcon_ != nullptr && flatcon_->ShouldFlatten() &&
+                            composition_layers.size() > 1;
+
+  auto composition = LayerToPlaneJoiningPlan::
+      CreateLayerToPlaneJoiningPlan(GetPipe(), std::move(composition_layers),
+                                    std::move(cursor_layer), prefer_merge);
+  plan_consolidated_ = prefer_merge && composition != nullptr;
+  if (composition) {
+    /* The rank the client entry ended at, which the steering may have
+     * moved by lowering a drawing layer beneath the merge. */
+    if (client_plan_index)
+      composition->client_index = composition->RankOf(*client_plan_index);
+    const auto outcome = static_cast<size_t>(composition->steering);
+    if (outcome < kSteeringOutcomes) {
+      steering_outcomes_[outcome]++;
+      steering_interval_[outcome]++;
+    }
+  }
+  return composition;
+}
+
+std::string HwcDisplay::DumpGroupSelector() const {
+  /* In enum order. The fallback reasons are the interesting half: they
+   * say whether first-fit frames are the table's size (lives overflow),
+   * the scene's shape (run too long), or nothing to steer at all. */
+  static const char *const kOutcomeNames[kSteeringOutcomes] =
+      {"steered", "fits ordinary", "monotone", "run too long",
+       "lives overflow", "seat refused", "mixed turn"};
+  std::stringstream ss;
+  ss << "Group selector            :";
+  for (size_t i = 0; i < kSteeringOutcomes; i++) {
+    ss << (i > 0 ? ", " : " ") << kOutcomeNames[i] << " "
+       << steering_outcomes_[i];
+  }
+  ss << "\n" << "  since last dumpsys      :";
+  for (size_t i = 0; i < kSteeringOutcomes; i++) {
+    ss << (i > 0 ? ", " : " ") << kOutcomeNames[i] << " "
+       << steering_interval_[i];
+    steering_interval_[i] = 0;
+  }
+  ss << "\n";
+  for (const auto &[id, layer] : layers_) {
+    ss << "  layer z=" << layer.GetZOrder() << "             : "
+       << (layer.IsLive() ? "live" : "quiet") << "\n";
+  }
+  return ss.str();
+}
+
+std::string HwcDisplay::DumpGpuDrops() const {
+  std::stringstream ss;
+  ss << "GPU executor              : dropped " << gpu_dropped_;
+  return ss.str();
+}
+
+std::string HwcDisplay::DumpColorBridge() const {
+  std::stringstream ss;
+  ss << "Colour bridge             : profile saturation "
+     << profile_saturation_ << ", intent queries " << render_intent_queries_
+     << ", mode sets " << color_mode_sets_;
+  if (color_mode_sets_ > 0) {
+    ss << ", last mode " << last_color_mode_ << " intent "
+       << last_render_intent_;
+  }
+  ss << ", intent matrix "
+     << (render_intent_matrix_ == GetBoostedCTMPtr() ? "boost" : "identity")
+     << "\n";
+  return ss.str();
+}
+
+CommitStatus HwcDisplay::CommitStagedComposition(SharedFd &out_present_fence) {
+  ATRACE_CALL();
+
+  if (IsInHeadlessMode()) {
+    ALOGE("%s: Display is in headless mode, should never reach here", __func__);
+    return CommitStatus::Success();
+  }
+
+  if (!validated_composition_.has_value()) {
+    ALOGE("%s: No composition is staged. Cannot commit.", __func__);
+    return CommitStatus::InternalFailure();
+  }
+
+  /* Between the lock and the controller there are three steps, and the frame
+   * is known to lose several milliseconds somewhere among them: the composer's
+   * own work at the bottom -- posting the flip -- has been timed at about
+   * one, and the lock is never waited on. Timed apart
+   * so the answer names a step rather than a range -- when the log is on,
+   * the only place the answer goes. */
+  const bool timed = hwc::LoggingWanted();
+  const int64_t t0 = timed ? GetTimeMonotonicNs() : 0;
+
+  const bool gpu_drew = validated_composition_->gpu_draws_client &&
+                        DrawClientOnGpu(validated_composition_.value());
+  /* A frame the executor sat out is a frame its memory did not watch. */
+  if (!validated_composition_->gpu_draws_client)
+    gpu_memory_.Forget();
+  PrepareCompositionForCommit(validated_composition_.value());
+  const int64_t t1 = timed ? GetTimeMonotonicNs() : 0;
+
+  auto a_args = CreateFrameUpdateCommit(validated_composition_.value());
+  const int64_t t2 = timed ? GetTimeMonotonicNs() : 0;
+
+  if (a_args && !staged_composition_reused_) {
+    /* A reused composition IS the kept plan -- writing it back would copy a
+     * map onto itself sixty times a second. Skipped, and safely: if the
+     * kept plan was emptied between validate and present, the bit that
+     * emptied it forces a full validation next frame anyway. */
+    reusable_plan_ = *validated_composition_;
+    /* Dropped rather than kept: the plan holds the plane reservations, and
+     * the commit rebuilds the joining from the types it carries. */
+    reusable_plan_->composition_plan.reset();
+  }
+  // |validated_composition_| can safely be reset now. |a_args| holds its own
+  // pointer to the plan which will remain in scope until the commit is finished
+  // (successfully or not).
+  validated_composition_.reset();
+
+  if (!a_args) {
+    ALOGE("Failed to create AtomicCommitArgs for frame composition.");
+    reusable_plan_.reset();
+    MarkPlanInvalid(kAllDirty);
+    /* Given up before the flip machinery was asked -- a frame it never
+     * judged, so nothing it remembers may outlive this one. */
+    GetPipe().atomic_state_manager->NoteFrameUnjudged();
+    gpu_memory_.Forget();
+    return CommitStatus::InternalFailure();
+  }
+
+  const auto status_or_result = ExecuteAtomicCommit(*a_args);
+  const auto &result = status_or_result.GetValue();
+  if (!result.has_value()) {
+    ALOGE("Failed to commit the frame composition with err=%d",
+          status_or_result.GetStatus().error_code);
+    reusable_plan_.reset();
+    MarkPlanInvalid(kAllDirty);
+    /* Asked and refused is as unjudged as never asked -- the frame put
+     * nothing on the panel, so nothing remembered of it may outlive it. */
+    GetPipe().atomic_state_manager->NoteFrameUnjudged();
+    gpu_memory_.Forget();
+    return status_or_result.GetStatus();
+  }
+
+  const int64_t t3 = timed ? GetTimeMonotonicNs() : 0;
+
+  out_present_fence = result->present_fence;
+  if (gpu_drew)
+    GetPipe().GetGpuExecutor()->Presented(out_present_fence);
+
+  /* Kept apart from the one above, which the client may be told loosely on
+   * purpose. This one answers when a buffer comes free and cannot be. */
+  release_fence_ = result->release_fence;
+
+  /* Put by for the next frame rather than used now -- see EngineReads. */
+  engine_this_frame_ = {result->engine_fence, result->engine_read};
+
+  ApplyCommitChanges(*a_args, result.value());
+
+  const int64_t t4 = timed ? GetTimeMonotonicNs() : 0;
+  if (t4 - t0 > 3000000) {
+    HWC_LOGX("slow commit: prepare %" PRId64 "us, describe %" PRId64
+             "us, execute %" PRId64 "us, apply %" PRId64 "us",
+             (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000,
+             (t4 - t3) / 1000);
+  }
+
+  return CommitStatus::Success();
+}
+
+void HwcDisplay::ApplyCommitChanges(const AtomicCommitArgs &a_args,
+                                    const AtomicCommitResult & /*result*/) {
+  if (a_args.display_mode) {
+    // Get the vsync period before updating active_config_id.
+    uint32_t prev_vperiod_ns = GetCurrentVsyncPeriodNs();
+    vsync_worker_->SetVsyncTimestampTracking(false);
+    int64_t last_vsync_ts = vsync_worker_->GetLastVsyncTimestamp();
+    if (last_vsync_ts != 0) {
+      hwc_->SendVsyncPeriodTimingChangedEventToClient(handle_,
+                                                      last_vsync_ts +
+                                                          prev_vperiod_ns);
+    }
+
+    // If staged_mode_config_id_ is nullopt that indicates a logic error.
+    ALOGE_IF(!staged_mode_config_id_,
+             "a_args.display_mode is set but staged_mode_config_id_ is not.");
+    // Update the active_config_id and update the vsync period for the
+    // VsyncWorker.
+    active_config_id_ = staged_mode_config_id_.value_or(active_config_id_);
+    staged_mode_config_id_.reset();
+    /* A seamless change is applied by the display some time after this
+     * commit -- at the end of whichever frame it is scanning -- so the new
+     * period is reported from the first blank that runs at it, not from
+     * here. A mode set is in force when the commit returns. */
+    if (a_args.seamless)
+      vsync_worker_->ExpectVsyncPeriodNs(
+          a_args.display_mode->GetVSyncPeriodNs());
+    else
+      vsync_worker_->SetVsyncPeriodNs(a_args.display_mode->GetVSyncPeriodNs());
+  }
+
+  if (a_args.hdcp_content_type.has_value() ||
+      a_args.content_protection.has_value()) {
+    if (a_args.hdcp_content_type.has_value()) {
+      ALOGI("HDCP commit requested with Content Type %d for display %d",
+            static_cast<int>(a_args.hdcp_content_type.value()),
+            static_cast<int>(handle_));
+    }
+    hdcpcon_->Requested();
+  }
+}
+
+size_t HwcDisplay::GetNumAvailablePlanes() const {
+  return pipeline_->GetUsablePlanes().first.size();
+}
+
+size_t HwcDisplay::GetNumDirectPlanes() const {
+  const auto usable = pipeline_->GetUsablePlanes();
+  size_t direct = 0;
+  for (const auto &plane : usable.first) {
+    if (plane && !plane->Get()->IsMerging()) {
+      ++direct;
+    }
+  }
+  return direct;
+}
+
+std::shared_ptr<BindingOwner<Plane>> HwcDisplay::GetCursorPlane() const {
+  return pipeline_->GetUsablePlanes().second;
+}
+
+bool HwcDisplay::CtmByGpu() const {
+  if (client_color_matrix_ == GetIdentityCtmPtr())
+    return false;
+
+  if (UseColorPipeline())
+    return false;
+
+  /* Whether the controller takes this matrix is the controller's answer,
+   * asked per trait: a negative coefficient needs a sign, an offset column
+   * needs an addend, and not every matrix stage has either. On DRM every
+   * answer is the CTM property's presence, as before. */
+  const Crtc &crtc = *GetPipe().crtc->Get();
+  const bool sign_ok = !client_ctm_has_negative_ || crtc.SupportsSignedCtm();
+  const bool offset_ok = !client_ctm_has_offset_ || crtc.SupportsCtmOffset();
+  if (crtc.SupportsCtm() && sign_ok && offset_ok)
+    return false;
+
+  if (hwc_->GetCtmHandling() == CtmHandling::kDrmOrIgnore)
+    return false;
+
+  return true;
+}
+
+bool HwcDisplay::ForcedScalingWithGpu() const {
+  return hwc_->ForcedScalingWithGpu();
+}
+
+
+void HwcDisplay::ResolveOcclusion() {
+  /* Read once: a switch for comparing, not something to flip mid-frame. */
+  static const bool enabled = Properties::Occlusion();
+
+  std::vector<HwcLayer *> order;
+  order.reserve(layers_.size());
+  for (auto &[_, layer] : layers_)
+    order.push_back(&layer);
+
+  std::sort(order.begin(), order.end(),
+            [](const HwcLayer *lhs, const HwcLayer *rhs) {
+              return lhs->GetZOrder() < rhs->GetZOrder();
+            });
+
+  const auto size = GetSize();
+  const IRect screen{0, 0, static_cast<int32_t>(size.first),
+                     static_cast<int32_t>(size.second)};
+  std::vector<occlusion::Layer> input;
+  input.reserve(order.size());
+  for (const HwcLayer *layer : order)
+    input.push_back(layer->OcclusionInput(screen));
+
+  /* Off: every layer whole, as SurfaceFlinger set it. */
+  std::vector<occlusion::Shown> shown(input.size());
+  if (enabled)
+    shown = occlusion::Resolve(input);
+  else
+    for (size_t i = 0; i < input.size(); ++i)
+      shown[i].bounds = input[i].frame;
+  for (size_t i = 0; i < order.size(); ++i)
+    order[i]->ApplyOcclusion(shown[i]);
+
+  /* Asked for only: each layer, bottom first, as it came and as shown. */
+  using hwc::PictureCapture;
+  if (PictureCapture::Wanted(PictureCapture::Source::kOcclusion)) {
+    std::string words;
+    for (size_t i = 0; i < order.size(); ++i) {
+      const occlusion::Layer &in = input[i];
+      const auto &df = order[i]->GetLayerData().pi.display_frame.i_rect;
+      char line[192];
+      snprintf(line, sizeof(line),
+               "z %u %s%s%s frame %d,%d-%d,%d -> %s %d,%d-%d,%d sf-rects %zu "
+               "r %.1f\n",
+               order[i]->GetZOrder(), in.opaque ? "opaque" : "translucent",
+               in.keep ? " kept" : "", order[i]->IsHidden() ? " HIDDEN" : "",
+               in.frame.left, in.frame.top, in.frame.right, in.frame.bottom,
+               df && *df != in.frame ? "CROPPED" : "shown",
+               df ? df->left : 0, df ? df->top : 0, df ? df->right : 0,
+               df ? df->bottom : 0, in.visible.size(), in.radius);
+      words += line;
+    }
+    PictureCapture::WriteText(PictureCapture::Source::kOcclusion, words);
+  }
+}
+
+std::vector<const HwcLayer *> HwcDisplay::GetOrderLayersByZPos() const {
+  std::vector<const HwcLayer *> ordered_layers;
+  ordered_layers.reserve(layers_.size());
+
+  /* The planner's view: a hidden layer is nothing to place. */
+  for (const auto &[handle, layer] : layers_) {
+    if (!layer.IsHidden())
+      ordered_layers.emplace_back(&layer);
+  }
+
+  std::sort(std::begin(ordered_layers), std::end(ordered_layers),
+            [](const HwcLayer *lhs, const HwcLayer *rhs) {
+              // Cursor layers should always have highest zpos.
+              if ((lhs->GetSfType() == CompositionType::kCursor) !=
+                  (rhs->GetSfType() == CompositionType::kCursor)) {
+                return rhs->GetSfType() == CompositionType::kCursor;
+              }
+
+              return lhs->GetZOrder() < rhs->GetZOrder();
+            });
+
+  return ordered_layers;
+}
+
+// Display primary values are coded as unsigned 16-bit values in units of
+// 0.00002, where 0x0000 represents zero and 0xC350 represents 1.0000.
+static uint64_t ToU16ColorValue(float in) {
+  constexpr float kPrimariesFixedPoint = 50000.F;
+  return static_cast<uint64_t>(kPrimariesFixedPoint * in);
+}
+
+void HwcDisplay::SetHdrOutputMetadata(const ColorGamut &color_gamut,
+                                      TransferFunction transfer_function) {
+  hdr_metadata_ = std::make_shared<hdr_output_metadata>();
+  hdr_metadata_->metadata_type = 0;
+  auto *m = &hdr_metadata_->hdmi_metadata_type1;
+  m->metadata_type = 0;
+
+  switch (transfer_function) {
+    case TransferFunction::kSmpte170M:
+      m->eotf = 1;
+      transfer_func_ = transfer_function;
+      break;
+    case TransferFunction::kPq:
+      m->eotf = 2;
+      transfer_func_ = transfer_function;
+      break;
+    case TransferFunction::kHlg:
+      m->eotf = 3;
+      transfer_func_ = transfer_function;
+      break;
+    case TransferFunction::kUnknown:
+      [[fallthrough]];
+    default:
+      ALOGW("Transfer function %d is not supported.", transfer_function);
+      transfer_func_ = TransferFunction::kUnknown;
+      return;
+  }
+
+  // Most luminance values are coded as an unsigned 16-bit value in units of 1
+  // cd/m2, where 0x0001 represents 1 cd/m2 and 0xFFFF represents 65535 cd/m2.
+  std::vector<ui::Hdr> types;
+  float hdr_luminance[3]{0.F, 0.F, 0.F};
+  GetEdid()->GetHdrCapabilities(types, &hdr_luminance[0], &hdr_luminance[1],
+                                &hdr_luminance[2]);
+  m->max_display_mastering_luminance = m->max_cll = static_cast<uint64_t>(
+      hdr_luminance[0]);
+  m->max_fall = static_cast<uint64_t>(hdr_luminance[1]);
+  // The min luminance value is coded as an unsigned 16-bit value in units of
+  // 0.0001 cd/m2, where 0x0001 represents 0.0001 cd/m2 and 0xFFFF
+  // represents 6.5535 cd/m2.
+  m->min_display_mastering_luminance = static_cast<uint64_t>(hdr_luminance[2] *
+                                                             10000.F);
+
+  auto primaries = color_gamut.getPrimaries();
+  m->display_primaries[0].x = ToU16ColorValue(primaries[0].x);
+  m->display_primaries[0].y = ToU16ColorValue(primaries[0].y);
+  m->display_primaries[1].x = ToU16ColorValue(primaries[1].x);
+  m->display_primaries[1].y = ToU16ColorValue(primaries[1].y);
+  m->display_primaries[2].x = ToU16ColorValue(primaries[2].x);
+  m->display_primaries[2].y = ToU16ColorValue(primaries[2].y);
+
+  auto whitePoint = color_gamut.getWhitePoint();
+  m->white_point.x = ToU16ColorValue(whitePoint.x);
+  m->white_point.y = ToU16ColorValue(whitePoint.y);
+}
+
+
+std::optional<LayerData> HwcDisplay::GetModesetLayerData(
+    const HwcDisplayConfig *new_config) {
+  const uint32_t new_width = new_config->mode.GetRawMode().hdisplay;
+  const uint32_t new_height = new_config->mode.GetRawMode().vdisplay;
+
+  const HwcDisplayConfig *active_config = GetCurrentConfig();
+  if (client_layer_.IsLayerUsableAsDevice() && active_config &&
+      // Reuse the client layer only when the CRTC is already active. After a
+      // teardown (power-off), the cached buffer may contain stale content that
+      // we do not want to rescan on modeset.
+      GetPipe().atomic_state_manager->IsActive() &&
+      active_config->mode.GetRawMode().hdisplay == new_width &&
+      active_config->mode.GetRawMode().vdisplay == new_height) {
+    ALOGV("Use existing client_layer for config.");
+    return client_layer_.GetLayerData();
+  }
+
+  ALOGV("Allocate modeset buffer.");
+  std::optional<BufferInfo>
+      modeset_buffer = GetPipe().device->CreateBufferForModeset(new_width,
+                                                                new_height);
+  if (!modeset_buffer)
+    return std::nullopt;
+
+  auto modeset_layer = std::make_unique<HwcLayer>(this);
+  modeset_layer->SetLayerProperties({
+      .buffer = std::optional<HwcLayer::Buffer>({
+          .bi = modeset_buffer.value(),
+          .fb = GetPipe().importer->GetOrCreateFbId(&modeset_buffer.value()),
+          .fence = {},
+      }),
+      .blend_mode = BufferBlendMode::kNone,
+  });
+
+  return modeset_layer->GetLayerData();
+}
+
+void HwcDisplay::SetConfigGroupsForActiveConfig() {
+  const auto *active_config = GetCurrentConfig();
+  if (!active_config) {
+    ALOGW("Could not fetch active config for config group assignment.");
+    return;
+  }
+
+  const std::optional<LayerData> modeset_layer_data = GetModesetLayerData(
+      active_config);
+  for (auto &[_, config] : configs_.hwc_configs) {
+    AtomicCommitArgs commit_args = CreateModesetCommit(&config,
+                                                       modeset_layer_data);
+    commit_args.seamless = true;
+    if (GetPipe()
+            .device->GetAtomicCommitSink()
+            .TestAtomicCommit(
+                {{GetPipe().atomic_state_manager.get(), commit_args}})
+            .success) {
+      config.group_id = active_config->group_id;
+    }
+  }
+
+  configs_.SanitizeGroups();
+}
+
+std::pair<uint32_t, uint32_t> HwcDisplay::GetSize() const {
+  const auto *config = GetNextConfig();
+  if (config == nullptr) {
+    return std::make_pair(0, 0);
+  }
+  return std::make_pair(config->mode.GetRawMode().hdisplay,
+                        config->mode.GetRawMode().vdisplay);
+}
+
+auto HwcDisplay::SetBrightness(float brightness) -> bool {
+  if (!HasBacklight()) {
+    return false;
+  }
+
+  if (brightness >= 0.0F && GetPipe().connector->Get()->IsInternal()) {
+    brightness_ = brightness;
+    return backlight_controller_->SetBrightness(
+        std::optional<float>(brightness));
+  }
+
+  brightness_ = kBrightnessUnset;
+  return backlight_controller_->SetBrightness(std::nullopt);
+}
+
+void HwcDisplay::LogModesOnHotplug() {
+  if (!display_mode_reporter_) {
+    return;
+  }
+
+  const HwcDisplay::DisplayType display_type = GetDisplayType();
+  if (display_type != HwcDisplay::DisplayType::kInternal &&
+      display_type != HwcDisplay::DisplayType::kExternal) {
+    return;
+  }
+
+  const uint32_t
+      connection_type = GetPipe().connector->Get()->GetConnectorType();
+  const bool is_mst = GetPipe().connector->Get()->IsMst();
+
+  auto vendor = EdidWrapper::VendorProductInfo{};
+  uint32_t vrr_range_min = 0;
+  uint32_t vrr_range_max = 0;
+  std::vector<ui::Hdr> hdr_types;
+  float max_luminance = 0.0F;
+  float max_average_luminance = 0.0F;
+  float min_luminance = 0.0F;
+  if (edid_wrapper_ != nullptr) {
+    vendor = edid_wrapper_->GetVendorProductInfo();
+    std::tie(vrr_range_min,
+             vrr_range_max) = edid_wrapper_->GetVerticalDisplayRangeLimits();
+    edid_wrapper_->GetHdrCapabilities(hdr_types, &max_luminance,
+                                      &max_average_luminance, &min_luminance);
+  }
+
+  using ModeAtom = DisplayHotplugConnectModeDetectedAtomReporter::Atom;
+  std::vector<ModeAtom> submitted_atoms;
+  for (const auto &[id, hwc_mode] : configs_.hwc_configs) {
+    const DrmMode &mode = hwc_mode.mode;
+    const drmModeModeInfo &raw_mode = mode.GetRawMode();
+    const bool is_preferred = (raw_mode.type & DRM_MODE_TYPE_PREFERRED) != 0;
+
+    constexpr float kMmPerInch = 25.4;
+    const auto [width_mm, height_mm] = GetDisplayBoundsMm();
+    int32_t dpi_x = -1;
+    if (width_mm > 0) {
+      dpi_x = static_cast<int32_t>(
+          lround((static_cast<float>(raw_mode.hdisplay) * kMmPerInch) /
+                 static_cast<float>(width_mm)));
+    }
+    int32_t dpi_y = dpi_x;
+    if (height_mm > 0) {
+      dpi_y = static_cast<int32_t>(
+          lround((static_cast<float>(raw_mode.vdisplay) * kMmPerInch) /
+                 static_cast<float>(height_mm)));
+    }
+
+    using AtomDisplayType = DisplayHotplugConnectModeDetectedAtomReporter::
+        DisplayType;
+    const ModeAtom atom =
+        {.display_handle = handle_,
+         .resolution_x = raw_mode.hdisplay,
+         .resolution_y = raw_mode.vdisplay,
+         .refresh_rate = static_cast<int32_t>(lround(mode.GetVRefresh())),
+         .dpi_x = dpi_x,
+         .dpi_y = dpi_y,
+         .display_type = display_type == HwcDisplay::DisplayType::kInternal
+                             ? AtomDisplayType::kInternal
+                             : AtomDisplayType::kExternal,
+         .is_preferred = is_preferred,
+         .make = vendor.make,
+         .model = vendor.model,
+         .year = vendor.year,
+         .hdr_types = hdr_types,
+         .max_luminance = max_luminance,
+         .max_average_luminance = max_average_luminance,
+         .min_luminance = min_luminance,
+         .connection_type = connection_type,
+         .has_path = is_mst,
+         .vrr_range_min = vrr_range_min,
+         .vrr_range_max = vrr_range_max};
+
+    if (std::find(submitted_atoms.begin(), submitted_atoms.end(), atom) !=
+        submitted_atoms.end()) {
+      continue;
+    }
+
+    display_mode_reporter_->PushAtom(atom);
+    submitted_atoms.push_back(atom);
+  }
+}
+
+void HwcDisplay::LogConfigResult(const AtomicCommitArgs &args, bool is_success,
+                                 int64_t duration_ns) const {
+  if (!config_result_reporter_) {
+    return;
+  }
+
+  DisplayConfigurationResultReporter::DisplayType
+      display_type = DisplayConfigurationResultReporter::DisplayType::
+          kUnspecified;
+  switch (GetDisplayType()) {
+    case HwcDisplay::DisplayType::kInternal:
+      display_type = DisplayConfigurationResultReporter::DisplayType::kInternal;
+      break;
+    case HwcDisplay::DisplayType::kExternal:
+      display_type = DisplayConfigurationResultReporter::DisplayType::kExternal;
+      break;
+    default:
+      display_type = DisplayConfigurationResultReporter::DisplayType::
+          kUnspecified;
+      break;
+  }
+
+  const DisplayConfigurationResultReporter::Atom atom{
+      .display_handle = handle_,
+      .success = is_success,
+      .is_seamless = args.seamless,
+      .display_type = display_type,
+      .is_blocking = args.blocking,
+      .is_display_mode = args.display_mode.has_value(),
+      .is_power_mode = args.power_mode.has_value(),
+      .is_teardown = args.teardown,
+      .duration_ns = duration_ns,
+  };
+  config_result_reporter_->PushAtom(atom);
+}
+
+bool HwcDisplay::CursorPlaneNeedsColorPipeline(
+    const HwcLayer &cursor_layer) const {
+  if (!UseColorPipeline()) {
+    return false;
+  }
+
+  const HwcColorspace cursor_colorspace = cursor_layer.GetLayerData()
+                                              .colorspace;
+  CscCache cursor_color_map;
+  auto cursor_matrix = ColorUtil::GamutAdjustIfNeeded<
+      drm_color_ctm_3x4>(cursor_colorspace, colorspace_, color_matrix_,
+                         cursor_color_map);
+
+  if (!cursor_matrix) {
+    return false;
+  }
+
+  static const auto identity_3x4 = ColorUtil::ToColorTransform3x4(
+      GetIdentityCtmPtr());
+
+  return (memcmp(cursor_matrix->matrix, identity_3x4->matrix,
+                 sizeof(identity_3x4->matrix)) != 0);
+}
+
+}  // namespace android::drm_hwcomposer

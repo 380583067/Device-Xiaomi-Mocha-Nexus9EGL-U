@@ -1,0 +1,389 @@
+/*
+ * Copyright (C) 2022 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "LayerToPlaneJoiningPlan.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include "compositor/LayerData.h"
+#include "compositor/MergeGroup.h"
+#include "display/DisplayPipeline.h"
+#include "display/Plane.h"
+
+namespace android::drm_hwcomposer {
+
+namespace {
+
+using PlaneRef = std::shared_ptr<BindingOwner<Plane>>;
+
+/* Whether two layers may share one merge pass. The engine has a single
+ * transform for the whole configuration, applied to every source it is
+ * told to read: a mixed group would turn a member that was not asked.
+ * One helper, because two copies of this question had already drifted. */
+bool SharesTurn(const LayerTransform &a, const LayerTransform &b) {
+  return a.hflip == b.hflip && a.vflip == b.vflip && a.rotate90 == b.rotate90;
+}
+
+/* The first fit: each layer takes the first remaining plane that can
+ * show it, and a plane once passed is never offered again. With the
+ * merging planes listed last, whatever fails to find an ordinary plane
+ * falls into the merge and everything above it follows -- the merge
+ * takes the top of the stack, whether or not the top is where the
+ * drawing is. */
+bool PlaceFirstFit(LayerToPlaneJoiningPlan &plan,
+                   const std::vector<PlaneRef> &avail_planes,
+                   std::vector<LayerData> &composition) {
+  auto first_avail_plane = avail_planes.begin();
+  for (auto &dhl : composition) {
+    // Consume avail_planes until a valid plane is found for the layer.
+
+    const auto suitable_plane = std::find_if(first_avail_plane,
+                                             avail_planes.end(),
+                                             [&dhl, &plan](const auto &plane) {
+                                               if (!plane->Get()->IsValidForLayer(
+                                                       &dhl))
+                                                 return false;
+                                               if (!plane->Get()->IsMerging())
+                                                 return true;
+                                               for (const auto &joining : plan.plan) {
+                                                 if (joining.plane->Get()
+                                                         ->IsMerging() &&
+                                                     !SharesTurn(dhl.pi.transform,
+                                                                 joining.layer.pi
+                                                                     .transform))
+                                                   return false;
+                                               }
+                                               return true;
+                                             });
+    if (suitable_plane == avail_planes.end()) {
+      return false;
+    }
+    plan.plan.emplace_back(std::move(dhl), *suitable_plane,
+                           static_cast<int>(plan.plan.size()));
+
+    first_avail_plane = suitable_plane + 1;
+  }
+  return true;
+}
+
+/* The steering the merge has waited for. The window that holds a merged
+ * buffer can only take a contiguous run of the stack, and the first fit
+ * always hands it the top -- where popups and animations live, so the
+ * engine redraws the group on every frame of exactly the scenes that
+ * are busiest. Steering gives the merge a contiguous run of the needed
+ * width carrying the fewest drawing layers instead, wherever in the
+ * stack it lies, and seats the drawing layers in windows of their own:
+ * the group's content then holds still, the merge cache answers every
+ * frame, and the engine sleeps through the animation.
+ *
+ * Only worth doing when a merge is unavoidable and the scene is mixed;
+ * anything else falls through to the first fit, as does any layout this
+ * one cannot seat -- a drawing layer the windows cannot take, or a
+ * scene that wants to put more layers into the merge than it takes in
+ * one pass. Nothing is moved until the whole
+ * seating is known to work, so falling through costs a walk, not a
+ * frame. */
+bool PlaceSteered(LayerToPlaneJoiningPlan &plan,
+                  const std::vector<PlaneRef> &avail_planes,
+                  std::vector<LayerData> &composition, bool prefer_merge) {
+  using Steering = LayerToPlaneJoiningPlan::Steering;
+
+  size_t ordinary_count = 0;
+  size_t merging_count = 0;
+  for (const auto &plane : avail_planes) {
+    if (plane->Get()->IsMerging()) {
+      merging_count++;
+    } else {
+      ordinary_count++;
+    }
+  }
+
+  /* A scene the ordinary planes can hold whole should not pay an engine
+   * pass for tidiness -- unless the door says the tidiness is the point:
+   * a turned scene held whole by the windows pays the column reader's
+   * way every vsync, and the door exists to price that against the
+   * pass. */
+  if (merging_count == 0 ||
+      (!prefer_merge && composition.size() <= ordinary_count)) {
+    plan.steering = Steering::kFitsOrdinary;
+    return false;
+  }
+
+  bool any_live = false;
+  bool any_quiet = false;
+  for (const auto &dhl : composition) {
+    (dhl.live ? any_live : any_quiet) = true;
+  }
+  /* All quiet or all drawing: no run is better than any other, and the
+   * first fit's shape is as good as shapes get. */
+  if (!any_live || !any_quiet) {
+    plan.steering = Steering::kMonotone;
+    return false;
+  }
+
+  /* A contiguous run of exactly the needed width, carrying the fewest
+   * drawing layers; ties go to the lower run, where wallpaper and
+   * application -- the natural group -- sit.
+   *
+   * The width is fixed: adding a layer to the run can never lower the
+   * number of live layers it holds, so the minimum is always reached at
+   * the minimum width, and a wider run cannot win. And a run one member
+   * wider would have stolen that member a window for no gain -- a direct
+   * window is cheaper than the merge. Hence one pass instead of a
+   * search.
+   *
+   * This leaves exactly as many layers outside the run as there are
+   * ordinary windows. If one of those fails to seat, the whole seating
+   * fails and everything falls to the first fit, exactly as today. A
+   * wider run would have pulled the troublesome layer into the merge and
+   * saved the layout. Widening is trivial -- repeat the search one layer
+   * wider, up to the merge's limit -- and is deliberately not done: the
+   * seating-refusal counter in the field is steady at zero.
+   *
+   * The only honest refusal left is wanting to put more layers into the
+   * merge than it takes in one pass. */
+  /* With the door open the width flips its meaning: not the overflow
+   * the windows could not take, but the most the merge will hold --
+   * the remainder, not the run, goes to the windows. */
+  const size_t need = prefer_merge
+                          ? std::min(composition.size(), merging_count)
+                          : composition.size() - ordinary_count;
+  if (need > merging_count) {
+    plan.steering = Steering::kRunTooLong;
+    return false;
+  }
+
+  const size_t run_len = need;
+  auto run_uniform = [&](size_t begin) {
+    const LayerTransform &t = composition[begin].pi.transform;
+    for (size_t i = 1; i < run_len; i++) {
+      if (!SharesTurn(composition[begin + i].pi.transform, t))
+        return false;
+    }
+    return true;
+  };
+
+  /* What the merge would push for one member: the larger of the pixels
+   * it reads and the pixels it writes, in the axes it writes them. */
+  const auto pixels_of = [](const LayerData &dhl) -> uint64_t {
+    const float w = dhl.bi ? static_cast<float>(dhl.bi->width) : 0.F;
+    const float h = dhl.bi ? static_cast<float>(dhl.bi->height) : 0.F;
+    const auto e = dhl.pi.ExtentsInDestAxes(w, h);
+    const float src = e.src_w > 0 && e.src_h > 0 ? e.src_w * e.src_h : 0.F;
+    const float dst = e.dst_w > 0 && e.dst_h > 0 ? e.dst_w * e.dst_h : 0.F;
+    return static_cast<uint64_t>(src > dst ? src : dst);
+  };
+  const auto scale_pct_of = [](const LayerData &dhl) -> uint32_t {
+    const float w = dhl.bi ? static_cast<float>(dhl.bi->width) : 0.F;
+    const float h = dhl.bi ? static_cast<float>(dhl.bi->height) : 0.F;
+    const auto e = dhl.pi.ExtentsInDestAxes(w, h);
+    if (e.src_w <= 0 || e.src_h <= 0)
+      return 100;
+    const float sx = e.dst_w / e.src_w;
+    const float sy = e.dst_h / e.src_h;
+    return static_cast<uint32_t>((sx > sy ? sx : sy) * 100.F + 0.5F);
+  };
+  /* Whether a run could be seated: the run's members in merging planes,
+   * everything else in ordinary ones, each plane offered once, in
+   * order -- the same walk the chosen run is seated by below. */
+  const auto seatable = [&](size_t begin) {
+    auto ordinary_it = avail_planes.begin();
+    auto merging_it = avail_planes.begin();
+    for (size_t i = 0; i < composition.size(); i++) {
+      const bool merged = i >= begin && i < begin + run_len;
+      const auto *dhl = &composition[i];
+      const auto fits = [merged, dhl](const PlaneRef &plane) {
+        return plane->Get()->IsMerging() == merged &&
+               plane->Get()->IsValidForLayer(dhl);
+      };
+      auto &it = merged ? merging_it : ordinary_it;
+      it = std::find_if(it, avail_planes.end(), fits);
+      if (it == avail_planes.end())
+        return false;
+      ++it;
+    }
+    return true;
+  };
+  const auto record = [&](size_t begin, size_t live) {
+    LayerToPlaneJoiningPlan::Run run;
+    run.begin = begin;
+    run.live = live;
+    for (size_t i = 0; i < run_len; i++) {
+      const LayerData &member = composition[begin + i];
+      run.pixels += pixels_of(member);
+      const uint32_t s = scale_pct_of(member);
+      if (s > run.scale_pct)
+        run.scale_pct = s;
+    }
+    run.seatable = seatable(begin);
+    plan.runs.push_back(run);
+  };
+  plan.run_len = run_len;
+
+  /* The contiguous runs, for the record: what the steering could have
+   * had without moving anything. */
+  size_t live_here = 0;
+  for (size_t i = 0; i < run_len; i++)
+    if (composition[i].live)
+      live_here++;
+  if (run_uniform(0))
+    record(0, live_here);
+  for (size_t i = run_len; i < composition.size(); i++) {
+    if (composition[i - run_len].live)
+      live_here--;
+    if (composition[i].live)
+      live_here++;
+    if (run_uniform(i - run_len + 1))
+      record(i - run_len + 1, live_here);
+  }
+
+  /* The group itself, which need not be contiguous as the stack came: a
+   * drawing layer between quiet ones -- the taskbar between the status
+   * bar and the screen decorations, say -- is lowered beneath the group
+   * when it covers none of the members it passes, so the quiet members
+   * hold still together and the cache answers every frame while the
+   * drawing layer takes a window of its own. Overlapping layers never
+   * change order, so the panel shows the same picture. */
+  std::vector<GroupMember> members;
+  members.reserve(composition.size());
+  for (const auto &dhl : composition) {
+    GroupMember m;
+    m.live = dhl.live;
+    if (const auto &r = dhl.pi.display_frame.i_rect)
+      m.frame = GroupMember::Frame{r->left, r->top, r->right, r->bottom};
+    const LayerTransform &t = dhl.pi.transform;
+    m.turn = (t.hflip ? 1U : 0U) | (t.vflip ? 2U : 0U) |
+             (t.rotate90 ? 4U : 0U);
+    members.push_back(m);
+  }
+  const auto group = ChooseMergeGroup(members, run_len);
+  if (!group) {
+    plan.steering = Steering::kMixedTurn;
+    return false;
+  }
+
+  if (group->lowered != 0) {
+    std::vector<LayerData> reordered;
+    reordered.reserve(composition.size());
+    for (size_t input : group->order)
+      reordered.push_back(std::move(composition[input]));
+    composition = std::move(reordered);
+    plan.rank_of_input.assign(composition.size(), 0);
+    for (size_t rank = 0; rank < group->order.size(); rank++)
+      plan.rank_of_input[group->order[rank]] = static_cast<int>(rank);
+    record(group->begin, group->live);
+    plan.runs.back().lowered = group->lowered;
+    plan.chosen_run = plan.runs.size() - 1;
+  } else {
+    for (size_t r = 0; r < plan.runs.size(); r++)
+      if (plan.runs[r].begin == group->begin)
+        plan.chosen_run = r;
+  }
+  const size_t run_begin = group->begin;
+
+  /* Seat everything tentatively -- the plan's z comes from position in
+   * the plan, not from which window shows a layer, so the quiet run may
+   * sit anywhere in the stack while the windows around it take the
+   * drawing layers. Each class keeps the first fit's own rule inside
+   * itself: a plane once passed is never offered again. */
+  std::vector<PlaneRef> seats;
+  seats.reserve(composition.size());
+  auto ordinary_it = avail_planes.begin();
+  auto merging_it = avail_planes.begin();
+  for (size_t i = 0; i < composition.size(); i++) {
+    const bool merged = i >= run_begin && i < run_begin + run_len;
+    const auto *dhl = &composition[i];
+    const auto fits = [merged, dhl](const PlaneRef &plane) {
+      return plane->Get()->IsMerging() == merged &&
+             plane->Get()->IsValidForLayer(dhl);
+    };
+    auto &it = merged ? merging_it : ordinary_it;
+    it = std::find_if(it, avail_planes.end(), fits);
+    if (it == avail_planes.end()) {
+      plan.steering = Steering::kSeatRefused;
+      return false;
+    }
+    seats.push_back(*it);
+    ++it;
+  }
+
+  for (size_t i = 0; i < composition.size(); i++) {
+    plan.plan.emplace_back(std::move(composition[i]), std::move(seats[i]),
+                           static_cast<int>(plan.plan.size()));
+  }
+  plan.steering = Steering::kSteered;
+  return true;
+}
+
+}  // namespace
+
+auto LayerToPlaneJoiningPlan::CreateLayerToPlaneJoiningPlan(
+    const DisplayPipeline &pipe, std::vector<LayerData> composition,
+    std::optional<LayerData> cursor_layer, bool prefer_merge)
+    -> std::unique_ptr<LayerToPlaneJoiningPlan> {
+  auto [avail_planes, cursor_plane] = pipe.GetUsablePlanes();
+
+  /* Where the merging planes sit in the queue -- and how wide a run the
+   * steering asks of them -- IS the seating policy: by default they
+   * catch only what the windows cannot take. The preference itself is
+   * decided by the caller, in one place; this only carries it out --
+   * the steering widens its run to the merge's capacity, and the
+   * first-fit queue puts the merging planes first for whatever falls
+   * through. No judgement moves: validity and the group's uniform-turn
+   * veto still rule, and unasked, the plan is exactly as the pipeline
+   * dealt it. */
+  if (prefer_merge) {
+    std::stable_partition(avail_planes.begin(), avail_planes.end(),
+                          [](const PlaneRef &plane) {
+                            return plane->Get()->IsMerging();
+                          });
+  }
+
+  if (cursor_layer) {
+    if (!cursor_plane ||
+        !cursor_plane->Get()->IsValidForLayer(&cursor_layer.value())) {
+      // Cursor plane can't be used. The cursor layer may need to fallback to
+      // device or client composition.
+      return {};
+    }
+  }
+
+  auto plan = std::make_unique<LayerToPlaneJoiningPlan>();
+  plan->plan.reserve(composition.size() +
+                     static_cast<size_t>(cursor_layer.has_value()));
+
+  const bool steered = PlaceSteered(*plan, avail_planes, composition,
+                                    prefer_merge);
+  if (!steered && !PlaceFirstFit(*plan, avail_planes, composition)) {
+    return {};
+  }
+
+  // Add cursor plane last to ensure it gets highest z-pos.
+  if (cursor_layer) {
+    // cursor_plane was already checked at the beginning of function.
+    plan->plan.emplace_back(std::move(cursor_layer.value()), cursor_plane,
+                            static_cast<int>(plan->plan.size()));
+  }
+
+  return plan;
+}
+
+}  // namespace android::drm_hwcomposer

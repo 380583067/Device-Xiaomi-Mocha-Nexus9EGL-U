@@ -1,0 +1,286 @@
+LOCAL_PATH := $(call my-dir)
+
+include $(CLEAR_VARS)
+
+# Named after the board rather than the device: the loader asks for
+# hwcomposer.<ro.board.platform>.so, and that is `tegra` here.
+LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+LOCAL_MODULE_RELATIVE_PATH := hw
+LOCAL_MODULE_TAGS := optional
+
+# A hardware module belongs on the vendor side, next to the service that
+# loads it.
+LOCAL_PROPRIETARY_MODULE := true
+
+LOCAL_CFLAGS := \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -std=c++17
+
+# The composer header keeps its C++ half behind these, and every user of it
+# turns them on -- the enumerations and the name-printing are what the code
+# above is written against, not the bare C typedefs.
+LOCAL_CFLAGS += \
+    -DHWC2_USE_CPP11 \
+    -DHWC2_INCLUDE_STRINGIFICATION
+
+# Per-frame tracing: what a plan contained, which descriptors went where,
+# what the hardware answered. Driven from the device tree with
+#
+#     TARGET_HWC_TRACE := true
+#
+# in BoardConfig.mk, so the decision sits with whoever is building the image
+# rather than in this repository. The calls stay compiled either way, so
+# turning tracing off cannot silently break it.
+#
+# This only decides whether the tracing is built. Whether it runs is decided
+# on the device with `setprop vendor.hwc.trace 1`, and the answer is no unless
+# asked -- a build that carries the tracing should not pay for it. See the
+# note in utils/Logging.h for what it costs when it does run.
+ifeq ($(TARGET_HWC_TRACE),true)
+LOCAL_CFLAGS += -DHWC_TRACE_ENABLED=1
+else
+LOCAL_CFLAGS += -DHWC_TRACE_ENABLED=0
+endif
+
+# Skip the VIC image compositor entirely: the mocha blob's
+# NvDdkVicCreateSession faults inside itself on this kernel's NvRm, and the
+# display pipeline carries a no-engine path anyway. Set from the device tree
+# with TARGET_HWC_NO_VIC := true.
+ifeq ($(TARGET_HWC_NO_VIC),true)
+LOCAL_CFLAGS += -DHWC_TEGRA_NO_VIC=1
+endif
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH)
+
+# Before the platform's own, and deliberately: this release ships version 2.3
+# of the composer interface and the code above expects 2.4. See compat/README
+# for why the newer header is copied whole rather than added to.
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/compat
+
+# The display controller interface is declared in the kernel's own
+# include/video/tegra_dc_ext.h. That header is GPL-2.0 and is not exported by
+# headers_install, so it is reached where it lives instead of being copied
+# here: including it leaves the licence with the kernel, while a copy in this
+# tree would drag it into an Apache-2.0 project.
+#
+# Only include/video is added, never include/ itself. The kernel's own
+# linux/ headers sit beside it and are not the ones libc means: putting the
+# parent directory on the search path shadows bionic's uapi copies, and the
+# internal versions are not even valid C++ (linux/list.h names a parameter
+# `new`). Nothing in include/video collides with a libc header name.
+LOCAL_C_INCLUDES += $(TARGET_KERNEL_SOURCE)/include/video
+
+# nvmap's interface lives in include/linux, which for the reason above is
+# never put on the search path: the one file is named outright instead. It
+# keeps everything of the kernel's own behind __KERNEL__. A copy of it once
+# had the caching flags numbered differently from the kernel, and every
+# write-combined zone slot came out cacheable.
+LOCAL_CFLAGS += -DKERNEL_NVMAP_H='"$(abspath $(TARGET_KERNEL_SOURCE))/include/linux/nvmap.h"'
+
+# Format codes, layout modifiers and the way a display timing is written down.
+# Only headers are wanted -- nothing here talks to a display through DRM,
+# because this kernel has no such driver for the display controller. It is the
+# vocabulary that is shared, not the path, and no libdrm function is called.
+#
+# Three directories rather than one: `include` for <drm/drm_fourcc.h> as this
+# tree writes it, the top level for <xf86drmMode.h>, and `include/drm` because
+# that header includes <drm.h> and <drm_mode.h> unqualified.
+LOCAL_C_INCLUDES += \
+    external/libdrm \
+    external/libdrm/include \
+    external/libdrm/include/drm
+
+# The way a display is told about high-dynamic-range content arrived in the
+# kernel's header after the libdrm of R, and drm/drm_mode.h carries a copy of
+# its two structures for a libdrm without them. A structure has no macro to
+# test for, so the question is put to the header itself: from S on libdrm
+# declares them, and the copy stands down.
+ifneq ($(shell grep -s -l 'struct hdr_output_metadata {' external/libdrm/include/drm/drm_mode.h),)
+LOCAL_CFLAGS += -DDRM_HWC_HAVE_HDR_OUTPUT_METADATA
+endif
+
+LOCAL_SHARED_LIBRARIES := \
+    liblog \
+    libbase \
+    libcutils \
+    libhardware \
+    libsync \
+    libui \
+    libdl
+
+# Statically, and that is the point rather than a preference. It is here for a
+# handful of helper calls in the property model -- adding one to an atomic
+# request, reading a blob -- and for nothing else: no display on this board is
+# reached through DRM and no device node is opened. Nothing else on this device
+# needs it either, so it is not in the image, and a shared dependency on it is
+# a module that will not load.
+LOCAL_STATIC_LIBRARIES := \
+    libdrm
+
+LOCAL_SRC_FILES := \
+    backend/BackendManager.cpp \
+    backend/ClientBackend.cpp \
+    backend/GenericBackend.cpp \
+    bufferinfo/BufferInfoGetter.cpp \
+    bufferinfo/GrallocBufferHandle.cpp \
+    bufferinfo/NvGralloc.cpp \
+    bufferinfo/legacy/BufferInfoNvidia.cpp \
+    compositor/CompositionPlanner.cpp \
+    compositor/FlatteningController.cpp \
+    compositor/FlatteningEventAtomReporter.cpp \
+    compositor/GenericCompositionPlanner.cpp \
+    compositor/HdcpController.cpp \
+    compositor/LayerEffects.cpp \
+    compositor/LayerToPlaneJoiningPlan.cpp \
+    compositor/MergeGroup.cpp \
+    compositor/Occlusion.cpp \
+    compositor/PartialRedraw.cpp \
+    compositor/PictureMemory.cpp \
+    display/DrmMode.cpp \
+    display/DrmProperty.cpp \
+    display/VSyncWorker.cpp \
+    stats/CompositionStatsAtomReporter.cpp \
+    stats/CountActiveDisplaysReporter.cpp \
+    stats/DisplayConfigurationResultReporter.cpp \
+    stats/DisplayHotplugConnectModeDetectedAtomReporter.cpp \
+    stats/DisplayRefreshRatesChangedAtomReporter.cpp \
+    stats/Stats.cpp \
+    stats/StatsPoller.cpp \
+    utils/BacklightController.cpp \
+    utils/ColorUtil.cpp \
+    utils/Logging.cpp \
+    utils/SysfsBacklightController.cpp \
+    utils/fd.cpp \
+    utils/fence.cpp \
+    utils/properties.cpp \
+    hwc/Hwc.cpp \
+    hwc/HwcDisplay.cpp \
+    hwc/HwcDisplayConfigs.cpp \
+    hwc/HwcLayer.cpp \
+    hwc2_device/DrmHwcTwo.cpp \
+    hwc2_device/hwc2_device.cpp \
+    tegra/DcControl.cpp \
+    tegra/DcHead.cpp \
+    tegra/GetFeaturesSource.cpp \
+    tegra/WindowFeatures.cpp \
+    tegra/TegraAtomicCommitSink.cpp \
+    tegra/TegraAtomicStateManager.cpp \
+    tegra/TegraBackend.cpp \
+    tegra/TegraDevice.cpp \
+    tegra/TegraFormat.cpp \
+    tegra/CompositionGovernor.cpp \
+    tegra/CursorPlane.cpp \
+    tegra/CursorUnit.cpp \
+    tegra/TegraPlane.cpp \
+    tegra/EngineWarmer.cpp \
+    tegra/FbDevice.cpp \
+    tegra/GovernorLibrary.cpp \
+    tegra/GpuExecutor.cpp \
+    tegra/MergeDescription.cpp \
+    tegra/PanelMirror.cpp \
+    tegra/PictureCapture.cpp \
+    tegra/TegraDisplayPipeline.cpp \
+    tegra/TegraVSyncSource.cpp \
+    tegra/ScratchPool.cpp \
+    tegra/VicSession.cpp
+
+include $(BUILD_SHARED_LIBRARY)
+
+# The composition load governor's policy, as its own library. The composer
+# above loads it by this name from the same directory, through the interface
+# in governor/HwcGovernor.h, and runs without it if it is absent. Kept apart
+# so the policy -- engine clocks, nvhost, pm_qos, all of it platform -- can be
+# replaced or removed without touching the composer.
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := hwcgovernor.$(TARGET_BOARD_PLATFORM)
+LOCAL_MODULE_RELATIVE_PATH := hw
+LOCAL_MODULE_TAGS := optional
+LOCAL_PROPRIETARY_MODULE := true
+
+LOCAL_CFLAGS := \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -std=c++17
+
+# nvhost's interface from the kernel's own header, named outright for the
+# reason given at the composer's KERNEL_NVMAP_H.
+LOCAL_CFLAGS += \
+    -DKERNEL_NVHOST_IOCTL_H='"$(abspath $(TARGET_KERNEL_SOURCE))/include/linux/nvhost_ioctl.h"'
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH)
+
+LOCAL_SHARED_LIBRARIES := \
+    liblog \
+    libcutils
+
+LOCAL_SRC_FILES := \
+    governor/CpuFloor.cpp \
+    governor/EngineClock.cpp \
+    governor/FenceWatch.cpp \
+    governor/FloorLane.cpp \
+    governor/GpuClock.cpp \
+    governor/Log.cpp \
+    governor/Mailbox.cpp \
+    governor/MergePlan.cpp \
+    governor/PerfProfile.cpp \
+    governor/SysNode.cpp \
+    governor/TegraGovernor.cpp \
+    governor/Tuning.cpp
+
+# The model is checked on the workstation, not on the device:
+# governor/tests/merge_plan_test.cpp says how.
+
+include $(BUILD_SHARED_LIBRARY)
+
+# The composer's own GPU executor, as its own library like the governor:
+# what the display windows and VIC cannot take is drawn here, so
+# SurfaceFlinger never composes a frame. Loaded by this name from the same
+# directory through vk/HwcVk.h; the composer runs without it. Vulkan comes
+# up through the camera's runtime in vk/runtime.
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := hwcvk.$(TARGET_BOARD_PLATFORM)
+LOCAL_MODULE_RELATIVE_PATH := hw
+LOCAL_MODULE_TAGS := optional
+LOCAL_PROPRIETARY_MODULE := true
+
+LOCAL_CFLAGS := \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -Wno-unused-parameter \
+    -std=c++17
+
+LOCAL_C_INCLUDES := $(LOCAL_PATH)
+LOCAL_HEADER_LIBRARIES := vulkan_headers
+
+LOCAL_SHARED_LIBRARIES := \
+    libcutils \
+    libdl \
+    liblog \
+    libutils
+
+LOCAL_SRC_FILES := \
+    vk/Compositor.cpp \
+    vk/Geometry.cpp \
+    vk/ImageCache.cpp \
+    vk/runtime/VulkanDeviceState.cpp \
+    vk/runtime/loader/HalHmiVulkanLoader.cpp \
+    vk/runtime/loader/SystemVulkanLoader.cpp \
+    vk/runtime/loader/VulkanLoader.cpp
+
+# The layer placement is checked on the workstation:
+# vk/tests/geometry_test.cpp says how.
+
+include $(BUILD_SHARED_LIBRARY)
+
+# The measuring stands under tools/ are found only through here: the build
+# does not descend past a directory that has its own Android.mk.
+# Each sets LOCAL_PATH to its own directory, so the path is taken first.
+HWC_TOOLS := $(LOCAL_PATH)/tools
+include $(HWC_TOOLS)/hwcvk_probe/Android.mk
+include $(HWC_TOOLS)/hwcvk_stand/Android.mk

@@ -1,0 +1,259 @@
+/*
+ * Copyright (C) 2022 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include "bufferinfo/BufferInfo.h"
+#include "compositor/DisplayInfo.h"
+#include "compositor/LayerData.h"
+#include "compositor/Occlusion.h"
+#include "utils/fd.h"
+
+namespace android::drm_hwcomposer {
+
+class ICompositorDisplay;
+
+class FrontendLayerBase {
+ public:
+  virtual ~FrontendLayerBase() = default;
+};
+
+class HwcLayer {
+ public:
+  struct Buffer {
+    BufferInfo bi;
+    std::shared_ptr<FbIdHandle> fb;
+    SharedFd fence;
+  };
+  // A set of properties to be validated.
+  struct LayerProperties {
+    std::optional<Buffer> buffer;
+    std::optional<BufferBlendMode> blend_mode;
+    std::optional<BufferColorEncoding> color_encoding;
+    std::optional<BufferSampleRange> sample_range;
+    std::optional<HwcColorspace> colorspace;
+    std::optional<TransferFunction> transfer_func;
+    std::optional<CompositionType> composition_type;
+    std::optional<DstRectInfo> display_frame;
+    std::optional<float> alpha;
+    std::optional<SrcRectInfo> source_crop;
+    std::optional<LayerTransform> transform;
+    std::optional<uint32_t> z_order;
+    std::optional<DamageInfo> damage;
+    std::optional<float> brightness;
+  };
+
+  explicit HwcLayer(ICompositorDisplay *parent_display);
+  CompositionType GetSfType() const {
+    return sf_type_;
+  }
+  CompositionType GetValidatedType() const {
+    return validated_type_;
+  }
+  void AcceptTypeChange() {
+    sf_type_ = validated_type_;
+  }
+  void SetValidatedType(CompositionType type) {
+    validated_type_ = type;
+  }
+  bool IsTypeChanged() const {
+    return sf_type_ != validated_type_;
+  }
+
+  bool GetPriorBufferScanOutFlag() const {
+    return prior_buffer_scanout_flag_;
+  }
+
+  void ClearPriorBufferScanOutFlag() {
+    prior_buffer_scanout_flag_ = false;
+    prior_buffer_ = nullptr;
+  }
+
+  /* The buffer this layer has just given up, which is the one the release
+   * fence is about -- the current one is only now being composed.
+   *
+   * Compared, never followed: it is here to be recognised in a list of the
+   * buffers the last frame was built from, and nothing reads through it. It
+   * stays valid for exactly as long as it needs to, because the client cannot
+   * take it back until told the fence this decides, and it is dropped the
+   * moment that is said.
+   */
+  buffer_handle_t GetPriorBuffer() const {
+    return prior_buffer_;
+  }
+
+  uint32_t GetZOrder() const {
+    return z_order_;
+  }
+
+  const LayerData &GetLayerData() const {
+    return layer_data_;
+  }
+
+  void SetLayerProperties(const LayerProperties &layer_properties);
+
+  /* Which of this layer's plan-shaping properties changed since the planner
+   * last asked, as PlanInvalidator bits, cleared by the asking. Raised inside
+   * SetLayerProperties by comparing each incoming value against the one it
+   * replaces, so the setters cannot be forgotten one by one -- there is only
+   * the one door. Const because the planner holds the display const; the
+   * bits are bookkeeping about the layer, not the layer. */
+  uint32_t TakePlanInvalidators() const {
+    const uint32_t taken = plan_invalidators_;
+    plan_invalidators_ = 0;
+    return taken;
+  }
+
+  /* The same bits, looked at and left in place. */
+  uint32_t PeekPlanInvalidators() const {
+    return plan_invalidators_;
+  }
+
+  /* Re-judge this layer's class from the time of its last activity and
+   * say whether the class changed. Activity is a new buffer or a moved
+   * frame, stamped where SetLayerProperties accepts them; the class
+   * decays to quiet after a second of silence. Asymmetric on purpose:
+   * a layer that starts drawing must leave the merge with its first
+   * frame, one that stops may wait a second to enter it -- except a
+   * small layer, which leaves with its second (see LivenessWouldChange).
+   * Const for the
+   * same reason TakePlanInvalidators is: the class is bookkeeping about
+   * the layer, not the layer. */
+  bool RefreshLiveness() const;
+  /* Whether RefreshLiveness would say the class changed, without changing
+   * it. */
+  bool LivenessWouldChange() const;
+
+  bool IsLive() const {
+    return live_;
+  }
+
+  auto GetFrontendPrivateData() -> std::shared_ptr<FrontendLayerBase> {
+    return frontend_private_data_;
+  }
+
+  auto SetFrontendPrivateData(std::shared_ptr<FrontendLayerBase> data) {
+    frontend_private_data_ = std::move(data);
+  }
+
+  // Returns the number of pixel operations this layer would require if it were
+  // client-composited.
+  uint32_t GetPixOps() const;
+
+  /* SurfaceFlinger's visible region for the layer, in the display's space;
+   * sent only when the geometry changes, so kept until replaced. */
+  void SetVisibleRegion(std::vector<IRect> region);
+
+  /* The layer as the occlusion takes it, on a display of `screen`. */
+  occlusion::Layer OcclusionInput(const IRect &screen) const;
+
+  /* What the occlusion found of the layer. A hidden layer is not shown at
+   * all; one seen only in part is shown cropped -- its display frame and
+   * source crop narrowed to the part -- in the layer data every reader
+   * takes, while what SurfaceFlinger set is kept to start again from. */
+  void ApplyOcclusion(const occlusion::Shown &shown);
+
+  bool IsHidden() const {
+    return hidden_;
+  }
+
+ private:
+  void PopulateLayerData();
+
+
+  // sf_type_ stores the initial type given to us by surfaceflinger,
+  // validated_type_ stores the type after running ValidateDisplay
+  CompositionType sf_type_ = CompositionType::kInvalid;
+  CompositionType validated_type_ = CompositionType::kInvalid;
+
+  uint32_t z_order_ = 0;
+  LayerData layer_data_;
+
+  /* What SurfaceFlinger set, before the occlusion narrowed it into
+   * layer_data_.pi; and what it said can be seen. */
+  DstRectInfo sf_display_frame_{};
+  SrcRectInfo sf_source_crop_{};
+  std::vector<IRect> sf_visible_;
+  bool hidden_ = false;
+
+  /* The following buffer data can have 2 sources:
+   * 1 - Mapper@4 metadata API
+   * 2 - HWC@2 API
+   * We keep ability to have 2 sources in drm_hwc. It may be useful for CLIENT
+   * layer, at this moment HWC@2 API can't specify blending mode for this layer,
+   * but Mapper@4 can do that
+   */
+  BufferColorEncoding color_encoding_{};
+  BufferSampleRange sample_range_{};
+  BufferBlendMode blend_mode_{};
+  HwcColorspace colorspace_{};
+  TransferFunction transfer_func_{};
+  std::optional<float> brightness_{};
+
+  mutable uint32_t plan_invalidators_ = 0;
+
+  /* One second, like the refresh governor's quiet delay and the
+   * flattening timeout: the one span this system calls settled. Longer
+   * than a blinking text cursor's half-period, so a blinker stays live
+   * in its window instead of rocking the plan twice a second. */
+  static constexpr std::chrono::milliseconds kLayerQuietDelay{1000};
+  /* Activity closer together than this is one frame announcing itself
+   * through several properties. Half a refresh at sixty. */
+  static constexpr std::chrono::milliseconds kSameFrame{8};
+  /* A layer covering at most this share of the panel -- one eighth -- is
+   * small: bars, strips, icons, a text cursor. */
+  static constexpr uint64_t kSmallShare = 8;
+  std::chrono::steady_clock::time_point last_activity_{};
+  std::chrono::steady_clock::time_point previous_activity_{};
+
+  /* The layer drew or moved now. */
+  void MarkActivity();
+  bool IsSmall() const;
+  mutable bool live_ = false;
+
+  bool prior_buffer_scanout_flag_{};
+
+  /* Set beside the flag above and cleared with it -- see GetPriorBuffer. */
+  buffer_handle_t prior_buffer_{};
+
+  ICompositorDisplay *const parent_;
+
+  std::shared_ptr<FrontendLayerBase> frontend_private_data_;
+
+  bool has_buffer_set_ = false;
+
+ public:
+  bool IsLayerUsableAsDevice() const;
+
+  /* setLayerGenericMetadata, for the keys of compositor/LayerEffects.h.
+   * Raises kEffects only when the layer gains or loses an effect; a value
+   * that only moves -- a radius animating -- is read at commit. */
+  EffectResult ApplyEffectMetadata(const char *key, size_t key_length,
+                                   const uint8_t *value, size_t value_length);
+
+  /* setLayerColor: the colour of a solid-colour layer, as the framework
+   * sends it, 0 to 255 a channel. */
+  void SetSolidColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+};
+
+}  // namespace android::drm_hwcomposer

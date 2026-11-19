@@ -1,0 +1,2603 @@
+/*
+ * Copyright (C) 2026 Artem Bambalov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "tegra/TegraAtomicStateManager.h"
+
+#include "tegra/CursorPlane.h"
+#include "tegra/TegraPlane.h"
+#include "utils/Time.h"
+
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <sched.h>
+#include <math.h>
+#include <ndk/sync.h>
+#include <string.h>
+#include <sync/sync.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <optional>
+#include <sstream>
+#include <cstdio>
+#include <string>
+
+#include <algorithm>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <cutils/properties.h>
+#include <tegra_dc_ext.h>
+
+#include "bufferinfo/BufferInfo.h"
+#include "bufferinfo/GrallocBufferHandle.h"
+#include "bufferinfo/NvGralloc.h"
+#include "compositor/LayerData.h"
+#include "compositor/LayerToPlaneJoiningPlan.h"
+#include "display/FbIdHandle.h"
+#include "display/Plane.h"
+#include "display/PipelineBinding.h"
+#include "tegra/MergeDescription.h"
+#include "tegra/PictureCapture.h"
+#include "tegra/TegraConnector.h"
+#include "tegra/FbDevice.h"
+#include "tegra/TegraFormat.h"
+#include "utils/fence.h"
+#include "utils/Logging.h"
+#include "utils/log.h"
+#include "utils/properties.h"
+
+namespace android::drm_hwcomposer {
+
+namespace {
+
+/* Whether the frame ring records at all.
+ *
+ * Of the whole instrument set the ring is the one piece that works on
+ * every shown frame -- a line built and stored per flip -- so it is the
+ * one piece production would pay for without asking. It records only
+ * when asked to: bracketing a defect is worth arming an instrument for,
+ * and a composer restart is a fair price for arming one.
+ *
+ * Read once, like every switch here: answering per frame would let it
+ * change without a restart, which is worth very little against asking
+ * the property store the same question sixty times a second for the
+ * life of the device.
+ */
+bool RingWanted() {
+  static const bool wanted = property_get_bool("vendor.hwc.ring", 0) != 0;
+  return wanted;
+}
+
+
+/* The framework's transform, as bits: hflip | vflip << 1 | rotate90 << 2 --
+ * the same encoding the platform's own enum uses. */
+uint8_t TransformBits(const LayerTransform &t) {
+  return static_cast<uint8_t>((t.hflip ? 1 : 0) | (t.vflip ? 2 : 0) |
+                              (t.rotate90 ? 4 : 0));
+}
+
+/* The engine's code for each framework transform.
+ *
+ * The engine has no named transforms at all: a code is three independent
+ * bits -- the low bit mirroring the first axis, the next the second, the
+ * third swapping them. The transform is one value for the whole
+ * composition, not one per source: it lives in three bytes of the
+ * configuration and is written by a single call that takes no source
+ * index. Only sources are ever transformed; the target is never turned.
+ *
+ * The mirrors are applied AFTER the transpose, in the destination's axes.
+ * That is the one thing the rows turn on, and it is what makes this table
+ * differ from WindowTransformFor, where the controller mirrors in the
+ * buffer's axes and reads columnar. The four rows without a turn agree
+ * between the two tables; the four with a turn cannot, and must not be
+ * unified.
+ *
+ * The index is the framework's own bit value, so row 6 is FLIP_V with a
+ * quarter turn and row 7 is ROT_270 -- not the other way round.
+ *
+ * The two quarter turns have been read off the panel, not derived. A
+ * disassembly of the stock composer's rotating blit yields a translation
+ * naming its own transforms, and reading those names as the framework's
+ * puts the two quarter turns the other way round -- which the panel
+ * refuses: the picture then stands a half turn from upright, exactly the
+ * distance between the two codes. The names in that translation are the
+ * vendor's and do not carry the framework's sense of which way a quarter
+ * turn goes, so they cannot settle these two rows. The door below can,
+ * and did.
+ *
+ * Passing the framework's own bits straight through is NOT equivalent,
+ * and the rows show why: the two quarter turns map to codes that are
+ * neither the framework's own nor each other's. The table must not be
+ * simplified. */
+uint32_t VicTransformFor(uint8_t bits) {
+  static constexpr uint32_t kTable[8] = {
+      0, /* identity          -- 000: unchanged */
+      1, /* FLIP_H            -- 001: mirror the first axis */
+      2, /* FLIP_V            -- 010: mirror the second axis */
+      3, /* ROT_180           -- 011: both mirrors */
+      6, /* ROT_90            -- 110: transpose, then mirror the second axis */
+      7, /* FH|ROT_90         -- 111: transpose, then both mirrors */
+      4, /* FV|ROT_90         -- 100: plain transpose */
+      5, /* ROT_270           -- 101: transpose, then mirror the first axis */
+  };
+  return kTable[bits & 7];
+}
+
+/* The group's one transform, or none.
+ *
+ * The engine has a single transform for the whole configuration, applied
+ * to every source it is told to read. A display rotation -- every member
+ * turned the same way -- can ride that one value in the merge pass. A
+ * mixed group cannot: that is a seating error, not a case to draw
+ * unturned. Empty or identity therefore yields nothing; disagreement
+ * yields no value, and the caller refuses the merge. */
+std::optional<uint8_t> UniformTurn(const std::vector<uint8_t> &transforms) {
+  if (transforms.empty())
+    return static_cast<uint8_t>(0);
+  const uint8_t first = transforms.front();
+  for (const uint8_t bits : transforms) {
+    if (bits != first) {
+      ALOGE("a merge was seated with mixed turns");
+      return std::nullopt;
+    }
+  }
+  return first;
+}
+
+/* Which engine code to force onto every turned member, or -1 to leave
+ * each member's own alone.
+ *
+ * The engine's eight codes are three bits with no dictionary, and which
+ * of them is a given framework transform cannot be settled by reading:
+ * the disassembly names the codes in the vendor's own terms, and those
+ * terms do not say which way a quarter turn goes. So the map is read off
+ * the panel. This substitutes one code for every turned member of the
+ * group at once, which is the right shape for the question -- under a
+ * display rotation every member carries the same transform anyway.
+ *
+ * Read every frame, so the values can be walked while looking at one
+ * still picture rather than restarting between them. */
+int ForcedVicTransform() {
+  return property_get_int32("vendor.hwc.test.victransform", -1);
+}
+
+/* The framework's transform, as the controller's window flags.
+ *
+ * Mirrors go straight through -- INVERT_H for the horizontal mirror,
+ * INVERT_V for the vertical -- and a quarter turn sets columnar reading
+ * (SCAN_COLUMN) and toggles the vertical mirror with an exclusive OR
+ * rather than adding it. That toggle is why rows 6 and 7 look "missing":
+ * there the mirror is cancelled, not set.
+ *
+ * This table does NOT match the engine's VicTransformFor, and cannot:
+ * the controller and the engine apply their mirrors in different spaces,
+ * before and after the transpose, so the rows for rotate 90 and 270
+ * differ. Six of the eight rows agree; these two do not. The two tables
+ * must not be unified. */
+uint32_t WindowTransformFor(uint8_t bits) {
+  static constexpr uint32_t kTable[8] = {
+      0,                                       /* identity   -- 000 */
+      TEGRA_DC_EXT_FLIP_FLAG_INVERT_H,         /* FLIP_H     -- 001 */
+      TEGRA_DC_EXT_FLIP_FLAG_INVERT_V,         /* FLIP_V     -- 010 */
+      TEGRA_DC_EXT_FLIP_FLAG_INVERT_H |
+          TEGRA_DC_EXT_FLIP_FLAG_INVERT_V,     /* ROT_180    -- 011 */
+      TEGRA_DC_EXT_FLIP_FLAG_SCAN_COLUMN |
+          TEGRA_DC_EXT_FLIP_FLAG_INVERT_V,     /* ROT_90     -- 100 */
+      TEGRA_DC_EXT_FLIP_FLAG_INVERT_H |
+          TEGRA_DC_EXT_FLIP_FLAG_SCAN_COLUMN |
+          TEGRA_DC_EXT_FLIP_FLAG_INVERT_V,     /* FH|ROT_90  -- 101 */
+      TEGRA_DC_EXT_FLIP_FLAG_SCAN_COLUMN,      /* FV|ROT_90  -- 110 */
+      TEGRA_DC_EXT_FLIP_FLAG_SCAN_COLUMN |
+          TEGRA_DC_EXT_FLIP_FLAG_INVERT_H,     /* ROT_270    -- 111 */
+  };
+  return kTable[bits & 7];
+}
+
+/* Which transform value to force onto an ordinary window's flags, or -1
+ * to leave each layer's own alone.
+ *
+ * The window mapping above was taken from the shipped stock composer and
+ * has not been confirmed by our own run. The door substitutes one of the
+ * eight values on a still picture, so all eight can be driven and an
+ * expected map read off the panel.
+ *
+ * Substituted only where a layer already carries a turn of its own. A
+ * window with nothing to turn -- the client's target above all, which is
+ * the whole screen already composed -- would otherwise be turned too, and
+ * every frame the scene fell to the client would come out wrong for a
+ * reason that has nothing to do with the question. The eye watching the
+ * panel would then be describing the door rather than the map.
+ *
+ * Read every time rather than once. The map is read off the panel by
+ * walking the eight values and looking, and a door read once needs the
+ * composer restarted between values -- which reshuffles the scene being
+ * looked at, so what the eye compares is no longer the same picture. The
+ * cost is a property read per window per frame, paid only while someone
+ * is standing in front of the panel driving it. */
+int ForcedWindowTransform() {
+  return property_get_int32("vendor.hwc.test.wintransform", -1);
+}
+
+/* When a fence came due, or nothing if it has not yet.
+ *
+ * Read rather than waited on: the question is whether it was due by a given
+ * moment, and waiting to find out would change the answer. The time is the
+ * fence's own, so it says when the hardware finished rather than when this
+ * thread got round to asking.
+ */
+/* Has this fence come due yet?
+ *
+ * Separate from SignalTimeNs, which answers "not yet" and "could not ask" with
+ * the same empty result. For a warning that is fine -- neither is worth
+ * saying. For counting it is not: a column of frames that could not be asked
+ * about, read as a column of frames that waited, would answer the question
+ * this counting exists to settle, and answer it wrongly.
+ */
+enum class Due { kYes, kNotYet, kCouldNotAsk };
+
+Due FenceDue(const SharedFd &fence) {
+  switch (QueryFence(fence)) {
+    case FenceState::kSignaled:
+      return Due::kYes;
+    case FenceState::kPending:
+      return Due::kNotYet;
+    default:
+      return Due::kCouldNotAsk;
+  }
+}
+
+std::optional<int64_t> SignalTimeNs(const SharedFd &fence) {
+  if (!fence)
+    return std::nullopt;
+
+  struct sync_file_info *info = sync_file_info(*fence);
+  if (info == nullptr)
+    return std::nullopt;
+
+  if (info->status != 1) {
+    sync_file_info_free(info);
+    return std::nullopt;
+  }
+
+  int64_t latest = 0;
+  struct sync_fence_info *each = sync_get_fence_info(info);
+  for (size_t i = 0; i < info->num_fences; i++) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    latest = std::max(latest, static_cast<int64_t>(each[i].timestamp_ns));
+  }
+
+  sync_file_info_free(info);
+  return latest;
+}
+
+uint32_t BlendFor(BufferBlendMode mode) {
+  switch (mode) {
+    case BufferBlendMode::kPreMult:
+      return TEGRA_DC_EXT_BLEND_PREMULT;
+    case BufferBlendMode::kCoverage:
+      return TEGRA_DC_EXT_BLEND_COVERAGE;
+    case BufferBlendMode::kNone:
+    case BufferBlendMode::kUndefined:
+    default:
+      return TEGRA_DC_EXT_BLEND_NONE;
+  }
+}
+
+/* The buffer as the allocator knows it, if whoever read this one left it
+ * behind, and null otherwise.
+ *
+ * The cast is not a guess. That field exists to carry exactly this -- the
+ * handle a description was read from, kept alive as long as the description
+ * is -- and GrallocBufferHandle is the only thing in this tree that can be
+ * put in it. It is a static cast because this platform's builds turn run-time
+ * type information off, so the checked one would not link.
+ */
+buffer_handle_t NativeHandleOf(const BufferInfo &bi) {
+  if (!bi.fds_shared)
+    return nullptr;
+
+  return std::static_pointer_cast<GrallocBufferHandle>(bi.fds_shared)
+      ->GetHandle();
+}
+
+/* Where a plan puts a layer, said the way this controller reads it.
+ *
+ * The two count in opposite directions. A plan says how high a layer sits,
+ * from the bottom up, which is the order the framework hands layers over and
+ * the order everything above this is written against. The controller takes a
+ * depth: the smallest number is the window nearest the viewer, and 0xff is as
+ * far back as it goes -- which is what the driver gives the single window it
+ * puts up on its own, and so is the hardware's own word for the bottom.
+ *
+ * Handing a plan's height over unchanged puts the bottom layer in front of
+ * everything, which on a display showing a wallpaper is a wallpaper over the
+ * whole screen and the entire user interface behind it. It stayed hidden for
+ * as long as only one window was ever used, because one window has no order
+ * to get wrong.
+ *
+ * Turned round here, at the single point where the plan's vocabulary becomes
+ * the controller's, rather than by teaching the planner this hardware's
+ * dialect.
+ */
+uint32_t DepthForZPos(int z_pos) {
+  constexpr uint32_t kFurthestBack = 0xff;
+
+  const auto height = static_cast<uint32_t>(std::max(z_pos, 0));
+  return height >= kFurthestBack ? 0 : kFurthestBack - height;
+}
+
+/* The selector's outcomes, as words. The same list the display's own dump
+ * keeps; duplicated rather than shared because the two dumps answer to
+ * different owners, and a shared table would couple them. */
+const char *SteeringWord(int steering) {
+  static const char *const kNames[] = {"steered",        "fits ordinary",
+                                       "monotone",       "run too long",
+                                       "lives overflow", "seat refused",
+                                       "mixed turn"};
+  if (steering < 0 ||
+      steering >= static_cast<int>(sizeof(kNames) / sizeof(kNames[0])))
+    return "?";
+  return kNames[steering];
+}
+
+/* The window converter's matrices for YCbCr to RGB, in the driver's own
+ * fixed point: the luma offset as a signed integer in the low byte, the luma
+ * gain in 2.8, the chroma gains in signed 2.8 for the red and blue rows and
+ * signed 1.8 for the green -- two's complement in the width of each field.
+ * Each row is out = kyrgb * (Y + yof) + k?r/g/b * (C - 128), summed over the
+ * two chroma channels; the 128 is the hardware's own.
+ *
+ * Coefficients are the standard ones times 256, rounded. The limited-range
+ * rows scale chroma by 255/224 and luma by 255/219, which is the studio
+ * swing; the full-range rows scale neither. The 601 limited row is the one
+ * every window boots with, and reads back from the driver's own table.
+ *
+ * Verified twice over, independently, before the first of them reached a
+ * register: the negative entries encode exactly, the positive ones within
+ * half a step of the standard. */
+namespace {
+
+struct CscRow {
+  uint16_t yof, kyrgb, kur, kvr, kug, kvg, kub, kvb;
+};
+
+constexpr CscRow k601Limited = {0x00F0, 0x012A, 0, 0x0198,
+                                0x039B, 0x032F, 0x0204, 0};
+constexpr CscRow k601Full = {0, 0x0100, 0, 0x0167, 0x03A8, 0x0349, 0x01C6, 0};
+constexpr CscRow k709Limited = {0x00F0, 0x012A, 0, 0x01CB,
+                                0x03C9, 0x0378, 0x021D, 0};
+constexpr CscRow k709Full = {0, 0x0100, 0, 0x0193, 0x03D0, 0x0388, 0x01DB, 0};
+
+hwc::DcHead::Window::Csc CscFor(BufferColorEncoding encoding,
+                                BufferSampleRange range, uint32_t height) {
+  const bool full = range == BufferSampleRange::kFullRange;
+  /* A buffer that says nothing about its standard is judged by its size,
+   * which is what the codecs themselves do: standard definition was
+   * encoded with 601, high definition with 709, and the line between them
+   * is 720 rows. */
+  const bool hd = encoding == BufferColorEncoding::kItuRec709 ||
+                  encoding == BufferColorEncoding::kItuRec2020 ||
+                  (encoding == BufferColorEncoding::kUndefined && height >= 720);
+  const CscRow &row = hd ? (full ? k709Full : k709Limited)
+                         : (full ? k601Full : k601Limited);
+  hwc::DcHead::Window::Csc csc;
+  csc.yof = row.yof;
+  csc.kyrgb = row.kyrgb;
+  csc.kur = row.kur;
+  csc.kvr = row.kvr;
+  csc.kug = row.kug;
+  csc.kvg = row.kvg;
+  csc.kub = row.kub;
+  csc.kvb = row.kvb;
+  return csc;
+}
+
+}  // namespace
+
+/* Fills one window from one layer of a plan. False if the layer cannot be
+ * described to this controller at all, which the planner should already have
+ * ruled out by asking the plane -- so it is a fault worth logging rather than
+ * an ordinary refusal. */
+bool DescribeWindow(const LayerData &layer, uint32_t plane_id, uint32_t depth,
+                    hwc::DcHead::Window *out) {
+  if (!layer.bi || !layer.fb) {
+    ALOGE("layer for plane %u has no buffer", plane_id);
+    return false;
+  }
+
+  const BufferInfo &bi = *layer.bi;
+
+  const uint32_t format = TegraFormatFromDrm(bi.format);
+  uint32_t flags = 0;
+  uint8_t block_height_log2 = 0;
+
+  if (format == 0 ||
+      !TegraLayoutFromModifier(bi.modifiers[0], &flags, &block_height_log2)) {
+    ALOGE("layer for plane %u cannot be shown here", plane_id);
+    return false;
+  }
+
+  *out = hwc::DcHead::Window{};
+
+  out->index = static_cast<int32_t>(plane_id);
+  out->bufferFd = static_cast<int>(layer.fb->GetFbId());
+  out->offset = bi.offsets[0];
+  out->stride = bi.pitches[0];
+  out->pixelFormat = format;
+  out->flags = flags;
+  out->blockHeightLog2 = block_height_log2;
+  out->z = depth;
+  out->blend = BlendFor(bi.blend_mode);
+
+  if (DrmFormatIsYuv(bi.format)) {
+    /* The chroma plane, as the allocator described it. Zero here would not
+     * refuse the flip: the driver would read chroma from the luma's own
+     * start with a row length of nothing, and show it. So a YUV buffer
+     * that arrived without one is refused here, whatever the format table
+     * says about it -- the table admits only the semi-planar codes today,
+     * and this is what keeps a packed code added there tomorrow from
+     * reaching the flip with chroma from nowhere. */
+    if (bi.pitches[1] == 0) {
+      ALOGE("layer for plane %u: YUV with no chroma plane described",
+            plane_id);
+      return false;
+    }
+    out->offsetU = bi.offsets[1];
+    out->strideUV = bi.pitches[1];
+
+    /* The matrix that turns this layer's encoding into the panel's RGB,
+     * chosen from what the layer said about itself when its dataspace was
+     * set -- the standard and the range -- which until now was recorded
+     * and read by nothing. Sent with every frame of every YUV window: the
+     * converter runs regardless with whatever the window last held, the
+     * window may have held another layer a frame ago, and the driver does
+     * not compose matrices, so this is the whole of what it runs.
+     *
+     * Two standards by primaries, two by range. High-definition content is
+     * almost always the second standard, and a decoder that says nothing
+     * about range is encoding the studio one -- that is what the codecs
+     * assume -- so an unspecified range reads as limited rather than
+     * full, and an unspecified standard as the first. The 2020 primaries
+     * fall to 709 as the nearer of the two: the window's matrix has no
+     * seat for a gamut change, and a wrong luma weighting is the smaller
+     * error of the two on offer. */
+    out->loadCsc = true;
+    out->csc = CscFor(bi.color_encoding, bi.sample_range, bi.height);
+  }
+
+  /* The layer's own opacity, which a window CAN carry: the controller
+   * multiplies a global factor over the whole window when the flag says
+   * so, on top of whatever the pixels themselves blend. Until this was
+   * sent, a layer fading on a window was drawn fully opaque for the whole
+   * fade -- and a layer that migrated between the merge (which honours
+   * alpha) and a window (which did not) pulsed between the two laws.
+   *
+   * No capability is asked about, because there is none to ask: the driver
+   * honours the flag on every window alike (dc/ext/dev.c reads it into the
+   * window whenever the flag is set, and writes back 255 when it is not).
+   * The mode of blending is untouched on purpose -- for a premultiplied
+   * layer the global factor is a second multiplier over an already-scaled
+   * colour, which is exactly the framework's arithmetic.
+   *
+   * Full opacity asks for nothing: the flag stays off, and the window runs
+   * the plain mode it always ran -- a fading layer pays for the mode only
+   * while it fades. */
+  if (layer.pi.alpha < 1.F) {
+    const float clamped = std::min(std::max(layer.pi.alpha, 0.F), 1.F);
+    out->flags |= TEGRA_DC_EXT_FLIP_FLAG_GLOBAL_ALPHA;
+    out->globalAlpha = static_cast<uint8_t>(lroundf(clamped * 255.F));
+  }
+
+  /* The layer's own turn, as the controller's window flags: the plane
+   * judged the window able to carry it, so a turned layer keeps its turn
+   * here rather than being drawn flat. Only the flags change -- the
+   * geometry below is untouched, because the kernel swaps the axes itself
+   * inside its unwrap: the source stays the crop of the buffer and the
+   * on-screen rectangle stays the panel rectangle. The test door
+   * substitutes a fixed value for the layer's own when asked, so the
+   * mapping above can be exercised on a picture that does not move. */
+  uint8_t transform = TransformBits(layer.pi.transform);
+  const int forced = ForcedWindowTransform();
+  if (transform != 0 && forced >= 0 && forced <= 7)
+    transform = static_cast<uint8_t>(forced);
+  out->flags |= WindowTransformFor(transform);
+
+  /* A source region left unsaid means the whole buffer, and a destination
+   * left unsaid means the whole panel. The controller has no such shorthand,
+   * so both are spelled out from what is known. */
+  if (layer.pi.source_crop.f_rect) {
+    const auto &src = *layer.pi.source_crop.f_rect;
+    out->sourceX = src.left;
+    out->sourceY = src.top;
+    out->sourceWidth = src.Width();
+    out->sourceHeight = src.Height();
+  } else {
+    out->sourceWidth = static_cast<float>(bi.width);
+    out->sourceHeight = static_cast<float>(bi.height);
+  }
+
+  if (layer.pi.display_frame.i_rect) {
+    const auto &dst = *layer.pi.display_frame.i_rect;
+    out->outX = dst.left;
+    out->outY = dst.top;
+    out->outWidth = dst.Width();
+    out->outHeight = dst.Height();
+  } else {
+    out->outWidth = static_cast<int32_t>(bi.width);
+    out->outHeight = static_cast<int32_t>(bi.height);
+  }
+
+  /* No clipping to the panel here, on the contract SurfaceFlinger has
+   * proven twice: it intersects every layer's frame with the viewport and
+   * trims the crop to match before this composer sees either -- a freeform
+   * window shoved past the edge arrived pre-clipped with a matching crop,
+   * and the parallax wallpaper scrolls by crop, never by frame. The trim
+   * that used to live here moved the source along same-named axes, which
+   * is wrong under a columnar read -- dead code carrying a live defect,
+   * the same verdict that removed the merge clip. */
+
+  /* Borrowed: the plan owns the fence and outlives the flip, and the kernel
+   * takes its own reference while the call is in progress. */
+  out->preFence = layer.acquire_fence ? *layer.acquire_fence : -1;
+
+  return true;
+}
+
+/* One layer of a plan, said the way the image compositor takes it.
+ *
+ * Both rectangles are spelled out for the same reason they are in
+ * DescribeWindow: unsaid means the whole buffer and the whole panel, and
+ * neither the controller nor the engine has that shorthand.
+ *
+ * The fence is borrowed. The engine is told to wait on it and does not take
+ * it; the plan owns it and outlives the frame.
+ */
+hwc::VicSession::Layer MergeLayerFrom(const LayerData &layer) {
+  hwc::VicSession::Layer out{};
+
+  const BufferInfo &bi = *layer.bi;
+
+  out.handle = bi.handle;
+
+  if (layer.pi.source_crop.f_rect) {
+    const auto &src = *layer.pi.source_crop.f_rect;
+    out.source_left = src.left;
+    out.source_top = src.top;
+    out.source_right = src.right;
+    out.source_bottom = src.bottom;
+  } else {
+    out.source_right = static_cast<float>(bi.width);
+    out.source_bottom = static_cast<float>(bi.height);
+  }
+
+  if (layer.pi.display_frame.i_rect) {
+    const auto &dst = *layer.pi.display_frame.i_rect;
+    out.display_left = dst.left;
+    out.display_top = dst.top;
+    out.display_right = dst.right;
+    out.display_bottom = dst.bottom;
+  } else {
+    out.display_right = static_cast<int32_t>(bi.width);
+    out.display_bottom = static_cast<int32_t>(bi.height);
+  }
+
+  /* Coverage blending multiplies at draw time; premultiplied does not.
+   * Anything else means the layer carries no alpha worth honouring, and
+   * saying premultiplied of an opaque layer costs nothing. */
+  out.premultiplied = bi.blend_mode != BufferBlendMode::kCoverage;
+  out.alpha = layer.pi.alpha;
+  out.acquire_fence = layer.acquire_fence ? *layer.acquire_fence : -1;
+
+  return out;
+}
+
+/* Shows the group in a full window when one stands empty this frame,
+ * rather than in the merging plane's own.
+ *
+ * The merging plane is the narrow window, D: the only one that cannot show
+ * what the GPU draws, and so the only one that costs the frame nothing to
+ * give the group. But D is a simple window -- no line buffer, ten
+ * kilobytes of fetch ahead of the scan against fifty to a hundred and
+ * thirty in A, B and C (TRM 21.3.1) -- and a whole screen read through it
+ * outruns that buffer for as long as a memory clock change takes at the
+ * lower clocks. The latency allowance says so, and the display holds the
+ * memory clock up to 396 MHz for a lone full-screen group in D, and to 528
+ * beside a scaled one, where the same window in B or C is content with 102
+ * to 204. A still screen is exactly such a lone group, and it is held up
+ * for as long as it is still.
+ *
+ * Any full window takes the group as it is: rows of thirty-two bits,
+ * unresized, the converter and vibrance off for RGB. Its place in the
+ * stack is the window's depth, not its number. The window D leaves is
+ * simply not described, and switches off in the same flip. Asked here,
+ * before the proposal is weighed, so the controller is asked about the
+ * very layout it will be given. */
+void SeatMergeInEmptyWindow(const std::vector<hwc::DcHead::Window> &windows,
+                            TegraAtomicRequest::Merge *merge) {
+  for (size_t i = 0; i < windows.size(); ++i) {
+    if (i == merge->slot || windows[i].bufferFd != 0)
+      continue;
+    merge->slot = i;
+    merge->window = windows[i].index;
+    return;
+  }
+}
+
+}  // namespace
+
+std::unique_ptr<AtomicRequest> TegraAtomicStateManager::GetAtomicModeReqForArgs(
+    AtomicCommitArgs &args) {
+  const std::vector<uint32_t> &available = head_.windows();
+  if (available.empty()) {
+    ALOGE("no windows to show anything with");
+    return nullptr;
+  }
+
+  /* A timing is accepted only if it is one the panel runs: its own, or the
+   * same timing at the slower rate. Either is a porch to ask the head for
+   * with this frame. A request for a timing this panel does not have must
+   * not be answered with silence, or the framework will believe a mode
+   * change happened that did not. */
+  std::optional<TegraAtomicRequest::Rate> rate;
+  if (args.display_mode) {
+    const drmModeModeInfo &wanted = args.display_mode->GetRawMode();
+
+    const bool known = std::any_of(modes_.begin(), modes_.end(),
+                                   [&wanted](const DrmMode &mode) {
+                                     return mode == wanted;
+                                   });
+    if (!known) {
+      ALOGE("asked for mode %s, which this panel does not run",
+            args.display_mode->GetName().c_str());
+      return nullptr;
+    }
+
+    rate = TegraAtomicRequest::Rate{
+        .porch = hwc::TegraConnector::porchFor(wanted,
+                                               modes_.front().GetRawMode()),
+        .period_ns = int64_t(args.display_mode->GetVSyncPeriodNs()),
+    };
+  }
+
+  /* Every window of the head, whether or not a layer claimed it.
+   *
+   * A window keeps what it was last given until told otherwise, and a frame
+   * only touches the windows it names -- so one left out stays on screen over
+   * the top of this frame. The spare ones are therefore sent with no buffer,
+   * which is how a window is switched off, and that is what a default-built
+   * Window already is.
+   */
+  std::vector<hwc::DcHead::Window> windows(available.size());
+  for (size_t i = 0; i < available.size(); ++i)
+    windows[i].index = static_cast<int32_t>(available[i]);
+
+
+  /* Value-initialised on purpose: the geometry fields are only assigned
+   * when layers join the group, and every reader is behind a non-empty
+   * guard today -- but an invariant that lives in guards alone is one
+   * refactor from undefined reads, and zeroes cost nothing here. */
+  TegraAtomicRequest::Merge merge{};
+  TegraAtomicRequest::Cursor cursor{};
+  FrameNote note{};
+  std::vector<hwc::PanelMirror::Window> panel;
+  const bool mirrored =
+      hwc::PictureCapture::Wanted(hwc::PictureCapture::Source::kPanel);
+
+  const int32_t panel_w =
+      modes_.empty() ? 0
+                     : static_cast<int32_t>(modes_.front().GetRawMode()
+                                                .hdisplay);
+  const int32_t panel_h =
+      modes_.empty() ? 0
+                     : static_cast<int32_t>(modes_.front().GetRawMode()
+                                                .vdisplay);
+
+  /* The frame's record has readers only when one is looking: the ring, the
+   * calibration lines in a trace, a capture's words. Otherwise it is not
+   * kept -- the walk below still fills a row, but one thrown away, so no
+   * frame allocates for a record nobody reads. */
+  using hwc::PictureCapture;
+  const bool noted =
+      RingWanted() || hwc::CalibrationWanted() ||
+      PictureCapture::Wanted(PictureCapture::Source::kFrame) ||
+      PictureCapture::Wanted(PictureCapture::Source::kMerge) ||
+      PictureCapture::Wanted(PictureCapture::Source::kMergeTurned);
+  FrameNote::Row unnoted{};
+
+  if (args.composition) {
+    /* The frame's record is filled as the layers are walked: each layer's
+     * seat, alpha, scale and landing place, beside the plan's own verdict.
+     * It travels with the request and is printed only if the frame is put
+     * up -- a request built to be weighed never reaches the ring. */
+    note.steering = static_cast<int>(args.composition->steering);
+    note.chosen_run = static_cast<uint32_t>(args.composition->chosen_run);
+    note.run_len = static_cast<uint32_t>(args.composition->run_len);
+    for (const auto &run : args.composition->runs) {
+      if (!noted)
+        break;
+      FrameNote::Run &r = note.runs.emplace_back();
+      r.begin = static_cast<uint32_t>(run.begin);
+      r.live = static_cast<uint32_t>(run.live);
+      r.pixels = run.pixels;
+      r.scale_pct = run.scale_pct;
+      r.seatable = run.seatable;
+    }
+
+    for (const auto &joining : args.composition->plan) {
+      if (!joining.plane)
+        continue;
+
+      FrameNote::Row &row = noted ? note.layers.emplace_back() : unnoted;
+      const LayerData &note_layer = joining.layer;
+      if (note_layer.bi) {
+        row.id = note_layer.bi->unique_id;
+        row.blend = note_layer.bi->blend_mode == BufferBlendMode::kPreMult
+                        ? 'p'
+                        : note_layer.bi->blend_mode == BufferBlendMode::kCoverage
+                              ? 'c'
+                              : '-';
+        const float src_w = note_layer.pi.source_crop.f_rect
+                                ? note_layer.pi.source_crop.f_rect->Width()
+                                : static_cast<float>(note_layer.bi->width);
+        const float src_h = note_layer.pi.source_crop.f_rect
+                                ? note_layer.pi.source_crop.f_rect->Height()
+                                : static_cast<float>(note_layer.bi->height);
+        const float dst_w = note_layer.pi.display_frame.i_rect
+                                ? static_cast<float>(
+                                      note_layer.pi.display_frame.i_rect
+                                          ->Width())
+                                : static_cast<float>(note_layer.bi->width);
+        const float dst_h = note_layer.pi.display_frame.i_rect
+                                ? static_cast<float>(
+                                      note_layer.pi.display_frame.i_rect
+                                          ->Height())
+                                : static_cast<float>(note_layer.bi->height);
+        if (dst_w > 0)
+          row.scale_w = src_w / dst_w;
+        if (dst_h > 0)
+          row.scale_h = src_h / dst_h;
+      }
+      row.alpha = note_layer.pi.alpha;
+      if (noted) {
+        const auto &rects = note_layer.pi.damage.dmg_rects;
+        row.damage = rects.empty() ? 'W'
+                     : std::all_of(rects.begin(), rects.end(),
+                                   [](const IRect &r) {
+                                     return r.right <= r.left ||
+                                            r.bottom <= r.top;
+                                   })
+                         ? 'E'
+                         : 'R';
+        row.generation = note_layer.generation;
+      }
+      if (note_layer.pi.display_frame.i_rect) {
+        const auto &dst = *note_layer.pi.display_frame.i_rect;
+        row.x = dst.left;
+        row.y = dst.top;
+        row.w = dst.Width();
+        row.h = dst.Height();
+      }
+
+      const uint32_t plane_id = joining.plane->Get()->GetId();
+      row.plane = plane_id;
+
+      /* The cursor's binding names no window: what it carries is set aside
+       * whole and told to the unit when the frame is executed. */
+      if (plane_id == TegraCursorPlane::kPlaneId) {
+        row.seat = 'c';
+        const auto &l = joining.layer;
+        if (l.bi && l.pi.display_frame.i_rect) {
+          cursor.present = true;
+          cursor.handle = NativeHandleOf(*l.bi);
+          cursor.id = l.bi->unique_id;
+          /* The sprite's own size, not the frame's: the frame is the
+           * half-pixel position rounded outward and may run a pixel
+           * large, and what the unit shows is the sprite. */
+          const float sprite_w = l.pi.source_crop.f_rect
+                                     ? l.pi.source_crop.f_rect->Width()
+                                     : static_cast<float>(l.bi->width);
+          const float sprite_h = l.pi.source_crop.f_rect
+                                     ? l.pi.source_crop.f_rect->Height()
+                                     : static_cast<float>(l.bi->height);
+          cursor.width = static_cast<uint32_t>(lroundf(sprite_w));
+          cursor.height = static_cast<uint32_t>(lroundf(sprite_h));
+          cursor.stride_px = l.bi->pitches[0] / 4;
+          cursor.premultiplied =
+              l.bi->blend_mode == BufferBlendMode::kPreMult;
+          cursor.x = l.pi.display_frame.i_rect->left;
+          cursor.y = l.pi.display_frame.i_rect->top;
+          cursor.seq = cursor_move_seq_;
+          cursor.acquire = l.acquire_fence;
+        }
+        continue;
+      }
+
+      auto it = std::find(available.begin(), available.end(), plane_id);
+      if (it == available.end()) {
+        ALOGE("plan names plane %u, which this head does not own", plane_id);
+        return nullptr;
+      }
+
+      const size_t slot = static_cast<size_t>(it - available.begin());
+
+      /* A layer bound for the merging plane is not described to the
+       * controller at all, because what that window will show is not this
+       * buffer. Set aside instead, to be drawn when the frame is executed --
+       * a plan is weighed several times before one is chosen, and drawing for
+       * each of those would cost more than the merge saves. */
+      const auto *plane = static_cast<const TegraPlane *>(joining.plane->Get());
+      if (plane->IsMerging()) {
+        row.seat = 'm';
+        /* Several planes can name the same window -- that is how a planner
+         * which gives one layer to one plane is told that this one takes
+         * more. They arrive in order of height, so the first is the bottom of
+         * the group, and its place in the stack is the merged buffer's: what
+         * is above it in the group is above it inside the buffer. */
+        if (merge.layers.empty()) {
+          merge.slot = slot;
+          merge.window = static_cast<int32_t>(plane_id);
+          merge.depth = DepthForZPos(joining.z_pos);
+        }
+        merge.layers.push_back(MergeLayerFrom(joining.layer));
+        merge.source_ids.push_back(joining.layer.bi
+                                       ? joining.layer.bi->unique_id
+                                       : 0);
+        merge.generations.push_back(joining.layer.generation);
+        merge.damages.push_back(joining.layer.pi.damage);
+        merge.serials.push_back(joining.layer.serial);
+        merge.transforms.push_back(TransformBits(joining.layer.pi.transform));
+        merge.formats.push_back(joining.layer.bi ? joining.layer.bi->format
+                                                 : 0);
+        continue;
+      }
+
+      if (!DescribeWindow(joining.layer, plane_id,
+                          DepthForZPos(joining.z_pos), &windows[slot]))
+        return nullptr;
+      if (mirrored)
+        panel.push_back({static_cast<int32_t>(plane_id),
+                         DepthForZPos(joining.z_pos),
+                         MergeLayerFrom(joining.layer)});
+
+    }
+  }
+
+  /* SurfaceFlinger already intersects the layer with the viewport before
+   * we see it, so a member off the panel is a broken contract, not a
+   * case to trim. Trimming would hide it, which is why the old clip
+   * existed -- and it was also wrong under a turn, because it moved the
+   * source along same-named axes. */
+  if (!merge.layers.empty() && panel_w > 0 && panel_h > 0) {
+    for (size_t i = 0; i < merge.layers.size(); ++i) {
+      const hwc::VicSession::Layer &l = merge.layers[i];
+      if (l.display_left < 0 || l.display_top < 0 ||
+          l.display_right > panel_w || l.display_bottom > panel_h) {
+        ALOGE("merge member %zu sits off the panel: %d,%d-%d,%d on %dx%d",
+              i, l.display_left, l.display_top, l.display_right,
+              l.display_bottom, panel_w, panel_h);
+        return nullptr;
+      }
+    }
+  }
+
+  /* The group's own frame of reference, found now that its members are
+   * known. The layers' panel rectangles are rebased to the group's corner:
+   * the engine will draw them from the buffer's origin, and where the group
+   * sits on the panel becomes the window's business alone. */
+  if (!merge.layers.empty()) {
+    int32_t left = INT32_MAX;
+    int32_t top = INT32_MAX;
+    int32_t right = INT32_MIN;
+    int32_t bottom = INT32_MIN;
+    for (const auto &l : merge.layers) {
+      left = std::min(left, l.display_left);
+      top = std::min(top, l.display_top);
+      right = std::max(right, l.display_right);
+      bottom = std::max(bottom, l.display_bottom);
+    }
+    merge.origin_x = left;
+    merge.origin_y = top;
+    merge.width = right > left ? static_cast<uint32_t>(right - left) : 1;
+    merge.height = bottom > top ? static_cast<uint32_t>(bottom - top) : 1;
+
+    for (auto &l : merge.layers) {
+      l.display_left -= left;
+      l.display_right -= left;
+      l.display_top -= top;
+      l.display_bottom -= top;
+    }
+  }
+
+  if (!UniformTurn(merge.transforms))
+    return nullptr;
+
+  if (!merge.layers.empty())
+    SeatMergeInEmptyWindow(windows, &merge);
+
+  /* The proposal must weigh the merged window too. Its buffer does not
+   * exist yet -- the engine draws it at execute, after exactly one plan has
+   * won -- but the bandwidth question never needed the buffer: the kernel
+   * counts a window from its geometry and format alone, and asks only that
+   * the buffer field be positive. So the window the engine will fill is
+   * described here as it will really be scanned out -- the group's own
+   * rectangle, thirty-two-bit rows -- with a stand-in descriptor nothing
+   * ever resolves: the test path discards the request after asking, and
+   * the execute path rebuilds this window from the real buffer before
+   * posting. Described full-panel, as it long was, every proposal carried
+   * a whole screen of imaginary bandwidth for what is usually a strip. */
+  if (!merge.layers.empty() && !modes_.empty()) {
+    const drmModeModeInfo &mode = modes_.front().GetRawMode();
+    hwc::DcHead::Window &window = windows[merge.slot];
+    window = hwc::DcHead::Window{};
+    window.index = merge.window;
+    window.bufferFd = 1; /* positive is all the proposal reads */
+    window.stride = hwc::VicSession::ZonePitchBytes(
+        static_cast<uint32_t>(mode.hdisplay));
+    window.pixelFormat = TEGRA_DC_EXT_FMT_R8G8B8A8;
+    window.sourceWidth = static_cast<float>(merge.width);
+    window.sourceHeight = static_cast<float>(merge.height);
+    window.outX = merge.origin_x;
+    window.outY = merge.origin_y;
+    window.outWidth = static_cast<int32_t>(merge.width);
+    window.outHeight = static_cast<int32_t>(merge.height);
+    window.z = merge.depth;
+    window.blend = TEGRA_DC_EXT_BLEND_PREMULT;
+  }
+
+  auto request = std::make_unique<TegraAtomicRequest>(std::move(windows),
+                                                      args.composition !=
+                                                          nullptr,
+                                                      args.power_mode,
+                                                      std::move(merge),
+                                                      args.color_matrix,
+                                                      cursor,
+                                                      std::move(note),
+                                                      rate);
+  if (mirrored)
+    request->SetPanel(std::move(panel));
+  return request;
+}
+
+bool TegraAtomicStateManager::Test(const AtomicRequest &request) {
+  const auto &tegra = static_cast<const TegraAtomicRequest &>(request);
+  if (head_.test(tegra.GetWindows()) != 0)
+    return false;
+
+  /* After the controller's yes, and only then: the planner asks about
+   * plans it will not commit, and a refused plan tells the governor
+   * nothing. Asked twice in one validate, the last accepted plan is the
+   * one the governor hears about, which is the one that will be shown. */
+  if (composition_governor_ != nullptr)
+    TellGovernor(tegra);
+  QueueMerge(tegra);
+  return true;
+}
+
+namespace {
+
+hwc::governor::Power GovernorPower(PowerMode mode) {
+  switch (mode) {
+    case PowerMode::kOff:
+      return hwc::governor::Power::off;
+    case PowerMode::kDoze:
+      return hwc::governor::Power::doze;
+    case PowerMode::kDozeSuspend:
+      return hwc::governor::Power::dozeSuspend;
+    case PowerMode::kSuspend:
+      return hwc::governor::Power::suspend;
+    case PowerMode::kOn:
+      break;
+  }
+  return hwc::governor::Power::on;
+}
+
+}  // namespace
+
+bool TegraAtomicStateManager::NoteLatch() {
+  if (FenceDue(previous_post_fence_) != Due::kYes)
+    return false;
+
+  /* Due, so the time is there to read; a fence that cannot say when
+   * leaves the last known latch standing. */
+  const std::optional<int64_t> at = SignalTimeNs(previous_post_fence_);
+  if (at && *at > last_latch_ns_)
+    last_latch_ns_ = *at;
+  return true;
+}
+
+void TegraAtomicStateManager::TellGovernor(const TegraAtomicRequest &tegra) {
+  const auto &merge = tegra.GetMerge();
+  const std::vector<hwc::governor::Member> members =
+      hwc::DescribeMembers(merge);
+
+  /* Whether the previous flip has landed decides which latch this frame
+   * can make: with the fence due, the nearest; otherwise the one after,
+   * since the present will first wait for it. The landing also says where
+   * the latches are. */
+  const bool landed = NoteLatch();
+
+  hwc::governor::Frame frame{};
+  frame.seq = ++planned_seq_;
+  hwc::MarkSteeringForCalibration(tegra.GetFrameNote(), merge.layers.size(),
+                                  frame.seq);
+  frame.now_ns = GetTimeMonotonicNs();
+  frame.last_latch_ns = last_latch_ns_;
+  /* The period of the rate the panel was last asked for, which is the pixel
+   * clock's and exact in the clock the fences are stamped in. Following the
+   * fences instead was tried: the worker's wake jitter on a single interval,
+   * taken in an eighth at a time, drifted the grid by milliseconds across a
+   * second's pause. */
+  frame.vsync_period_ns = period_ns_;
+  frame.last_engine_use_ns = vic_ != nullptr ? vic_->last_use_ns() : 0;
+  frame.merge_planned = !merge.layers.empty();
+  /* The verdict execute will reach, predicted from the same key. Only a
+   * prediction: the client target can still arrive between now and then,
+   * and a wrong guess costs a floor or a warm-up, never a frame. */
+  frame.merge_reuse_predicted = frame.merge_planned && merge_cache_ &&
+                                JudgeMerge(merge) == MergeVerdict::kSame;
+  frame.previous_flip_landed = landed;
+  frame.power_mode = static_cast<uint8_t>(GovernorPower(power_mode_seen_));
+  frame.target_w = merge.width;
+  frame.target_h = merge.height;
+  frame.members = members.data();
+  frame.member_count = static_cast<uint32_t>(members.size());
+
+  composition_governor_->FramePlanned(frame);
+}
+
+namespace {
+
+/* The group as the memory of drawn pictures takes it: each member's buffer
+ * and which frame of it, and where it went inside the group. The group's
+ * place on the panel and its depth in the stack are left out on purpose --
+ * the pixels are drawn relative to the group's own corner, so a group that
+ * moved, or had layers arrive or leave above it, is the same picture shown
+ * somewhere else, and the window is simply moved under it. */
+std::vector<PictureMemory::Member> MergeMembers(
+    const TegraAtomicRequest::Merge &merge) {
+  std::vector<PictureMemory::Member> members(merge.layers.size());
+  for (size_t i = 0; i < merge.layers.size(); ++i) {
+    const hwc::VicSession::Layer &l = merge.layers[i];
+    PictureMemory::Member &m = members[i];
+    m.source = i < merge.source_ids.size() ? merge.source_ids[i] : 0;
+    m.generation = i < merge.generations.size() ? merge.generations[i] : 0;
+    m.serial = i < merge.serials.size() ? merge.serials[i] : 0;
+    m.src = {l.source_left, l.source_top, l.source_right, l.source_bottom};
+    m.dst = {l.display_left, l.display_top, l.display_right,
+             l.display_bottom};
+    m.alpha = l.alpha;
+    m.premultiplied = l.premultiplied;
+    m.transform = i < merge.transforms.size() ? merge.transforms[i] : 0;
+  }
+  return members;
+}
+
+/* One group's drawing, wherever it is done -- on the engine's worker or,
+ * when nothing was queued for it, on the binder thread. A part at a time
+ * into the same buffer when there are parts, each writing its own
+ * rectangle and leaving the rest; the channel runs them in the order
+ * given, so the last one's fence is the buffer's. A part the engine would
+ * not take -- a scaled member described whole past its edge is the one way
+ * it can come to that -- is no reason to drop the frame: the buffer is
+ * drawn whole instead. */
+template <typename Drawn, typename Job>
+Drawn DrawMergeJob(hwc::VicSession *vic, const Job &job) {
+  Drawn drawn;
+  const int ready = job.target_ready ? *job.target_ready : -1;
+  if (job.parts.empty()) {
+    drawn.fence = vic->Compose(*job.target, job.layers, job.width, job.height,
+                               ready, job.group_code);
+    return drawn;
+  }
+  for (const IRect &part : job.parts) {
+    drawn.fence = vic->Compose(*job.target, job.layers, job.width,
+                               job.height, ready, job.group_code, &part);
+    if (!drawn.fence)
+      break;
+    drawn.passes++;
+  }
+  if (!drawn.fence) {
+    drawn.drew_whole = true;
+    drawn.fence = vic->Compose(*job.target, job.layers, job.width, job.height,
+                               ready, job.group_code);
+  }
+  return drawn;
+}
+
+}  // namespace
+
+void TegraAtomicStateManager::VicWorkerLoop() {
+  pthread_setname_np(pthread_self(), "hwc-vic");
+  /* SCHED_FIFO at 2, as the binder thread it works for and the GPU
+   * executor's: the frame waits on this thread. */
+  struct sched_param param = {};
+  param.sched_priority = 2;
+  sched_setscheduler(0, SCHED_FIFO, &param);
+
+  /* A job is taken only once the engine is done with the one before.
+   * Work piled behind a drawing that runs long would only make each frame
+   * after it later still; held back instead, a job that may be dropped is
+   * dropped when its frame goes up, and the window shows the last group
+   * drawn -- one frame repeated rather than every frame after it late. */
+  SharedFd last;
+  for (;;) {
+    if (last)
+      sync_wait(*last, -1);
+    auto taken = vic_jobs_.Take();
+    if (!taken)
+      return;
+    VicDrawn drawn = DrawMergeJob<VicDrawn>(vic_, taken->second);
+    const bool submitted = static_cast<bool>(drawn.fence);
+    last = drawn.fence;
+    vic_jobs_.Done(taken->first, submitted, std::move(drawn));
+  }
+}
+
+void TegraAtomicStateManager::DropPendingMerge() {
+  if (!pending_merge_)
+    return;
+  /* Taken back whether or not the worker got to it: a drawing under way
+   * runs to its end into a slot that is then never shown, and the slot is
+   * known to hold nothing remembered. */
+  vic_jobs_.Cancel(pending_merge_->id);
+  slot_pictures_.Lost(pending_merge_->target);
+  scratch_->Rewind();
+  pending_merge_.reset();
+  merges_.queued_given_up++;
+}
+
+void TegraAtomicStateManager::QueueMerge(const TegraAtomicRequest &tegra) {
+  DropPendingMerge();
+  const auto &merge = tegra.GetMerge();
+  if (!vic_worker_wanted_ || vic_ == nullptr || scratch_ == nullptr ||
+      merge.layers.empty())
+    return;
+  /* A group the window already shows is not drawn at all. */
+  if (merge_cache_ && JudgeMerge(merge) == MergeVerdict::kSame)
+    return;
+  const auto group_turn = UniformTurn(merge.transforms);
+  if (!group_turn)
+    return;
+  const int forced_group = ForcedVicTransform();
+  const uint32_t group_code =
+      *group_turn != 0 && forced_group >= 0 && forced_group <= 7
+          ? static_cast<uint32_t>(forced_group)
+          : VicTransformFor(*group_turn);
+
+  if (!vic_worker_.joinable())
+    vic_worker_ = std::thread([this] { VicWorkerLoop(); });
+
+  SharedFd target_ready;
+  const hwc::ScratchPool::Slot *target = scratch_->Next(&target_ready);
+  if (target == nullptr)
+    return;
+
+  PendingMerge pending;
+  pending.target = target;
+  pending.group_code = group_code;
+  pending.members = MergeMembers(merge);
+  for (size_t i = 0; i < pending.members.size() && i < merge.damages.size();
+       ++i)
+    slot_pictures_.Record(pending.members[i], merge.damages[i].dmg_rects);
+  if (partial_ && group_code == 0)
+    pending.plan = slot_pictures_.Decide(target, merge.width, merge.height,
+                                         pending.members);
+  pending.untouched = pending.plan.kind == partial::Plan::Kind::kUnchanged;
+  if (pending.untouched)
+    pending.held_fence = slot_pictures_.Fence(target);
+  slot_pictures_.Lost(target);
+  pending.key.Remember(merge.width, merge.height,
+                       pending.members);
+  /* The last group may stand in for this one only if it is the same group
+   * in the same buffer size: the same members, a newer frame of some or
+   * moved within the group. Anything that changes what the window is --
+   * its size, its members, their turn -- is drawn. */
+  if (merge_cache_ && last_merge_fence_) {
+    switch (JudgeMerge(merge)) {
+      case MergeVerdict::kChangedFrame:
+      case MergeVerdict::kChangedGeometry:
+      case MergeVerdict::kChangedBlend:
+        pending.droppable = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (!pending.untouched) {
+    VicJob job;
+    job.target = target->vendor;
+    job.layers = merge.layers;
+    /* The layers' fences are the client's, borrowed until its next buffer;
+     * the job may outlive that if this frame is validated again before it
+     * is shown, so it reads copies of its own. */
+    for (auto &l : job.layers) {
+      if (l.acquire_fence < 0)
+        continue;
+      SharedFd copy = MakeSharedFd(dup(l.acquire_fence));
+      l.acquire_fence = copy ? *copy : -1;
+      job.fences.push_back(std::move(copy));
+    }
+    job.width = merge.width;
+    job.height = merge.height;
+    job.target_ready = std::move(target_ready);
+    job.group_code = group_code;
+    job.parts = pending.plan.parts;
+    pending.id = vic_jobs_.Queue(std::move(job), pending.droppable);
+  }
+  pending_merge_ = std::move(pending);
+  merges_.queued++;
+}
+
+TegraAtomicStateManager::MergeVerdict TegraAtomicStateManager::JudgeMerge(
+    const TegraAtomicRequest::Merge &merge) const {
+  return merge_memory_.Judge(merge.width, merge.height,
+                             MergeMembers(merge));
+}
+
+bool TegraAtomicStateManager::RecognisesMerge(
+    const TegraAtomicRequest::Merge &merge) {
+  switch (JudgeMerge(merge)) {
+    case MergeVerdict::kSame:
+      return true;
+    case MergeVerdict::kFirstSight:
+      merges_.first_sight++;
+      return false;
+    case MergeVerdict::kChangedShape:
+      merges_.changed_shape++;
+      return false;
+    case MergeVerdict::kChangedSize:
+      merges_.changed_size++;
+      return false;
+    case MergeVerdict::kNameless:
+      merges_.nameless++;
+      return false;
+    case MergeVerdict::kChangedIdentity:
+      merges_.changed_identity++;
+      return false;
+    case MergeVerdict::kChangedFrame:
+      merges_.changed_frame++;
+      return false;
+    case MergeVerdict::kChangedGeometry:
+      merges_.changed_geometry++;
+      return false;
+    case MergeVerdict::kChangedBlend:
+      merges_.changed_blend++;
+      return false;
+    case MergeVerdict::kChangedTransform:
+      merges_.changed_transform++;
+      return false;
+    case MergeVerdict::kChangedEffects:
+      /* The engine draws no effects; nothing sets them on a member. */
+      merges_.changed_geometry++;
+      return false;
+  }
+  return false;
+}
+
+void TegraAtomicStateManager::RememberMerge(
+    const TegraAtomicRequest::Merge &merge,
+    const hwc::DcHead::Window &described, const SharedFd &drawn) {
+  merge_memory_.Remember(merge.width, merge.height,
+                         MergeMembers(merge));
+  last_merge_described_ = described;
+  last_merge_fence_ = drawn;
+}
+
+namespace {
+
+/* The windows a frame put on the panel, one to a line, in the controller's
+ * own terms: which window, from what memory, how far back, which part of the
+ * buffer and where on the panel. The order the planner stacked them in is
+ * only visible here -- no picture shows it. */
+std::string DescribeWindows(const std::vector<hwc::DcHead::Window> &windows) {
+  std::string out;
+  for (const auto &w : windows) {
+    char line[256];
+    snprintf(line, sizeof(line),
+             "win %d fd %d z %u src %.1f,%.1f %.1fx%.1f -> %d,%d %dx%d "
+             "fmt %u flags 0x%x bh %u blend %u alpha %u stride %u fence %d\n",
+             w.index, w.bufferFd, w.z, w.sourceX, w.sourceY, w.sourceWidth,
+             w.sourceHeight, w.outX, w.outY, w.outWidth, w.outHeight,
+             w.pixelFormat, w.flags, w.blockHeightLog2, w.blend,
+             w.globalAlpha, w.stride, w.preFence);
+    out += line;
+  }
+  return out;
+}
+
+/* A group as the planner sent it: where its window sits, and each member's
+ * part of its buffer and place inside the group. */
+std::string DescribeMerge(const TegraAtomicRequest::Merge &merge) {
+  char line[256];
+  snprintf(line, sizeof(line),
+           "merge into window %d slot %zu z %u at %d,%d %ux%u, %zu member(s)\n",
+           merge.window, merge.slot, merge.depth, merge.origin_x,
+           merge.origin_y, merge.width, merge.height, merge.layers.size());
+  std::string out = line;
+  for (size_t i = 0; i < merge.layers.size(); ++i) {
+    const auto &l = merge.layers[i];
+    snprintf(line, sizeof(line),
+             "  [%zu] id %" PRIu64 " turn %u src %.1f,%.1f-%.1f,%.1f -> "
+             "%d,%d-%d,%d alpha %.3f %s fence %d\n",
+             i, i < merge.source_ids.size() ? merge.source_ids[i] : 0,
+             i < merge.transforms.size() ? merge.transforms[i] : 0,
+             l.source_left, l.source_top, l.source_right, l.source_bottom,
+             l.display_left, l.display_top, l.display_right, l.display_bottom,
+             l.alpha, l.premultiplied ? "premult" : "coverage",
+             l.acquire_fence);
+    out += line;
+    if (i < merge.generations.size())
+      out += "      gen " + std::to_string(merge.generations[i]);
+    if (i < merge.damages.size()) {
+      std::string dmg;
+      for (const IRect &r : merge.damages[i].dmg_rects) {
+        char one[48];
+        snprintf(one, sizeof(one), " %d,%d-%d,%d", r.left, r.top, r.right,
+                 r.bottom);
+        dmg += one;
+      }
+      out += " damage" + (dmg.empty() ? std::string(" whole") : dmg);
+    }
+    out += "\n";
+  }
+  return out;
+}
+
+/* How the frame's group came to be on the window, for its words. */
+std::string HowDrawn(bool reused, bool drawn, const partial::Plan &plan) {
+  if (reused)
+    return ", group shown from memory";
+  if (!drawn)
+    return "";
+  if (plan.kind == partial::Plan::Kind::kUnchanged)
+    return ", slot already held it";
+  if (plan.parts.empty())
+    return ", slot drawn whole";
+  const IRect box = partial::Bounds(plan.parts);
+  char how[96];
+  snprintf(how, sizeof(how), ", slot drawn %s in %zu part(s) within %d,%d-%d,%d",
+           plan.kind == partial::Plan::Kind::kPartial ? "in part" : "in full",
+           plan.parts.size(), box.left, box.top, box.right, box.bottom);
+  return how;
+}
+
+}  // namespace
+
+int TegraAtomicStateManager::Execute(const AtomicRequest &request,
+                                     AtomicCommitResult *out_result) {
+  const auto &tegra = static_cast<const TegraAtomicRequest &>(request);
+
+  if (tegra.GetPowerMode() && *tegra.GetPowerMode() != power_mode_seen_) {
+    power_mode_seen_ = *tegra.GetPowerMode();
+    if (composition_governor_ != nullptr)
+      composition_governor_->PowerMode(GovernorPower(power_mode_seen_));
+  }
+
+  /* Lighting the panel comes before showing anything on it: a frame posted
+   * to a display that is not scanning out never appears, and nothing later
+   * repeats it. Going dark is the other way round for the same reason -- the
+   * last frame asked for should be on screen when the light goes out. */
+  if (tegra.GetPowerMode() && *tegra.GetPowerMode() == PowerMode::kOn) {
+    int err = SetPowered(true);
+    if (err) {
+      /* A frame abandoned before anything was drawn or shown -- but a
+       * frame nobody judged all the same. See ForgetMerge. */
+      ForgetMerge();
+      return err;
+    }
+  }
+
+  if (!tegra.HasComposition()) {
+    /* A commit with no frame is a frame nobody judged -- see ForgetMerge. */
+    ForgetMerge();
+    if (tegra.GetPowerMode() && *tegra.GetPowerMode() != PowerMode::kOn)
+      return SetPowered(false);
+    return 0;
+  }
+
+  /* The frame's colour transform, before the frame itself: the write is
+   * folded in at the next frame boundary whatever the order here, and a
+   * frame the controller then refuses leaves colour -- a property of the
+   * display, not of any one frame -- pointing the way the framework said. */
+  if (cmu_ctm_ && tegra.GetColorMatrix())
+    ProgramColorMatrix(*tegra.GetColorMatrix());
+
+  std::vector<hwc::DcHead::Window> windows = tegra.GetWindows();
+
+  /* What would not fit a window is drawn now, into a buffer of our own, and
+   * the window is told to show that instead.
+   *
+   * Here rather than where the plan was described, because a plan is weighed
+   * several times before one is chosen and only one of those becomes a frame.
+   */
+  SharedFd merged;
+  bool merge_reused = false;
+  /* What the engine drew into, kept for a picture of it once the frame is
+   * up; see PictureCapture. */
+  const hwc::VendorBuffer *merged_target = nullptr;
+  bool merged_turned = false;
+  /* The slot this frame's group went into, while its drawing has yet to
+   * reach the panel: a flip that fails leaves it holding nothing known. */
+  const hwc::ScratchPool::Slot *drawn_slot = nullptr;
+  partial::Plan drawn_plan;
+  /* Where the drawn buffer's group stands on the panel. */
+  int32_t drawn_x = 0;
+  int32_t drawn_y = 0;
+  const auto &merge = tegra.GetMerge();
+  if (merge.layers.empty())
+    DropPendingMerge();
+  if (!merge.layers.empty()) {
+    if (vic_ == nullptr || scratch_ == nullptr) {
+      ALOGE("a frame was planned for an engine this display has not got");
+      return -EINVAL;
+    }
+
+    const bool same = merge_cache_ && RecognisesMerge(merge);
+
+    /* Drawn already, or being drawn, if validate queued this very group. A
+     * droppable job the engine has not taken yet -- it is still busy with
+     * the group before -- is dropped now, and the window shows that group
+     * again, as for a group shown a frame behind. */
+    const bool queued =
+        !same && pending_merge_ &&
+        pending_merge_->key.Judge(merge.width, merge.height,
+                                  MergeMembers(merge)) ==
+            PictureMemory::Verdict::kSame;
+    std::optional<VicDrawn> resolved;
+    bool dropped = false;
+    if (queued && !pending_merge_->untouched) {
+      auto out = vic_jobs_.Resolve(pending_merge_->id,
+                                   !pending_merge_->droppable);
+      if (out.state == VicJobs::State::kDropped) {
+        dropped = true;
+      } else {
+        resolved = out.result ? std::move(*out.result) : VicDrawn{};
+      }
+    }
+    /* The group as last drawn but for a newer frame of some member whose
+     * client is still drawing it: the engine would wait for that drawing
+     * in the stream and the flip for the engine, so the panel would miss
+     * its refresh for the sake of one member. The group is shown as it was
+     * instead, a frame behind, and drawn on the next frame whether the
+     * member is ready by then or not. Only the same members in the same
+     * places: anything else and the remembered pixels are not this group. */
+    const bool lag =
+        !same && merge_cache_ && !lagged_last_ && last_merge_fence_ &&
+        merge_memory_.SameButFrames(merge.width, merge.height,
+                                    MergeMembers(merge)) &&
+        std::any_of(merge.layers.begin(), merge.layers.end(),
+                    [](const hwc::VicSession::Layer &l) {
+                      return QueryFence(l.acquire_fence) == FenceState::kPending;
+                    });
+    lagged_last_ = lag;
+
+    if (dropped) {
+      /* The slot the dropped job would have drawn into was never written:
+       * its turn is given back, and what it held is still what it held,
+       * but it was let go as known when the job was queued. */
+      pending_merge_.reset();
+      scratch_->Rewind();
+      merges_.dropped++;
+      hwc::MarkDropped("vic");
+    }
+
+    if (same || lag || dropped) {
+      DropPendingMerge();
+      /* The group is the one already drawn, so the window is shown the
+       * buffer it is already showing. No buffer changes hands: the pool is
+       * not advanced, nothing is described again, and the layers' own fences
+       * need no heeding -- a buffer that kept its identity was not drawn
+       * into, or the client would have had to queue a different one for at
+       * least the frame in between; one shown a frame behind is not read.
+       * The fence below came due when the original drawing finished, so the
+       * flip's wait on it is a no-op.
+       *
+       * A flip that failed goes unnoticed here on purpose: the next frame's
+       * reuse submits this same description again, so a dropped frame
+       * retries itself out of what is remembered. */
+      if (same)
+        merges_.reused++;
+      else if (lag)
+        merges_.lagged++;
+      merge_reused = true;
+      windows[merge.slot] = last_merge_described_;
+      /* Drawn while shown in one window, perhaps, and shown in another
+       * now: the picture is the same, the window is this frame's. */
+      windows[merge.slot].index = merge.window;
+      windows[merge.slot].preFence = last_merge_fence_ ? *last_merge_fence_
+                                                       : -1;
+
+      /* Where the group sits now, not where it sat when it was drawn. The
+       * pixels are relative to the group's corner, so a moved group is the
+       * remembered picture in a new place -- the window follows it, in the
+       * plane and in the stack alike. */
+      windows[merge.slot].outX = merge.origin_x;
+      windows[merge.slot].outY = merge.origin_y;
+      windows[merge.slot].z = merge.depth;
+    } else {
+      /* Anything but the group queued at validate: the queued job is let go
+       * and the group drawn here, as it always was. */
+      if (!queued)
+        DropPendingMerge();
+
+      /* The buffer and, separately, when it may be written to. The engine is
+       * told the second and waits for it itself; nothing here does. */
+      SharedFd target_ready;
+      const hwc::ScratchPool::Slot *target =
+          queued ? pending_merge_->target : scratch_->Next(&target_ready);
+      if (target == nullptr) {
+        ForgetMerge();
+        return -EBUSY;
+      }
+
+      /* The merge pass carries the group's one transform. A mixed seating
+       * is a planner error: refuse rather than draw the members unturned. */
+      const auto group_turn = UniformTurn(merge.transforms);
+      if (!group_turn) {
+        pending_merge_.reset();
+        scratch_->Rewind();
+        ForgetMerge();
+        return -EINVAL;
+      }
+
+      /* The same door the turning pass used to answer to, so a code can
+       * still be walked on this route. */
+      const int forced_group = ForcedVicTransform();
+      const uint32_t group_code =
+          *group_turn != 0 && forced_group >= 0 && forced_group <= 7
+              ? static_cast<uint32_t>(forced_group)
+              : VicTransformFor(*group_turn);
+
+      /* What of the slot to draw again: the slot still holds the picture it
+       * was last drawn with, and the members' damage since says where this
+       * one differs from it. Their damage is kept whether or not it is
+       * asked of, so that a slot coming round finds the frames it missed.
+       * A queued group was decided so at validate. */
+      std::vector<PictureMemory::Member> members;
+      partial::Plan plan;
+      bool untouched = false;
+      SharedFd held_fence;
+      if (queued) {
+        members = std::move(pending_merge_->members);
+        plan = std::move(pending_merge_->plan);
+        untouched = pending_merge_->untouched;
+        held_fence = pending_merge_->held_fence;
+      } else {
+        members = MergeMembers(merge);
+        for (size_t i = 0; i < members.size() && i < merge.damages.size();
+             ++i)
+          slot_pictures_.Record(members[i], merge.damages[i].dmg_rects);
+        if (partial_ && group_code == 0)
+          plan = slot_pictures_.Decide(target, merge.width, merge.height,
+                                       members);
+        else
+          plan.why = 'o';
+        untouched = plan.kind == partial::Plan::Kind::kUnchanged;
+        if (untouched)
+          held_fence = slot_pictures_.Fence(target);
+        slot_pictures_.Lost(target);
+      }
+
+      if (composition_governor_ != nullptr && !untouched)
+        hwc::MarkMergeForCalibration(merge, planned_seq_);
+
+      /* Timed for the dump only, and only when it is asked to. */
+      const bool timed = Properties::Statistics();
+      const int64_t before_merge = timed ? GetTimeMonotonicNs() : 0;
+      /* A slot that already holds the picture is shown as it stands, against
+       * the fence its drawing came due on: nothing is written, so the
+       * display reading it at the same time is no hazard. */
+      if (untouched) {
+        merged = held_fence;
+      } else {
+        VicDrawn drawn;
+        if (queued) {
+          if (resolved)
+            drawn = std::move(*resolved);
+          merges_.queued_used++;
+        } else {
+          VicJob job;
+          job.target = target->vendor;
+          job.layers = merge.layers;
+          job.width = merge.width;
+          job.height = merge.height;
+          job.target_ready = target_ready;
+          job.group_code = group_code;
+          job.parts = plan.parts;
+          drawn = DrawMergeJob<VicDrawn>(vic_, job);
+        }
+        merged = drawn.fence;
+        merges_.passes += drawn.passes;
+        if (drawn.drew_whole) {
+          merges_.parts_refused++;
+          plan = partial::Plan{};
+          plan.why = 'x';
+        }
+      }
+      pending_merge_.reset();
+      if (!merged) {
+        /* The engine would not take it. Nothing has been written, so the
+         * honest thing is to drop the frame rather than show a window
+         * whatever it held before -- and the planner will be asked again
+         * for the next one. What was remembered is dropped too: this frame
+         * went unjudged, and the argument that keeps a remembered identity
+         * honest does not survive a frame nobody watched. */
+        scratch_->Rewind();
+        ForgetMerge();
+        /* Each member's geometry rides along, because two very different
+         * faults refuse identically: a rectangle collapsed to nothing and
+         * a resize past the engine's reach. A zero on an axis names the
+         * first; a wild ratio names the second. */
+        std::string geometry;
+        for (size_t i = 0; i < merge.layers.size(); ++i) {
+          const auto &l = merge.layers[i];
+          char one[80];
+          snprintf(one, sizeof(one), " [%zu:t%u] %.0fx%.0f->%dx%d", i,
+                   i < merge.transforms.size() ? merge.transforms[i] : 0,
+                   l.source_right - l.source_left,
+                   l.source_bottom - l.source_top,
+                   l.display_right - l.display_left,
+                   l.display_bottom - l.display_top);
+          geometry += one;
+        }
+        ALOGE("the engine refused a frame of %zu layer(s):%s",
+              merge.layers.size(), geometry.c_str());
+        return -EINVAL;
+      }
+
+      /* A run armed for a rotation keeps its place for the frames that
+       * carried a turn. A still portrait scene draws merge after merge with
+       * nothing turned in any of them, and such a run would spend itself
+       * on those and catch the rotation's last frames or none. Counted the
+       * same way it is drawn: any member turned at all. */
+      const bool any_turn =
+          group_turn != 0 ||
+          std::any_of(merge.transforms.begin(), merge.transforms.end(),
+                      [](uint8_t bits) { return bits != 0; });
+      merged_target = target->vendor;
+      merged_turned = any_turn;
+      last_merge_vendor_ = target->vendor;
+      drawn_slot = target;
+      drawn_x = merge.origin_x;
+      drawn_y = merge.origin_y;
+
+      slot_pictures_.Drawn(target, merge.width, merge.height,
+                           std::move(members), plan, merged);
+
+      const int64_t took = timed ? GetTimeMonotonicNs() - before_merge : 0;
+      const uint64_t group_pixels =
+          static_cast<uint64_t>(merge.width) * merge.height;
+      if (plan.kind == partial::Plan::Kind::kPartial) {
+        merges_.partial++;
+        merges_.partial_pixels += partial::Area(plan.parts);
+        merges_.partial_group_pixels += group_pixels;
+      } else if (!untouched && !plan.parts.empty()) {
+        merges_.held_full++;
+        merges_.held_full_pixels += partial::Area(plan.parts);
+        merges_.held_full_group_pixels += group_pixels;
+      }
+      /* A slot that already held the picture woke no engine: counted on its
+       * own, and kept out of the engine's averages. */
+      if (untouched) {
+        merges_.untouched++;
+      } else {
+        merges_.frames++;
+        if (group_turn != 0)
+          merges_.turn_folded++;
+        merges_.layers += merge.layers.size();
+        const size_t bucket =
+            merge.layers.empty()
+                ? 0
+                : std::min<size_t>(merge.layers.size() - 1, 4);
+        merges_.members[bucket]++;
+        merges_.engine_ns += took;
+        if (took > merges_.engine_ns_max)
+          merges_.engine_ns_max = took;
+      }
+
+      drawn_plan = std::move(plan);
+
+      /* Cut from the zone by this composer: there is no allocator to ask,
+       * and nothing to ask it -- the buffer is described by what the
+       * library built when it was born, and it begins where it begins. */
+      const int buffer_fd = target->vendor->mem_fd();
+      const uint32_t buffer_offset = 0;
+      const uint32_t buffer_stride = target->vendor->pitch;
+      if (buffer_fd < 0) {
+        scratch_->Rewind();
+        ForgetMerge();
+        ALOGE("the buffer the engine just drew has no fd for the window");
+        return -EINVAL;
+      }
+
+      hwc::DcHead::Window &window = windows[merge.slot];
+      window = hwc::DcHead::Window{};
+      window.index = merge.window;
+      window.bufferFd = buffer_fd;
+      window.offset = buffer_offset;
+      window.stride = buffer_stride;
+
+      /* Ours to know rather than to ask about: this buffer was allocated by
+       * this composer, as thirty-two bit colour laid out in rows, which is
+       * the one shape the window it is bound for can show. */
+      window.pixelFormat = TEGRA_DC_EXT_FMT_R8G8B8A8;
+      window.flags = 0;
+      window.blockHeightLog2 = 0;
+
+      /* Shown unresized, and only the group's worth of it. The buffer is
+       * panel-sized because the pool allocates once for the worst case, but
+       * the group lives in its top-left corner and the window reads exactly
+       * that: everything about where each layer sits inside the group is
+       * already in the pixels, and where the group sits on the panel is
+       * said here, in the window's destination. The controller never
+       * fetches past the rectangle it is given -- a strip's window costs a
+       * strip's bandwidth. */
+      window.sourceWidth = static_cast<float>(merge.width);
+      window.sourceHeight = static_cast<float>(merge.height);
+      window.outX = merge.origin_x;
+      window.outY = merge.origin_y;
+      window.outWidth = static_cast<int32_t>(merge.width);
+      window.outHeight = static_cast<int32_t>(merge.height);
+      window.z = merge.depth;
+      window.blend = TEGRA_DC_EXT_BLEND_PREMULT;
+      window.preFence = *merged;
+
+      RememberMerge(merge, window, merged);
+
+      /* The governor hears of the merge now, by a copy of the engine's
+       * fence -- the one signal that the engine is done with it, and the
+       * copy is the governor's to close. Now rather than after the flip:
+       * the processor's lift ends with the submit, and the flip is still
+       * a millisecond or two away. */
+      if (composition_governor_ != nullptr && !untouched)
+        composition_governor_->MergeSubmitted(planned_seq_, DupFd(merged));
+    }
+  } else {
+    /* No group this frame, so no frame of any group was judged: a layer
+     * away from the merge can be redrawn under a kept identity, and this
+     * path would not see the buffer that proves it. Forgotten, so that the
+     * group's return starts the argument over. */
+    ForgetMerge();
+  }
+
+  /* The pointer, before the frame: the unit latches on the same blank the
+   * flip aims at, so telling it first puts sprite and frame up together.
+   * Hiding is a duty owed the moment the pointer leaves the scene -- the
+   * unit draws independently of frames, and a sprite nobody hides
+   * outlives everything. A refused Show simply leaves this frame without
+   * the unit; the layer goes back through the ordinary negotiation next
+   * frame. */
+  if (cursor_ != nullptr) {
+    const auto &point = tegra.GetCursor();
+    if (point.present) {
+      cursor_shown_ = cursor_->Show(point.handle, point.id, point.width,
+                                    point.height, point.stride_px,
+                                    point.premultiplied,
+                                    point.acquire ? *point.acquire : -1,
+                                    point.x, point.y,
+                                    point.seq == cursor_move_seq_);
+    } else if (cursor_shown_) {
+      cursor_->Hide();
+      cursor_shown_ = false;
+    }
+  }
+
+  const bool flip_timed = ::android::hwc::LoggingWanted();
+  const int64_t before_flip = flip_timed ? GetTimeMonotonicNs() : 0;
+
+  hwc::UniqueFd post_fence;
+  int err = head_.flip(windows, &post_fence);
+  if (err) {
+    /* A frame drawn by the engine and refused by the controller was never
+     * shown: the slot it went into is the right one to draw the next
+     * attempt into, and its description must not be shown from memory --
+     * a reuse would put on the panel a frame the panel never accepted,
+     * against a pool that still truthfully names the older buffer. A
+     * reused frame that fails here needs neither: nothing was drawn, and
+     * what memory describes is exactly what the panel kept showing. */
+    if (merged) {
+      scratch_->Rewind();
+      ForgetMerge();
+      if (drawn_slot != nullptr)
+        slot_pictures_.Lost(drawn_slot);
+    }
+    return err;
+  }
+
+  frames_executed_++;
+
+  /* After the flip, so the words carry every window the frame put up and
+   * the wait for the engine costs this frame nothing on the panel. */
+  using hwc::PictureCapture;
+  if (PictureCapture::Wanted(PictureCapture::Source::kFrame) ||
+      PictureCapture::Wanted(PictureCapture::Source::kMerge) ||
+      PictureCapture::Wanted(PictureCapture::Source::kMergeTurned)) {
+    char head[128];
+    snprintf(head, sizeof(head), "frame %" PRIu64 " plan %" PRIu64 "%s\n",
+             frames_executed_, planned_seq_,
+             HowDrawn(merge_reused, drawn_slot != nullptr, drawn_plan).c_str());
+    std::string words = head;
+    if (!merge.layers.empty())
+      words += DescribeMerge(merge);
+    words += DescribeWindows(windows);
+    /* Which buffer sat where: the plan's own rows, bottom first. A window
+     * that shows an older picture shows it under an older id. */
+    for (const auto &row : tegra.GetFrameNote().layers) {
+      char line[96];
+      snprintf(line, sizeof(line), "layer id %" PRIu64 " seat %c plane %u at %d,%d %dx%d\n",
+               row.id, row.seat, row.plane, row.x, row.y, row.w, row.h);
+      words += line;
+    }
+    PictureCapture::WriteText(PictureCapture::Source::kFrame, words);
+    if (merged_target != nullptr && !PictureCapture::WordsOnly()) {
+      const auto source = PictureCapture::Wanted(PictureCapture::Source::kMerge)
+                              ? PictureCapture::Source::kMerge
+                              : PictureCapture::Source::kMergeTurned;
+      if (source == PictureCapture::Source::kMerge || merged_turned)
+        PictureCapture::Write(source, merged_target->pixels, merge.width,
+                              merge.height, merged_target->pitch, *merged,
+                              words);
+    }
+  }
+
+  /* The panel as this flip stacked it: every described window, and the
+   * group's, in the image engine's hands. The frame after a run still
+   * comes here once, to collect the last picture and write the run out. */
+  if (PictureCapture::Wanted(PictureCapture::Source::kPanel) ||
+      (mirror_ && mirror_->Busy())) {
+    if (!mirror_ && vic_ != nullptr && !modes_.empty()) {
+      const drmModeModeInfo &mode = modes_.front().GetRawMode();
+      mirror_ = std::make_unique<hwc::PanelMirror>(vic_, mode.hdisplay,
+                                                   mode.vdisplay);
+    }
+    if (mirror_) {
+      std::vector<hwc::PanelMirror::Window> shown = tegra.GetPanel();
+      const hwc::VendorBuffer *group =
+          merge_reused ? last_merge_vendor_ : merged_target;
+      if (!merge.layers.empty() && group != nullptr) {
+        hwc::PanelMirror::Window w;
+        w.index = windows[merge.slot].index;
+        w.depth = windows[merge.slot].z;
+        w.layer.handle = nullptr;
+        w.layer.vendor = group;
+        w.layer.source_right = static_cast<float>(merge.width);
+        w.layer.source_bottom = static_cast<float>(merge.height);
+        w.layer.display_left = merge.origin_x;
+        w.layer.display_top = merge.origin_y;
+        w.layer.display_right =
+            merge.origin_x + static_cast<int32_t>(merge.width);
+        w.layer.display_bottom =
+            merge.origin_y + static_cast<int32_t>(merge.height);
+        w.layer.premultiplied = true;
+        w.layer.alpha = 1.F;
+        w.layer.acquire_fence = windows[merge.slot].preFence;
+        shown.push_back(w);
+      }
+      char head[128];
+      snprintf(head, sizeof(head), "frame %" PRIu64 " plan %" PRIu64 "%s\n",
+               frames_executed_, planned_seq_,
+               HowDrawn(merge_reused, drawn_slot != nullptr, drawn_plan)
+                   .c_str());
+      mirror_->Frame(std::move(shown), head + DescribeWindows(windows));
+    }
+  }
+
+  /* The frame as it went up: the ring's line is written only here, past
+   * every refusal above, so what the ring says was shown was shown. */
+  NoteFrame(tegra, windows, merge_reused,
+            drawn_slot != nullptr ? &drawn_plan : nullptr, drawn_x, drawn_y);
+
+  /* Said even when the flip failed would be wrong -- nothing is showing that
+   * buffer then, and holding it back would cost a frame for nothing. Said
+   * here, with the fence this flip returned: the buffer is free to be drawn
+   * into again once the display has finished reading it, and that is what
+   * this fence means. */
+  if (merged && scratch_ != nullptr && post_fence)
+    scratch_->Presented(MakeSharedFd(::dup(post_fence.get())));
+
+  /* Only when the flip did not fit comfortably inside a refresh -- the
+   * rest is the ordinary case and says nothing. */
+  constexpr int64_t kWorthSaying = 3000000;
+  const int64_t after_flip = flip_timed ? GetTimeMonotonicNs() : 0;
+  if (after_flip - before_flip > kWorthSaying) {
+    HWC_LOGD("slow present: flip %" PRId64 "us",
+             (after_flip - before_flip) / 1000);
+  }
+
+  /* Which flip's fence goes back to the framework.
+   *
+   * The contract is not ambiguous about this. A present fence signals "when
+   * the current frame appears on the screen"; a release fence signals "when
+   * the HWC is no longer using the previous buffer because the current buffer
+   * has replaced the previous buffer on the display". Both name one instant,
+   * and that instant belongs to this flip.
+   *
+   * This used to be a switch, because the true answer once cost whole frames:
+   * a fence still pending at the client's next wake-up made it drop the frame
+   * outright, with no grace at all. That check is off now (the device's
+   * system.prop turns it off), the kernel raises the fence from the vblank
+   * itself, and the panel has said its piece: fed the true fence every frame,
+   * the client's model of the refresh stops being torn down and rebuilt twice
+   * a second, and a run of transitions comes out the same length every time.
+   *
+   * The loose answers turned out to have prices of their own. The flip before
+   * is a fence already come due -- and the framework frees a dying layer's
+   * last buffer with exactly this fence, so a stale one hands the buffer back
+   * while the panel is still reading it. No fence at all reads as "already
+   * free" and frees it the same way. The true fence is also the safe one.
+   *
+   * The first frame has no predecessor and hands back nothing, which reads as
+   * already presented -- it is.
+   */
+  SharedFd this_post_fence = post_fence ? MakeSharedFd(post_fence.release())
+                                        : SharedFd{};
+
+  if (out_result != nullptr) {
+    out_result->present_fence = this_post_fence;
+
+    /* The same instant, so the same fence. When these two answers differed,
+     * a paragraph stood here reconciling them; with both questions answered
+     * truly there is nothing left to reconcile. */
+    out_result->release_fence = this_post_fence;
+
+    /* What the engine read, said separately from what the display was given.
+     *
+     * These buffers were drawn into a scratch buffer of ours and the display
+     * was handed that instead, so nothing on the panel is reading them. They
+     * stopped being read when the engine finished, which this fence names --
+     * and the display has not even started by then, since the flip above was
+     * told to wait for this very fence before touching the result.
+     *
+     * The vendor's own composer did exactly this, and its interface required
+     * it in as many words: the fence a composition returns "will be signalled
+     * once composition is complete", and the client "is responsible for
+     * updating each layer" with it. Ours handed every layer the flip's fence
+     * instead, which for these is one to two frames further off than the
+     * truth -- and a buffer withheld that long from a client with three of
+     * them leaves it drawing into two.
+     */
+    if (report_engine_reads_ && merged && !merge.layers.empty()) {
+      out_result->engine_fence = merged;
+      out_result->engine_read.reserve(merge.layers.size());
+      for (const auto &layer : merge.layers)
+        if (layer.handle != nullptr) {
+          out_result->engine_read.push_back(layer.handle);
+          HWC_LOGD("engine read %p for fence %d", layer.handle,
+                   *merged);
+        }
+    }
+  }
+
+  previous_post_fence_ = std::move(this_post_fence);
+
+  /* The rate goes with the frame that carried it, once the frame is up: the
+   * framework counts the change as made when this commit returns. The head
+   * takes the porch at the end of the frame it is scanning, without a flip,
+   * and the vsync worker reports the new period from the first blank that
+   * runs at it. */
+  if (tegra.GetRate()) {
+    porch_ = tegra.GetRate()->porch;
+    period_ns_ = tegra.GetRate()->period_ns;
+    head_.setActiveVfp(porch_);
+  }
+
+  if (composition_governor_ != nullptr)
+    composition_governor_->FramePresented(planned_seq_);
+
+  /* Was it already due when it was given away? */
+  if (count_fences_) {
+    fences_.frames++;
+    if (out_result == nullptr || !out_result->present_fence) {
+      fences_.without_fence++;
+    } else {
+      switch (FenceDue(out_result->present_fence)) {
+        case Due::kYes:
+          fences_.already_due++;
+          break;
+        case Due::kNotYet:
+          fences_.not_yet_due++;
+          break;
+        case Due::kCouldNotAsk:
+          fences_.could_not_ask++;
+          break;
+      }
+    }
+  }
+
+  /* How late the fence just handed out comes due, asked one frame later.
+   *
+   * It is the client's release fence as well as this frame's present fence,
+   * and the client cannot draw into the buffer behind it until it is due. A
+   * fence trailing the frame it belongs to is a client standing still with
+   * nothing to blame -- from its side a late fence and a slow application look
+   * exactly alike.
+   *
+   * Replaced every frame now, come due or not. Held until it signalled -- what
+   * this did before -- the timestamp beside it went on naming an older frame
+   * while the fence moved on, so the interval reported was however many frames
+   * had gone by in the meantime. It read as tens of milliseconds of lateness
+   * that were never there, and it was believed for a while.
+   */
+  if (handed_out_fence_) {
+    const std::optional<int64_t> due = SignalTimeNs(handed_out_fence_);
+
+    /* Free: the asking has already been done for the warning below. */
+    if (count_fences_) {
+      if (due)
+        fences_.due_a_frame_later++;
+      else
+        fences_.still_not_due++;
+    }
+
+    constexpr int64_t kTwoRefreshesNs = 33326654;
+    if (due && *due - handed_out_ns_ > kTwoRefreshesNs) {
+      /* Said outright rather than behind the trace switch. That switch guards
+       * what is said about every frame, which is paid for whether or not
+       * anything is wrong; this is said only when something is. */
+      HWC_LOGW("the fence handed out last frame came due %" PRId64
+               "us after the flip it belongs to",
+               (*due - handed_out_ns_) / 1000);
+    }
+  }
+
+  handed_out_fence_ = out_result != nullptr ? out_result->present_fence
+                                            : SharedFd{};
+  handed_out_ns_ = before_flip;
+
+  return 0;
+}
+
+void TegraAtomicStateManager::NoteFrame(
+    const TegraAtomicRequest &tegra,
+    const std::vector<hwc::DcHead::Window> &windows, bool merge_reused,
+    const partial::Plan *drawn, int32_t drawn_x, int32_t drawn_y) {
+  if (!RingWanted())
+    return;
+
+  /* One line a frame, kept dense on purpose: the ring holds a second of
+   * frames, and a line that sprawls would make the dump itself the thing
+   * nobody reads. Per layer: the buffer's name, the seat the plan gave it,
+   * its alpha and its scale, and where it lands. Per window: the buffer it
+   * shows, the rectangle it shows it in, and its depth. */
+  std::ostringstream line;
+  line << "#" << frames_executed_ << " "
+       << SteeringWord(tegra.GetFrameNote().steering)
+       << (merge_reused ? " reuse" : "") << " L";
+  for (const auto &row : tegra.GetFrameNote().layers) {
+    char b[160];
+    snprintf(b, sizeof(b), " %llu%c%u%c a%.2f s%.2fx%.2f @%d,%d d%cg%llu",
+             static_cast<unsigned long long>(row.id), row.seat, row.plane,
+             row.blend, row.alpha, row.scale_w, row.scale_h, row.x, row.y,
+             row.damage, static_cast<unsigned long long>(row.generation));
+    line << b;
+  }
+  /* How the engine drew the group's buffer, when it drew one: k for a
+   * slot that already held it, w for the whole buffer, f for a full
+   * drawing by the members' places, p for a partial one -- then where the
+   * group stands on the panel, and each part it drew, a pass apiece, in
+   * the group's own pixels. Enough to lay the parts over a picture of the
+   * panel afterwards; nothing of it is drawn on the panel itself. */
+  if (drawn != nullptr) {
+    const char kind = drawn->kind == partial::Plan::Kind::kUnchanged ? 'k'
+                      : drawn->parts.empty()                         ? 'w'
+                      : drawn->kind == partial::Plan::Kind::kPartial ? 'p'
+                                                                     : 'f';
+    line << " | M" << kind;
+    /* And why a drawing was not partial (see partial::Plan::why). */
+    if (drawn->why != 'n')
+      line << '/' << drawn->why;
+    line << " @" << drawn_x << "," << drawn_y;
+    for (const IRect &part : drawn->parts) {
+      char b[48];
+      snprintf(b, sizeof(b), " %d,%d,%d,%d", part.left, part.top,
+               part.right, part.bottom);
+      line << b;
+    }
+  }
+  line << " | W";
+  for (const auto &window : windows) {
+    if (window.bufferFd == 0)
+      continue;
+    /* The flags word goes out beside the rectangle because the turn a
+     * window carries lives nowhere else: the layer's own transform is not
+     * in this line, and the mirrors and the columnar read are exactly what
+     * a wrongly-turned picture is made of. Printed raw -- the bits are
+     * TEGRA_DC_EXT_FLIP_FLAG_*, and naming them here would cost the line
+     * more room than reading a hex word costs the reader. */
+    char b[128];
+    snprintf(b, sizeof(b), " %d:fd%d %d,%d %dx%d z%u f%x", window.index,
+             window.bufferFd, window.outX, window.outY, window.outWidth,
+             window.outHeight, window.z, window.flags);
+    line << b;
+  }
+  /* When the line was written, in the same clock the engine's timings use.
+   * Appended last so the field order the ring has always had is untouched;
+   * intervals and percentiles are computed from it elsewhere. */
+  line << " t" << GetTimeMonotonicNs() << "\n";
+
+  if (frame_ring_.size() < kFrameRing) {
+    frame_ring_.push_back(line.str());
+  } else {
+    frame_ring_[frame_ring_pos_] = line.str();
+    frame_ring_pos_ = (frame_ring_pos_ + 1) % kFrameRing;
+  }
+}
+
+std::string TegraAtomicStateManager::DumpState() {
+  std::stringstream ss;
+
+  /* The engine's work, if this display has one. Read and reset the interval
+   * counters so two dumps around a transition describe that transition; the
+   * accepted/refused tallies come straight from the engine and run for its
+   * whole life. */
+  if (vic_ != nullptr) {
+    const MergeCounters m = merges_;
+    merges_ = {};
+
+    ss << "Merges since last dumpsys request:\n"
+       << "  frames merged           : " << m.frames << "\n"
+       << "  shown from memory       : " << m.reused << "\n"
+       << "  shown a frame behind    : " << m.lagged << "\n"
+       << "  members 1/2/3/4/5+      : " << m.members[0] << "/"
+       << m.members[1] << "/" << m.members[2] << "/" << m.members[3] << "/"
+       << m.members[4] << "\n";
+    if (m.frames != 0)
+      ss << "  layers per merge (avg)  : "
+         << (m.layers / m.frames) << "\n"
+         << "  engine us per merge     : "
+         << (m.engine_ns / 1000 / static_cast<int64_t>(m.frames)) << "\n"
+         << "  engine us worst         : " << (m.engine_ns_max / 1000)
+         << "\n";
+    /* Gated on the causes as well as the outcomes: an interval of nothing
+     * but engine refusals draws no frame and reuses none, and the causes
+     * are then the only line explaining what kept being attempted. */
+    const uint64_t causes = m.first_sight + m.changed_shape +
+                            m.changed_identity + m.changed_frame +
+                            m.changed_geometry +
+                            m.changed_size + m.changed_blend +
+                            m.changed_transform + m.nameless;
+    if (m.frames != 0 || m.reused != 0 || causes != 0)
+      ss << "  drawn because           : first " << m.first_sight
+         << ", shape " << m.changed_shape << ", buffer "
+         << m.changed_identity << ", redrawn " << m.changed_frame
+         << ", geometry " << m.changed_geometry
+         << ", size " << m.changed_size << ", blend " << m.changed_blend
+         << ", transform " << m.changed_transform << ", nameless "
+         << m.nameless << "\n";
+    if (m.turn_folded != 0)
+      ss << "  turns folded into pass  : " << m.turn_folded << "\n";
+    if (m.partial != 0 || m.untouched != 0)
+      ss << "  drawn in part           : " << m.partial << " (avg "
+         << (m.partial_group_pixels != 0
+                 ? m.partial_pixels * 100 / m.partial_group_pixels
+                 : 0)
+         << "% of group), slot already held it " << m.untouched << "\n";
+    if (m.held_full != 0)
+      ss << "  drawn in full by places : " << m.held_full << " (avg "
+         << (m.held_full_group_pixels != 0
+                 ? m.held_full_pixels * 100 / m.held_full_group_pixels
+                 : 0)
+         << "% of group)\n";
+    if (m.passes != 0 || m.parts_refused != 0)
+      ss << "  passes for parts        : " << m.passes << ", refused "
+         << m.parts_refused << "\n";
+    if (m.queued != 0)
+      ss << "  queued at validate      : " << m.queued << ", used "
+         << m.queued_used << ", given up " << m.queued_given_up
+         << ", dropped " << m.dropped << "\n";
+    if (scratch_ != nullptr)
+      ss << "  scratch pool            : " << scratch_->source_name()
+         << " (" << scratch_->width() << "x" << scratch_->height() << ")\n"
+         << scratch_->DumpSlots();
+    ss << vic_->last_target_probe();
+    ss << "Engine over its lifetime:\n"
+       << "  frames accepted         : " << vic_->composed() << "\n"
+       << "  frames refused          : " << vic_->refused() << "\n"
+       << "  scaled beyond its reach : " << TegraPlane::ScaleRefusals()
+       << " (limit " << TegraPlane::kEngineScaleReach << "x)\n";
+
+    /* What the zone is holding, and how often it would not give.
+     *
+     * The pair is the whole point: bytes alone say nothing -- the zone is
+     * there to be used -- and a refusal is the only sign that it is too
+     * small for the scene. Held bytes come from the pool because it owns
+     * the buffers; the kernel's own count of the heap is the check against
+     * this one. */
+    const size_t show_held = scratch_ != nullptr ? scratch_->held_bytes() : 0;
+    ss << "  zone held               : " << (show_held >> 10) << " KiB shown\n"
+       << "  zone refusals           : " << vic_->zone_refusals() << "\n\n";
+  }
+
+  /* The number the cursor's whole promise is judged by: a pointer moving
+   * over a still desktop must leave it exactly where it was. */
+  ss << "Frames committed          : " << frames_executed_ << "\n";
+  if (cursor_ != nullptr) {
+    cursor_->AppendDump(ss);
+    ss << "  seat asked / agreed     : " << TegraCursorPlane::Asked()
+       << " / " << TegraCursorPlane::Taken() << "\n"
+       << "  last refusal / format   : " << TegraCursorPlane::LastRefusal()
+       << " / 0x" << std::hex << TegraCursorPlane::SeenFormat() << std::dec
+       << "\n";
+  } else {
+    ss << "Cursor unit               : not claimed\n";
+  }
+
+  ss << "Panel rate                : porch " << porch_ << " (0 is the "
+        "panel's own), period " << period_ns_ / 1000 << " us, "
+     << modes_.size() << " rate(s) offered\n";
+
+  /* Quiet when colour was never asked to change: most dumps, on a display
+   * that spends its life at the identity. */
+  {
+    const CmuCounters c = cmu_;
+    cmu_ = {};
+    const uint64_t any = c.applied + c.restored + c.skipped_offset;
+    if (any != 0 || csc_programmed_) {
+      ss << "Colour transforms since last dumpsys request:\n"
+         << "  written to the pipeline : " << c.applied << "\n"
+         << "  boot state restored     : " << c.restored << "\n"
+         << "  skipped, offset         : " << c.skipped_offset << "\n"
+         << "  approximated in shape   : " << c.approximated << "\n"
+         << "  holding a transform now : " << (csc_programmed_ ? "yes" : "no")
+         << "\n\n";
+    }
+  }
+
+  /* The ring reads newest-last and survives the dump unchanged: its whole
+   * use is to bracket a defect that has to be reproduced first, so a dump
+   * must not spend it. */
+  if (!frame_ring_.empty()) {
+    ss << "Frames shown lately, oldest first:\n";
+    for (size_t i = 0; i < frame_ring_.size(); ++i) {
+      const size_t at = frame_ring_.size() < kFrameRing
+                            ? i
+                            : (frame_ring_pos_ + i) % frame_ring_.size();
+      ss << frame_ring_[at];
+    }
+  } else if (!RingWanted()) {
+    /* An empty section must read as a choice, not a fault. */
+    ss << "Frame ring                : off (vendor.hwc.ring, read at start)\n";
+  }
+
+  if (!count_fences_)
+    return ss.str();
+
+  const FenceCounters c = fences_;
+  /* Read and reset, so that two dumps around one transition describe that
+   * transition and nothing else -- which is how the composition statistics
+   * beside it are already read. */
+  fences_ = {};
+
+  ss << "Fences handed to the framework since last dumpsys request:\n"
+     << "  frames                  : " << c.frames << "\n"
+     << "  already due when given  : " << c.already_due << "\n"
+     << "  not yet due when given  : " << c.not_yet_due << "\n"
+     << "  no fence given at all   : " << c.without_fence << "\n"
+     << "  due one frame later     : " << c.due_a_frame_later << "\n"
+     << "  still not due then      : " << c.still_not_due << "\n";
+  if (c.could_not_ask != 0)
+    ss << "  could not be asked      : " << c.could_not_ask << "\n";
+
+  return ss.str();
+}
+
+bool TegraAtomicStateManager::CountFencesFromProperty() {
+  return property_get_bool("vendor.hwc.fencestats", 0) != 0;
+}
+
+bool TegraAtomicStateManager::ThrottleFromProperty() {
+  /* On unless told otherwise: it is what upstream and every vendor does, and
+   * an unbounded flip queue is hard to defend whatever it turns out to cost
+   * here. Off is for measuring it. */
+  return property_get_bool("vendor.hwc.throttle", 1) != 0;
+}
+
+bool TegraAtomicStateManager::EngineReadsFromProperty() {
+  /* On unless told otherwise. Off restores what this did before: every layer
+   * waits for the flip, whether or not the display ever read it. */
+  return property_get_bool("vendor.hwc.enginefence", 1) != 0;
+}
+
+bool TegraAtomicStateManager::MergeCacheFromProperty() {
+  /* On unless told otherwise. Off draws the merge afresh on every frame,
+   * which is what this did before -- kept switchable only so the two can be
+   * measured against each other on the panel without building twice. */
+  return property_get_bool("vendor.hwc.mergecache", 1) != 0;
+}
+
+bool TegraAtomicStateManager::CmuFromProperty() {
+  /* On unless told otherwise. Off leaves the head's colour pipeline at its
+   * boot state and the framework's matrices unapplied, which is what this
+   * did before the pipeline had a consumer. */
+  return property_get_bool("vendor.hwc.cmu", 1) != 0;
+}
+
+/* The panel's gamut corrected toward sRGB, in linear light -- the inner
+ * factor under every framework matrix, and the resting state when the
+ * calibrated mode is chosen.
+ *
+ * Reconstructed, not measured: no factory colorimetry for this module
+ * exists anywhere public, so the primaries are the ones this 63%-of-sRGB
+ * class of white-LED panel is documented to have, anchored to lab
+ * measurements of the same Sharp module in another product. Rows sum to
+ * one -- white stays white, and no non-negative input can drive the
+ * matrix stage negative. Typical-unit accuracy, not this-unit accuracy:
+ * expected to cut the native hue error roughly in half, never to
+ * eliminate it; a measured matrix can replace these numbers without
+ * touching anything else. */
+static constexpr float kPanelToSrgb[9] = {1.014F,  -0.057F, 0.043F,
+                                          -0.092F, 1.218F,  -0.126F,
+                                          -0.073F, -0.115F, 1.188F};
+
+/* Row-major 3x3 product: out = a * b. */
+static void MultiplyCsc(const float a[9], const float b[9], float out[9]) {
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      out[r * 3 + c] = a[r * 3 + 0] * b[0 * 3 + c] +
+                       a[r * 3 + 1] * b[1 * 3 + c] +
+                       a[r * 3 + 2] * b[2 * 3 + c];
+}
+
+void TegraAtomicStateManager::ProgramColorMatrix(
+    const HalColorTransformMatrix &matrix) {
+  /* The steady state: the same matrix arrives with every frame for as long
+   * as nothing changes, and must cost this comparison and nothing else. */
+  if (color_matrix_seen_ &&
+      std::equal(matrix.begin(), matrix.end(), last_color_matrix_.begin()))
+    return;
+  last_color_matrix_ = matrix;
+  color_matrix_seen_ = true;
+
+  /* Everything below runs once per change of matrix. */
+
+  constexpr float kEps = 1e-4F;
+  const float *m = matrix.data();
+
+  /* Column-major, as the client API hands it: m[col * 4 + row]. The fourth
+   * column is the offset, the bottom row the projective weight. */
+  /* The first restore after start writes home even when this instance never
+   * programmed anything: a predecessor may have died mid-transform, its
+   * state outlives it in the kernel, and a computed home cannot see it --
+   * only overwrite it. Once written, an untouched pipeline is left alone.
+   * Home is the boot pipeline, or the panel correction over it when the
+   * calibrated mode is chosen; the true boot state returns when the head
+   * is torn down. */
+  const auto restore = [this]() {
+    if (!csc_programmed_ && boot_state_written_)
+      return;
+    const bool written = calibrated_home_
+                             ? head_.setColorMatrix(kPanelToSrgb, 0.F)
+                             : head_.writeBootState();
+    if (written) {
+      if (csc_programmed_)
+        cmu_.restored++;
+      csc_programmed_ = false;
+      boot_state_written_ = true;
+    }
+  };
+
+  bool identity = true;
+  for (int i = 0; i < 16 && identity; ++i)
+    identity = fabsf(m[i] - (i % 5 == 0 ? 1.F : 0.F)) < kEps;
+  if (identity) {
+    restore();
+    return;
+  }
+
+  /* Row-major out = M * in, which is the order the head takes, and the
+   * offset column as the addition it is. */
+  float rm[9];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      rm[r * 3 + c] = m[c * 4 + r];
+
+  const float offset = (m[12] + m[13] + m[14]) / 3.F;
+  const bool has_offset = fabsf(m[12]) > kEps || fabsf(m[13]) > kEps ||
+                          fabsf(m[14]) > kEps;
+
+  bool negative = false;
+  for (float v : rm)
+    negative = negative || v < -kEps;
+
+  /* The framework's inversion family, matched by decomposition rather than
+   * by shape: the verbatim inversion alone, and the same inversion under a
+   * night tint, which the framework multiplies into one matrix -- the tint
+   * outermost, so each ROW of the product is the inversion's row scaled by
+   * that channel's factor, and the offset column carries the same factors
+   * rather than staying uniform. Each factor is recovered by least squares
+   * over its row, the residual rejects impostors, and the offset must echo
+   * the factors -- the affine half of the same composition -- or this is
+   * not that family. The true inversion's cross-channel character becomes
+   * the per-channel flip: the same feature with a different hue mapping,
+   * counted as the approximation it is. The panel correction is not
+   * composed here -- its linear-light matrix has no seat in this
+   * gamma-domain pipeline, and an inverted screen is no place to judge
+   * gamut fidelity from anyway. */
+  if (negative && has_offset && offset > 0.4F) {
+    static constexpr float kInvert[9] = {0.402F,  -1.174F, -0.228F,
+                                         -0.598F, -0.174F, -0.228F,
+                                         -0.599F, -1.175F, 0.772F};
+    float tint[3];
+    bool family = true;
+    for (int r = 0; r < 3 && family; ++r) {
+      float num = 0.F;
+      float den = 0.F;
+      for (int c = 0; c < 3; ++c) {
+        num += rm[r * 3 + c] * kInvert[r * 3 + c];
+        den += kInvert[r * 3 + c] * kInvert[r * 3 + c];
+      }
+      tint[r] = num / den;
+      family = tint[r] > 0.F && fabsf(m[12 + r] - tint[r]) < 0.05F;
+    }
+    for (int i = 0; i < 9 && family; ++i)
+      family = fabsf(rm[i] - tint[i / 3] * kInvert[i]) < 0.05F;
+
+    if (family) {
+      if (head_.setInversion(tint)) {
+        csc_programmed_ = true;
+        boot_state_written_ = true;
+        cmu_.applied++;
+        cmu_.approximated++;
+      }
+      return;
+    }
+  }
+
+  /* An offset the family above did not claim has no home here: the matrix
+   * stage has no addend, and folding a bare positive offset into the
+   * regamma would lift its floor -- a brightened screen with dead shadow
+   * contrast, worse than an untransformed frame. Nothing sends one. */
+  if (has_offset) {
+    restore();
+    cmu_.skipped_offset++;
+    return;
+  }
+
+  /* The framework's matrix is meant for gamma-encoded values -- that is how
+   * the GPU applies it -- while this matrix stage sits between a degamma
+   * and a regamma table and multiplies linear light, where the shadows keep
+   * a third more distinguishable levels. For a diagonal matrix the two
+   * domains reconcile on a power law: raising the factor to an exponent
+   * makes scale-then-encode track encode-then-scale. The exponent is fit,
+   * not read off sRGB: minimising the worst mismatch against the GPU's own
+   * application across the full level range puts it at 2.1 -- the
+   * transfer's linear toe drags it below the curve's 2.4 -- for a worst
+   * case of ~5 of 255 at the strongest night tint. Cross-channel terms
+   * have no such bridge and go in as they are; the divergence from the
+   * gamma-domain reference is real (large on daltonism simulations) and
+   * accepted deliberately: the linear domain wins on shadow precision and
+   * on colourimetry, and the reference itself is only gamma-domain because
+   * the framework has not gone linear yet. A non-uniform offset rides on
+   * the channels' average -- the table it folds into is shared -- and
+   * nothing the framework sends today has one. */
+  constexpr float kDisplayGamma = 2.1F;
+  const bool diagonal = fabsf(rm[1]) < kEps && fabsf(rm[2]) < kEps &&
+                        fabsf(rm[3]) < kEps && fabsf(rm[5]) < kEps &&
+                        fabsf(rm[6]) < kEps && fabsf(rm[7]) < kEps;
+  if (diagonal) {
+    rm[0] = powf(rm[0], kDisplayGamma);
+    rm[4] = powf(rm[4], kDisplayGamma);
+    rm[8] = powf(rm[8], kDisplayGamma);
+  }
+
+  /* The panel correction is the LAST step before the panel: the framework
+   * shapes the content, the correction compensates the glass -- so the
+   * total is correction times framework, in that order. Both live in
+   * linear light by this point, so the composition is a plain product; it
+   * commutes for night's diagonals, which is why only a saturation would
+   * ever tell the orders apart -- by thirteen percent of a channel. */
+  if (calibrated_home_) {
+    float composed[9];
+    MultiplyCsc(kPanelToSrgb, rm, composed);
+    memcpy(rm, composed, sizeof(composed));
+
+    /* The product can leave the coefficient field on extreme saturations
+     * (past roughly 1.97). Scaled down whole rather than clamped apiece:
+     * a uniform scale narrows the gamut a shade, a single clamped
+     * coefficient breaks the row sums and moves white. */
+    float peak = 0.F;
+    for (float v : rm)
+      peak = fmaxf(peak, fabsf(v));
+    if (peak > 1.99F) {
+      const float scale = 1.99F / peak;
+      for (float &v : rm)
+        v *= scale;
+    }
+  }
+
+  if (head_.setColorMatrix(rm, 0.F)) {
+    csc_programmed_ = true;
+    boot_state_written_ = true;
+    cmu_.applied++;
+    if (!diagonal)
+      cmu_.approximated++;
+  }
+}
+
+int TegraAtomicStateManager::SetPowered(bool powered) {
+  /* A repeated OFF is a no-op; a repeated ON is re-asserted regardless.
+   * The cache starts life as an assumption and a refused blank can leave
+   * it lying -- the light request is rare and idempotent, so asking the
+   * hardware again costs nothing and un-wedges a cache that lied, which
+   * once meant a black screen for the life of the process. */
+  if (active_ == powered && !powered)
+    return 0;
+
+  int err = hwc::setPanelPowered(head_.index(), powered);
+  if (err)
+    return err;
+
+  active_ = powered;
+
+  /* A blanked head refuses cursor calls and a lit one remembers none of
+   * them, so the sprite is re-stated the moment the light comes back --
+   * the same discipline the colour state keeps. */
+  if (powered && cursor_ != nullptr && cursor_shown_)
+    cursor_->Rearm();
+
+  /* Nor does it keep a stretched porch: blanking puts the panel's own back.
+   * The framework still believes in the rate it last chose, so that is the
+   * rate the panel comes back at. */
+  if (powered && porch_ != 0)
+    head_.setActiveVfp(porch_);
+
+  return 0;
+}
+
+void TegraAtomicStateManager::WaitLastFrame() {
+  /* Keep one frame in the air, no more.
+   *
+   * This used to do nothing, on the reasoning that the flip does not block and
+   * the fence it hands back is the caller's to wait on. Both halves of that are
+   * true and the conclusion still does not follow: the flip is queued, and
+   * nothing else in this composer bounds how deep that queue may get. Left
+   * alone, we run ahead of the panel -- and then a window's syncpoint maximum
+   * stands not one step above its minimum but as many as there are flips
+   * waiting, so the fence of any one of them needs that many frames rather than
+   * one. The frame the framework is holding a buffer for is not the frame the
+   * panel is about to show.
+   *
+   * It is measurable from the other side: with this empty, the recents surface
+   * sits at queued-frames=2 through the transition, its producer two frames
+   * ahead of the display with nothing free to draw into.
+   *
+   * Everyone else does this. Upstream waits on the prior present fence before
+   * every commit; Intel calls it "in-flight frames to 1"; Samsung waits up to
+   * five refreshes on the previous retire fence before submitting a config.
+   * This composer was the only one of the four with no bound at all.
+   *
+   * The caller waits here, after the next frame has been described and before
+   * it is posted, which is where upstream waits too. Describing a frame
+   * therefore overlaps the previous one reaching the panel; only the posting
+   * of it waits.
+   *
+   * Half a second, matching upstream: long enough that no honest frame ever
+   * reaches it, short enough that a display which has stopped answering does
+   * not take the composer down with it.
+   */
+  if (!throttle_to_one_frame_ || !previous_post_fence_)
+    return;
+
+  constexpr int kTimeoutMs = 500;
+  if (sync_wait(*previous_post_fence_, kTimeoutMs) < 0)
+    HWC_LOGE("the frame before this one never reached the panel");
+}
+
+}  // namespace android::drm_hwcomposer

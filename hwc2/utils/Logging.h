@@ -1,0 +1,107 @@
+/*
+ * Copyright (C) 2026 Artem Bambalov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef UTILS_LOGGING_H
+#define UTILS_LOGGING_H
+
+/* Ours rather than the platform's, and deliberately: utils/log.h is where the
+ * platform's macros are redefined so that nothing is written unless the device
+ * asked for it. Reaching past it to <utils/Log.h> would get the ungated
+ * originals back. */
+#include "utils/log.h"
+
+/* Errors and one-off state changes. Rare by nature, but still behind the
+ * switch in utils/log.h -- a fault that repeats turns a rare line into a
+ * per-frame one, and nothing here should be able to cost a frame unasked. */
+#define HWC_LOGE(...) ALOGE(__VA_ARGS__)
+#define HWC_LOGW(...) ALOGW(__VA_ARGS__)
+#define HWC_LOGI(...) ALOGI(__VA_ARGS__)
+
+/* Per-frame and per-call detail: what a plan contained, which descriptors
+ * went where, what the hardware answered.
+ *
+ * Two switches, and both have to be on. The build decides whether any of this
+ * is compiled at all:
+ *     LOCAL_CFLAGS += -DHWC_TRACE_ENABLED=1
+ * and the device decides whether what was compiled actually runs:
+ *     setprop vendor.hwc.trace 1
+ *
+ * The second exists because a line of this costs more than it looks. Writing
+ * one is a message to another process, and there are five of them in every
+ * frame -- which came to several milliseconds of a sixteen millisecond frame
+ * on this hardware, quietly taken out of the client's share of it. A build
+ * that carries the tracing should not pay for it until someone asks, and the
+ * asking is worth a restart.
+ *
+ * Read once, for the same reason: a question asked sixty times a second is
+ * itself a cost, however small the answer.
+ *
+ * The call stays inside `if (false)` when the build switch is off rather than
+ * being cut by the preprocessor, so the compiler still checks the format
+ * string against its arguments and then drops the whole statement. Tracing
+ * that stops compiling the moment it is switched off is tracing that rots.
+ */
+#ifndef HWC_TRACE_ENABLED
+#define HWC_TRACE_ENABLED 0
+#endif
+
+namespace android {
+namespace hwc {
+
+/* Whether the device was asked for the trace. Answered once, on the first
+ * asking; changing it afterwards takes a restart. */
+bool TracingWanted();
+
+}  // namespace hwc
+}  // namespace android
+
+#define HWC_LOGD(...)                                                         \
+    do {                                                                      \
+        if (HWC_TRACE_ENABLED && ::android::hwc::TracingWanted())             \
+            ALOGD(__VA_ARGS__);                                               \
+    } while (0)
+
+/* What is said once, when something changes -- which plan was chosen, why a
+ * frame went to the client, what the hardware said it could do.
+ *
+ * A separate switch from HWC_LOGD, and the distinction is not tidiness. What
+ * HWC_LOGD guards is said several times in every frame and costs milliseconds
+ * of that frame; what this guards is said when a scene changes, which is a
+ * handful of lines over a whole session. Sharing one switch meant that seeing
+ * why a plan was made cost the same as watching every buffer go by -- and
+ * every measurement taken with it on was taken through a slowdown the size of
+ * the thing being measured.
+ *
+ * So this one can be afforded when the other cannot:
+ *     setprop vendor.hwc.explain 1
+ */
+namespace android {
+namespace hwc {
+
+/* Whether the device asked to be told what the composer decided and why.
+ * Answered once; changing it takes a restart. */
+bool ExplanationWanted();
+
+}  // namespace hwc
+}  // namespace android
+
+#define HWC_LOGX(...)                                                         \
+    do {                                                                      \
+        if (HWC_TRACE_ENABLED && ::android::hwc::ExplanationWanted())         \
+            ALOGD(__VA_ARGS__);                                               \
+    } while (0)
+
+#endif  // UTILS_LOGGING_H

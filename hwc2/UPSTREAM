@@ -1,0 +1,129 @@
+Provenance of adapted files
+===========================
+
+Part of this composer is adapted from drm-hwcomposer rather than written
+here. Those files keep their original copyright headers, and this file
+records where each of them came from, so that a later reader can diff
+against the original and see exactly what was changed and why.
+
+Upstream:   https://gitlab.freedesktop.org/drm-hwcomposer/drm-hwcomposer
+Base:       da06409105fe03cc0f2f2090f88af96fd0e5053e
+            with 5b36732 ("Remove hwc2_device") reverted
+
+Why that base. The HWC2 entry point was removed upstream on 2025-12-11,
+and the layer-mapping work landed after it, so neither point of the
+history has both. Reverting the removal onto the current tree brings the
+two together: the revert applies without a conflict, and of the thirty
+two members the entry point reaches for on the display, three no longer
+exist -- each with a direct successor.
+
+What is left out. Everything that speaks to the display through DRM/KMS:
+this kernel has no DRM driver for the display controller at all, and the
+hardware is driven through tegra_dc_ext instead. Also left out are the
+parts with no counterpart on this board: HDCP, flattening telemetry, and
+the vendor backends for other hardware.
+
+
+Adapted files
+-------------
+
+Taken unchanged unless a note says otherwise. Paths are the same on both
+sides.
+
+  utils/fd.h
+  utils/fd.cpp
+  utils/log.h
+  compositor/DisplayInfo.h
+  compositor/FrameTimeHistory.h
+  compositor/FrameTimeHistory.cpp
+  compositor/LayerData.h
+  bufferinfo/BufferInfo.h
+  bufferinfo/BufferInfoGetter.h
+  bufferinfo/BufferInfoGetter.cpp
+  display/PipelineBinding.h
+      From drm/DrmDisplayPipeline.h, the two templates that say who a piece
+      of display hardware currently belongs to. They are here because they
+      know nothing about DRM, while the rest of that file is nothing else.
+      Changed: the thing bound to is a pipeline as this composer describes
+      one.
+
+  bufferinfo/GrallocBufferHandle.h
+  bufferinfo/GrallocBufferHandle.cpp
+      Changed: the handle is kept rather than imported. The mapper on this
+      platform wants a full description of the buffer alongside the handle,
+      which this function is not given; and the import is not needed here,
+      because the handle arrives over the interface into the process this
+      runs in and what reaches the display is one of its own descriptors.
+
+  display/DrmMode.h
+  display/DrmMode.cpp
+      From drm/DrmMode.{h,cpp}.
+      Changed: CreateModeBlob is not here. It registers a timing as a
+      property object on a DRM device, and there is no such device on this
+      board -- nothing to register against and nothing that would read it.
+      Standing something in for it would mean writing a mock of an interface
+      this hardware does not have, which is worse than the absence: the
+      absence is true. Everything else in the file is unchanged.
+
+  backend/BackendDisplayCapabilities.h
+      Changed twice, both because of the platform rather than the board.
+      The list of high-dynamic-range types is named through a package this
+      release predates, so it is named the way the rest of upstream names it
+      -- ui::Hdr, which this release does have. And a guard was added: the
+      file has none upstream, where it is included from exactly one place.
+
+  compositor/FlatteningController.cpp
+      Changed: one added include. The lock-assertion helper it uses arrived
+      in the platform's thread annotations after this release; every macro
+      it is written in terms of is here, so the class is declared where the
+      platform would declare it, in utils/ThreadAnnotations.h.
+
+  compositor/LayerToPlaneJoiningPlan.h
+      Changed: the pipeline is forward-declared as a struct, which is what
+      it is. Upstream says class and its own build only warns.
+
+  utils/SysfsBacklightController.cpp
+      Changed: a backlight node without a `scale` attribute is accepted
+      rather than refused. That attribute joined the backlight class long
+      after this kernel, so upstream's refusal means this board has no
+      backlight controller at all and every brightness call above it is
+      unreachable. Absent, the hardware is assumed to do its own perceptual
+      encoding, which is what the board's light service already assumes: it
+      writes the framework's value to the node unchanged. A node that does
+      declare a scale is read as upstream reads it.
+
+  hwc2_device/hwc2_device.cpp
+      Changed: registering a callback has an entry point of its own instead
+      of the shared one, so that it can let the lock go before telling the
+      framework about a display.
+
+      Not a fork of their behaviour but an application of it: the queue
+      those events sit in exists to keep hotplug callbacks out of the main
+      mutex, and says so where it is declared. Their own call site empties
+      it while the mutex is held, which is harmless where the framework
+      defers the news and fatal where it does not.
+
+      This release does not defer it. It handles the display appearing on
+      the registering thread, asks the composer what kind of display it is
+      before returning, and checks on return that a primary display was
+      announced -- so the news can neither wait nor go out under the lock.
+      The same composer did exactly this when this release was current: it
+      called back from inside the registering call, and had no lock at all.
+
+      Correct on any release, so there is nothing here to undo later. A
+      newer framework that defers the news is served by it just as well.
+
+  compat/
+      Not upstream's at all: copies of two AOSP headers newer than the ones
+      this release ships. See compat/README, which says what they are for
+      and how to retire the directory.
+
+  utils/ThreadAnnotations.h
+  utils/Tracing.h
+  utils/GraphicsCompat.h
+  drm/drm_mode.h
+      One declaration each that this release is missing, guarded so that a
+      newer platform's own wins and the file can then be deleted. In order:
+      a lock assertion, a trace marker for a moment rather than a span, one
+      colour mode, and the way a display is told about high-dynamic-range
+      content.

@@ -1,0 +1,341 @@
+/*
+ * Copyright (C) 2026 Artem Bambalov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef TEGRA_DC_HEAD_H
+#define TEGRA_DC_HEAD_H
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "tegra/WindowFeatures.h"
+#include "utils/UniqueFd.h"
+
+/* The kernel's colour-pipeline snapshot; kept behind a pointer so the kernel
+ * header stays out of everyone who includes this one. */
+struct tegra_dc_ext_cmu;
+
+namespace android {
+namespace hwc {
+
+/* One display head, /dev/tegra_dc_N.
+ *
+ * Where DcControl answers questions about the controller, this is what
+ * actually shows pixels: it owns display windows and posts flips.
+ *
+ * The kernel's flip structure is not exposed here. It carries better than
+ * thirty fields, of which a composer that does not scale, rotate, decompress
+ * or play protected video uses a dozen; translating in one place keeps the
+ * kernel ABI inside the implementation, where a change to it is a local
+ * repair rather than a change of interface.
+ */
+class DcHead {
+public:
+    /* One window's worth of a flip.
+     *
+     * A window is the display controller's own compositing unit: it reads a
+     * region of memory and places it on the panel, and the hardware blends
+     * however many are enabled. Showing a single client-composed frame uses
+     * exactly one; overlays are the same structure, more of them.
+     */
+    struct Window {
+        /* Which hardware window; one of those windows() reports. */
+        int32_t index = 0;
+
+        /* dma-buf descriptor for the memory to scan out, borrowed for the
+         * duration of the call. Despite its name in the kernel headers the
+         * flip takes a descriptor, not an nvmap identifier: the driver
+         * resolves it with dma_buf_get, and its SET_NVMAP_FD ioctl is a
+         * no-op that returns success without recording anything. Zero
+         * disables the window. */
+        int bufferFd = 0;
+
+        uint32_t offset = 0;
+        uint32_t stride = 0;
+
+        /* The chroma plane of a semi-planar format, in the same memory:
+         * where it starts and how long its rows are. Neither is derived by
+         * the driver -- it takes the base from the luma's descriptor and
+         * adds the offset it was given, and writes the row length into the
+         * upper half of the stride register as given. Left at zero for a
+         * format that has no such plane, and read for nothing else. */
+        uint32_t offsetU = 0;
+        uint32_t strideUV = 0;
+
+        /* One of the controller's own format codes. */
+        uint32_t pixelFormat = 0;
+
+        /* The window's own colour matrix, loaded with this flip when
+         * `loadCsc` says so. The converter runs for every YUV window
+         * whether or not this is sent, with whatever it last held --
+         * BT.601 limited from boot -- so a window showing anything else
+         * says so here, every frame: there is one matrix per window, the
+         * driver keeps the last one written before the frame, and windows
+         * change hands between layers. Fixed point in the driver's own
+         * widths: an integer luma offset, then 2.8 and signed 2.8 / 1.8
+         * gains, which are written to the registers as they are. */
+        struct Csc {
+            uint16_t yof = 0;
+            uint16_t kyrgb = 0;
+            uint16_t kur = 0;
+            uint16_t kvr = 0;
+            uint16_t kug = 0;
+            uint16_t kvg = 0;
+            uint16_t kub = 0;
+            uint16_t kvb = 0;
+        };
+        bool loadCsc = false;
+        Csc csc;
+
+        /* Source region, in pixels. Converted to the hardware's fixed point
+         * on the way down. */
+        float sourceX = 0.f;
+        float sourceY = 0.f;
+        float sourceWidth = 0.f;
+        float sourceHeight = 0.f;
+
+        /* Destination region on the panel, in whole pixels. */
+        int32_t outX = 0;
+        int32_t outY = 0;
+        int32_t outWidth = 0;
+        int32_t outHeight = 0;
+
+        /* How far back this window sits, not how high: zero is nearest the
+         * viewer and 0xff is the furthest back the controller goes. It is
+         * the opposite of the order layers are usually counted in, and the
+         * driver's own choice for the single window it raises by itself is
+         * 0xff -- the hardware's word for the bottom. */
+        uint32_t z = 0;
+
+        /* Blending and layout, as the controller's own flags. */
+        uint32_t blend = 0;
+        uint32_t flags = 0;
+
+        /* The layer's own opacity, multiplied over the whole window when the
+         * flags say to use it; 255 when they do not, which is what the flag's
+         * absence already means. */
+        uint8_t globalAlpha = 255;
+
+        /* How tall a block is, where the flags say the memory is arranged in
+         * blocks rather than rows. Ignored otherwise. */
+        uint8_t blockHeightLog2 = 0;
+
+        /* Waited on by the hardware before this window is read. Borrowed;
+         * ownership stays with the caller. -1 for a buffer already ready. */
+        int preFence = -1;
+    };
+
+    /* What one window can be asked to do; see WindowFeatures.h. */
+    using WindowCapabilities = hwc::WindowCapabilities;
+
+    /* Opens head `index`. Returns null and logs on failure. */
+    static std::unique_ptr<DcHead> open(int index);
+
+    /* Puts head `index` back on its panel's own vertical porch, and says
+     * whether the kernel can stretch that porch at all.
+     *
+     * Done before anything else is built, through a descriptor of its own:
+     * a predecessor that died with the panel slowed left it slow, and only
+     * a kernel that answers this can be offered a slower rate. False also
+     * where the head will not open; the caller has other ways of finding
+     * that out. */
+    static bool settlePorch(int index);
+
+    ~DcHead();
+
+    /* Which head this is.
+     *
+     * Not needed to post a frame -- the descriptor already says which head --
+     * but the same number names this display's other two devices, and whoever
+     * has the head is who ends up needing them. */
+    int index() const { return mIndex; }
+
+    DcHead(const DcHead &) = delete;
+    DcHead &operator=(const DcHead &) = delete;
+
+    /* The windows this head has, in ascending order, all owned by us.
+     *
+     * Which windows a head has is a property of the board rather than of the
+     * chip: the controller's windows are split between the heads, and the
+     * split is not the same on every design. There is no ioctl that answers
+     * it, so they are discovered by being asked for -- the driver hands over
+     * the ones this head has and refuses the rest. Ownership is per open
+     * file and lasts until this object dies, so the asking happens once.
+     *
+     * A flip must name a window this head owns, so everything that builds a
+     * flip starts here.
+     */
+    const std::vector<uint32_t> &windows();
+
+    /* What window `index` can do, or null if the controller would not say.
+     *
+     * Asked once and remembered: this describes the silicon, which does not
+     * change while the composer runs.
+     */
+    const WindowCapabilities *capabilities(uint32_t index);
+
+    /* Asks the controller to report vertical blanks, or to stop.
+     *
+     * Subscribing to the event stream on the control device is only half of
+     * receiving blanks and is the half that changes nothing in the hardware:
+     * it says which events this reader wants to be handed, out of those the
+     * driver produces. Producing them at all is this call. Until it is made
+     * the controller's vertical blank interrupt stays masked, the driver
+     * never reaches the code that queues the event, and a reader subscribed
+     * to a stream nobody writes to waits for ever.
+     *
+     * The request is not counted and not remembered across the display being
+     * turned off: the driver drops it when the head is disabled, without
+     * telling anyone, so whoever wants blanks has to be prepared to ask
+     * again. Asking twice is free -- the driver answers from a flag when the
+     * request already holds.
+     *
+     * Returns 0 if the request was taken. A positive result is the driver
+     * refusing it because the display is off, which is an answer rather than
+     * a fault; negative is errno.
+     */
+    int setVBlankReporting(bool enabled);
+
+    /* The head's own descriptor, for the one client of the extension that
+     * is not a window: the cursor unit is claimed and driven through the
+     * same file the flips go through, and the kernel grants it per
+     * descriptor. Borrowed; the head outlives every borrower here. */
+    int fd() const {
+        return mFd.get();
+    }
+
+    /* Asks for a vertical front porch of `vfp` lines, nought for the mode's
+     * own. The request is taken at once and applied by the kernel at the
+     * end of the frame being scanned, with no flip needed; nothing comes
+     * back to say when. The caller tells apart the frames that ran under it
+     * by their length. */
+    int setActiveVfp(uint32_t vfp);
+
+    /* Posts one frame.
+     *
+     * Returns 0 and, in `outPostFence`, a fence that fires once the frame is
+     * on the panel and the buffers of the frame before it are free. The
+     * caller owns that descriptor. The call itself does not block.
+     */
+    int flip(const std::vector<Window> &windows, UniqueFd *outPostFence);
+
+    /* Would this frame go up?
+     *
+     * Asks the controller to weigh the same set of windows it would be given
+     * to show, and to say whether it can feed them all at once. That is the
+     * one limit no amount of reading a window's capabilities will reveal:
+     * each window on its own may be within what it can do, while together
+     * they ask more of memory than there is to give.
+     *
+     * Nothing is posted and nothing changes. Returns 0 if the frame would be
+     * accepted.
+     */
+    int test(const std::vector<Window> &windows);
+
+    /* Sets the head's colour matrix.
+     *
+     * The head ends in a colour pipeline the whole output passes through --
+     * every window and the cursor, after blending: a degamma table, a 3x3
+     * matrix, a regamma table. It boots as a net no-op, and the tables stay
+     * at that boot state here: the matrix multiplies linear light between
+     * them, which keeps a third more distinguishable shadow levels than
+     * collapsing the tables would, so a caller with gamma-domain semantics
+     * translates its coefficients rather than its domain. The uniform
+     * `offset` -- an addition the matrix stage does not have -- is folded
+     * into the regamma table as a shift of its output values.
+     *
+     * `matrix` is row-major, out = M * in, as fractions of unity. A
+     * coefficient lives in ten bits of two's complement Q1.8 -- [-2, 2)
+     * with unity at 256 -- and is clamped to that range here because the
+     * driver writes the register unmasked: a value past either end would
+     * come out the other side.
+     *
+     * The write lands at the next frame boundary, never mid-scan, and does
+     * not block: the driver keeps a shadow copy and folds the difference in
+     * during the following vertical blank. Reset puts the boot pipeline
+     * back. All three return false only when the kernel refused.
+     */
+    bool setColorMatrix(const float matrix[9], float offset);
+    bool resetColorMatrix();
+
+    /* Writes the boot pipeline whether or not this instance ever changed
+     * it: the kernel keeps a dead predecessor's transform standing, and a
+     * home that is computed rather than read cannot notice it. Called once
+     * when colour service starts; harmless when nothing was stale. */
+    bool writeBootState();
+
+    /* Shows every colour as its tinted distance from white: the per-channel
+     * flip, exact in this hardware where the framework's own cross-channel
+     * inversion cannot run at all -- the matrix's sums reach the regamma as
+     * an unsigned index, so mixed-sign arithmetic folds to zero. The flip
+     * lives in the degamma and `tint` scales each flipped channel in the
+     * matrix stage -- night mode over an inverted screen, the tint
+     * outermost as the framework composes it. Non-negative by contract,
+     * all ones for the bare inversion. */
+    bool setInversion(const float tint[3]);
+
+private:
+    /* Out of line: a member unique_ptr of the forward-declared snapshot
+     * makes every path that could destroy a half-built DcHead -- this
+     * constructor included -- need the complete type. */
+    DcHead(UniqueFd fd, int index);
+
+    /* Takes ownership of one window. A refusal is an answer, not a failure --
+     * it is how the head says the window is not its -- so it is not logged. */
+    bool tryClaimWindow(uint32_t index);
+
+    /* Gives a window back and blanks it. Done for us on destruction. */
+    void releaseWindow(uint32_t index);
+
+    UniqueFd mFd;
+    int mIndex;
+
+    /* Where this head's feature table comes from. One source today, the
+     * 3.10 kernel's; the head asks through it and would not notice another
+     * in its place. */
+    std::unique_ptr<WindowFeatureSource> mFeatures;
+
+    /* Reads the live colour pipeline and keeps it as the state to restore.
+     * Done once, before the first write ever changes it. */
+    bool rememberBootCmu();
+
+    /* Makes the snapshot's tables the identity: degamma spreading each
+     * 8-bit level over the 12-bit scale, regamma answering every slot with
+     * its own level back. */
+    static void fillIdentityTables(tegra_dc_ext_cmu *cmu);
+
+    /* Reads the feature table and keeps what it says about each window. One
+     * table answers for every window, so it is done once. */
+    bool readCapabilities();
+
+    /* Owned windows, ascending. Empty until the first call to windows(). */
+    std::vector<uint32_t> mOwnedWindows;
+    bool mWindowsDiscovered = false;
+
+    /* Indexed by window. Empty until the controller has been asked. */
+    std::map<uint32_t, WindowCapabilities> mCapabilities;
+    bool mCapabilitiesRead = false;
+
+    /* The pipeline as it booted: the calibration to come home to. Null until
+     * the first colour write; never touched after it is filled. */
+    std::unique_ptr<tegra_dc_ext_cmu> mBootCmu;
+};
+
+}  // namespace hwc
+}  // namespace android
+
+#endif  // TEGRA_DC_HEAD_H

@@ -1,0 +1,378 @@
+/*
+ * Copyright (C) 2015 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
+
+#include "VSyncWorker.h"
+
+#include <linux/sync_file.h>
+#include <linux/time.h>
+#include <ndk/sync.h>
+#include <pthread.h>
+#include <sched.h>
+#include <utils/Trace.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <utility>
+
+#include "display/DisplayPipeline.h"
+#include "display/VSyncSource.h"
+#include "utils/ThreadAnnotations.h"
+#include "utils/Time.h"
+#include "utils/fd.h"
+#include "utils/log.h"
+
+namespace android::drm_hwcomposer {
+namespace {
+std::optional<uint64_t> GetPresentTime(const SharedFd &fence_fd) {
+  if (!fence_fd) {
+    return std::nullopt;
+  }
+
+  struct sync_file_info *file_info = sync_file_info(*fence_fd);
+  if (file_info == nullptr) {
+    return std::nullopt;
+  }
+
+  if (file_info->status != 1) {
+    sync_file_info_free(file_info);
+    return std::nullopt;
+  }
+
+  uint64_t timestamp = 0;
+  struct sync_fence_info *fence_info = sync_get_fence_info(file_info);
+  for (size_t i = 0; i < file_info->num_fences; i++) {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic):
+    const uint64_t fence_timestamp = fence_info[i].timestamp_ns;
+    if (std::max(fence_timestamp, timestamp) == fence_timestamp) {
+      timestamp = fence_timestamp;
+    }
+  }
+
+  sync_file_info_free(file_info);
+  return timestamp;
+}
+}  // namespace
+
+auto VSyncWorker::CreateInstance(std::shared_ptr<DisplayPipeline> &pipe)
+    -> std::unique_ptr<VSyncWorker> {
+  auto vsw = std::unique_ptr<VSyncWorker>(new VSyncWorker());
+
+  if (pipe) {
+    vsw->source_ = &pipe->GetVSyncSource();
+  }
+
+  vsw->vswt_ = std::thread(&VSyncWorker::ThreadFn, vsw.get());
+
+  return vsw;
+}
+
+VSyncWorker::~VSyncWorker() {
+  StopThread();
+
+  vswt_.join();
+}
+
+void VSyncWorker::UpdateVSyncControl() {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    enabled_ = ShouldEnable();
+  }
+
+  cv_.notify_all();
+}
+
+void VSyncWorker::SetVsyncPeriodNs(uint32_t vsync_period_ns) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  vsync_period_ns_ = vsync_period_ns;
+  expected_period_ns_ = 0;
+  last_timestamp_ = std::nullopt;
+  last_present_fence_.reset();
+}
+
+void VSyncWorker::ExpectVsyncPeriodNs(uint32_t vsync_period_ns) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (vsync_period_ns == vsync_period_ns_) {
+    expected_period_ns_ = 0;
+    return;
+  }
+  expected_period_ns_ = vsync_period_ns;
+}
+
+uint32_t VSyncWorker::GetVsyncPeriodNs() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return vsync_period_ns_;
+}
+
+bool VSyncWorker::RanAtExpectedPeriod(int64_t ran_period_ns) const {
+  /* Both sides are worked out from the same timing, by different roundings;
+   * a hundredth covers them and is far from any other rate. */
+  const int64_t expected = expected_period_ns_;
+  return std::abs(ran_period_ns - expected) <= expected / 100;
+}
+
+bool VSyncWorker::LandsOnExpectedPeriod(int64_t previous,
+                                        int64_t timestamp) const {
+  const int64_t interval = timestamp - previous;
+  const int64_t expected = expected_period_ns_;
+  return std::abs(interval - expected) <= expected / 5;
+}
+
+void VSyncWorker::SetVsyncTimestampTracking(bool enabled) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    enable_vsync_timestamps_ = enabled;
+    if (enabled) {
+      // Reset the freshness flag to ensure that only a fresh timestamp is
+      // returned from GetLastVsyncTimestamp.
+      last_timestamp_is_fresh_ = false;
+    }
+  }
+  UpdateVSyncControl();
+}
+
+int64_t VSyncWorker::GetLastVsyncTimestamp() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return last_timestamp_is_fresh_ ? last_timestamp_.value_or(0) : 0;
+}
+
+void VSyncWorker::UpdateLastVsyncTimeWithPresentTime() {
+  if (enabled_) {
+    last_present_fence_.reset();
+    return;
+  }
+
+  ATRACE_CALL();
+  std::optional<int64_t> fence_time = GetPresentTime(last_present_fence_);
+  last_present_fence_.reset();
+
+  if (last_timestamp_.value_or(0) < fence_time.value_or(0)) {
+    last_timestamp_ = fence_time;
+  }
+}
+
+void VSyncWorker::SetDisplayOn(bool on) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    display_on_ = on;
+  }
+  UpdateVSyncControl();
+}
+
+void VSyncWorker::AddLastPresentFence(SharedFd &fence) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  last_present_fence_ = fence;
+}
+
+int64_t VSyncWorker::GetNextVsyncTimestamp(int64_t time) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return GetPhasedVSync(vsync_period_ns_, time);
+}
+
+void VSyncWorker::SetTimestampCallback(
+    std::optional<VsyncTimestampCallback> &&callback) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    callback_ = std::move(callback);
+  }
+  UpdateVSyncControl();
+}
+
+void VSyncWorker::StopThread() {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    thread_exit_ = true;
+    enabled_ = false;
+  }
+
+  cv_.notify_all();
+}
+
+bool VSyncWorker::ShouldEnable() const {
+  return display_on_ && (enable_vsync_timestamps_ || callback_.has_value());
+};
+
+/*
+ * Returns the timestamp of the next vsync in phase with last_timestamp_.
+ * For example:
+ *  last_timestamp_ = 137
+ *  frame_ns = 50
+ *  current = 683
+ *
+ *  ret = (50 * ((683 - 137)/50 + 1)) + 137
+ *  ret = 687
+ *
+ *  Thus, we must sleep until timestamp 687 to maintain phase with the last
+ *  timestamp.
+ */
+int64_t VSyncWorker::GetPhasedVSync(int64_t frame_ns, int64_t current) {
+  UpdateLastVsyncTimeWithPresentTime();
+
+  if (!last_timestamp_.has_value())
+    return current + frame_ns;
+
+  return (frame_ns * ((current - *last_timestamp_) / frame_ns + 1)) +
+         *last_timestamp_;
+}
+
+static const int64_t kOneSecondNs = 1LL * 1000 * 1000 * 1000;
+
+int VSyncWorker::SyntheticWaitVBlank(int64_t *timestamp) {
+  int64_t phased_timestamp = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int64_t time_now = GetTimeMonotonicNs();
+    phased_timestamp = GetPhasedVSync(vsync_period_ns_, time_now);
+  }
+
+  struct timespec vsync {};
+  vsync.tv_sec = int(phased_timestamp / kOneSecondNs);
+  vsync.tv_nsec = int(phased_timestamp - (vsync.tv_sec * kOneSecondNs));
+
+  int ret = 0;
+  do {
+    // NOLINTNEXTLINE(misc-include-cleaner)
+    ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &vsync, nullptr);
+  } while (ret == EINTR);
+  if (ret != 0)
+    return ret;
+
+  *timestamp = phased_timestamp;
+  return 0;
+}
+
+void VSyncWorker::ThreadFn() {
+  pthread_setname_np(pthread_self(), "VSyncWorker");
+
+  /* This thread is the clock the whole frame is hung on: everything the
+   * framework schedules -- when an app is woken, when SurfaceFlinger latches,
+   * when the next flip is due -- is measured from the timestamp it hands out.
+   * A few milliseconds of waiting to be given a CPU therefore does not delay
+   * one thread, it shifts the entire timing grid, and the display shows it as
+   * an uneven rhythm rather than a lower rate.
+   *
+   * So it runs at the same real-time priority as the composer's own service
+   * thread, which the platform's HAL wrapper already sets for itself.
+   *
+   * It had this once and lost it: the priority came from the project's Worker
+   * base class, was not carried over when this thread was moved to
+   * std::thread, and disappeared entirely when that class was deleted.
+   *
+   * pthread_setschedparam RETURNS the error rather than setting errno, so it
+   * must not be reported through strerror(errno) -- that prints whatever the
+   * last unrelated failure happened to leave behind.
+   */
+  const sched_param param = {.sched_priority = 2};
+  const int prio_err = pthread_setschedparam(pthread_self(), SCHED_FIFO,
+                                             &param);
+  if (prio_err != 0) {
+    ALOGE("Cannot give the vsync thread real-time priority: %s",
+          strerror(prio_err));
+  }
+
+  int ret = 0;
+
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      base::ScopedLockAssertion thread_assertion(mutex_);
+      if (thread_exit_)
+        break;
+
+      if (!enabled_) {
+        /* Told to the source before sleeping, outside the lock: the
+         * source may talk to the driver, and nobody should wait on this
+         * lock for that. An enable that lands in between is answered by
+         * the next wait, which asks the source for blanks again. */
+        if (source_ != nullptr) {
+          lock.unlock();
+          source_->stop();
+          lock.lock();
+        }
+        if (thread_exit_)
+          break;
+        if (!enabled_)
+          cv_.wait(lock);
+      }
+
+      if (!enabled_)
+        continue;
+    }
+
+    ret = -EAGAIN;
+    int64_t timestamp = 0;
+    int64_t ran_period_ns = 0;
+
+    if (source_ != nullptr) {
+      ret = source_->waitForVSync(&timestamp, &ran_period_ns);
+      if (ret == -EINTR)
+        continue;
+    }
+
+    if (ret != 0) {
+      ret = SyntheticWaitVBlank(&timestamp);
+      if (ret != 0)
+        continue;
+    }
+
+    std::optional<VsyncTimestampCallback> vsync_callback;
+    int64_t vsync_period_ns = 0;
+
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (!enabled_)
+        continue;
+      if (enable_vsync_timestamps_) {
+        last_timestamp_is_fresh_ = true;
+      }
+      /* The first blank that ends a frame run at the new rate is where the
+       * period told changes, and the phase is taken from it. The display's
+       * own word on how long the frame took decides, where it gives one;
+       * where it does not, a blank one expected period after the one
+       * before it is taken for that frame. */
+      const bool took_hold =
+          ran_period_ns != 0
+              ? RanAtExpectedPeriod(ran_period_ns)
+              : last_timestamp_.has_value() &&
+                    LandsOnExpectedPeriod(*last_timestamp_, timestamp);
+      if (expected_period_ns_ != 0 && took_hold) {
+        vsync_period_ns_ = expected_period_ns_;
+        expected_period_ns_ = 0;
+        ATRACE_INT("hwc_vsync_period_us",
+                   static_cast<int32_t>(vsync_period_ns_ / 1000));
+      }
+      vsync_callback = callback_;
+      vsync_period_ns = vsync_period_ns_;
+      last_timestamp_ = timestamp;
+    }
+
+    if (vsync_callback) {
+      vsync_callback.value()(timestamp, vsync_period_ns);
+    }
+  }
+
+  ALOGI("VSyncWorker thread exit");
+}
+
+}  // namespace android::drm_hwcomposer

@@ -1,0 +1,143 @@
+/*
+ * Copyright (C) 2026 Artem Bambalov
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "tegra/TegraFormat.h"
+
+#include <drm/drm_fourcc.h>
+
+#include <tegra_dc_ext.h>
+
+/* Plain rows have been spelled both ways over the years, and the copy of the
+ * format header in this tree only knows the older spelling. */
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR DRM_FORMAT_MOD_NONE
+#endif
+
+namespace android::drm_hwcomposer {
+
+namespace {
+
+/* The vendor's own arrangements, spelled out because the format header in
+ * this tree predates them. The values are the published ones. */
+constexpr uint64_t kVendorNvidia = 0x03;
+
+constexpr uint64_t NvidiaModifier(uint64_t code) {
+  return (kVendorNvidia << 56) | (code & 0x00ffffffffffffffULL);
+}
+
+constexpr uint64_t kTegraTiled = NvidiaModifier(1);
+
+/* A block-linear modifier carries the shape of the arrangement in its low
+ * bits: the bottom four say how tall a block is, and the bit above them
+ * marks it as this family rather than the older one. */
+constexpr uint64_t kBlockLinearMarker = 0x10;
+constexpr uint64_t kBlockHeightMask = 0x0f;
+
+bool IsBlockLinear(uint64_t modifier) {
+  return (modifier >> 56) == kVendorNvidia &&
+         (modifier & kBlockLinearMarker) != 0;
+}
+
+}  // namespace
+
+uint32_t TegraFormatFromDrm(uint32_t drm_format) {
+  switch (drm_format) {
+    case DRM_FORMAT_ABGR8888:
+    case DRM_FORMAT_XBGR8888:
+      return TEGRA_DC_EXT_FMT_R8G8B8A8;
+    case DRM_FORMAT_ARGB8888:
+    case DRM_FORMAT_XRGB8888:
+      return TEGRA_DC_EXT_FMT_B8G8R8A8;
+    case DRM_FORMAT_BGR565:
+      return TEGRA_DC_EXT_FMT_B5G6R5;
+    /* The two semi-planar 4:2:0 arrangements: a plane of luma, then one
+     * plane of chroma pairs. They differ only in which of the pair comes
+     * first, and each side names that the same way -- the code is read
+     * off the definition, not matched by eye. */
+    case DRM_FORMAT_NV12:
+      return TEGRA_DC_EXT_FMT_YCbCr420SP;
+    case DRM_FORMAT_NV21:
+      return TEGRA_DC_EXT_FMT_YCrCb420SP;
+    default:
+      return 0;
+  }
+}
+
+bool DrmFormatIsYuv(uint32_t drm_format) {
+  switch (drm_format) {
+    case DRM_FORMAT_YUYV:
+    case DRM_FORMAT_YVYU:
+    case DRM_FORMAT_UYVY:
+    case DRM_FORMAT_VYUY:
+    case DRM_FORMAT_AYUV:
+    case DRM_FORMAT_NV12:
+    case DRM_FORMAT_NV21:
+    case DRM_FORMAT_NV16:
+    case DRM_FORMAT_NV61:
+    case DRM_FORMAT_NV24:
+    case DRM_FORMAT_NV42:
+    case DRM_FORMAT_YUV410:
+    case DRM_FORMAT_YVU410:
+    case DRM_FORMAT_YUV411:
+    case DRM_FORMAT_YVU411:
+    case DRM_FORMAT_YUV420:
+    case DRM_FORMAT_YVU420:
+    case DRM_FORMAT_YUV422:
+    case DRM_FORMAT_YVU422:
+    case DRM_FORMAT_YUV444:
+    case DRM_FORMAT_YVU444:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool TegraLayoutFromModifier(uint64_t modifier, uint32_t *out_flags,
+                             uint8_t *out_block_height_log2) {
+  *out_flags = 0;
+  *out_block_height_log2 = 0;
+
+  if (IsBlockLinear(modifier)) {
+    /* The kind rides bits 12..19: the allocator's name for the memory
+     * arrangement inside the blocks. The display scans only the plain
+     * one -- a compressible kind puts tile records where the controller
+     * expects pixels -- and until here every consumer of the modifier
+     * was blind to it, on the assumption that a compressed buffer never
+     * reaches a bare window. The assumption is now a gate: an unknown
+     * kind sends the layer to the client instead of the glass. */
+    constexpr uint64_t kKindShift = 12;
+    constexpr uint64_t kKindMask = 0xff;
+    constexpr uint64_t kKindGeneric16Bx2 = 0xfe;
+    if (((modifier >> kKindShift) & kKindMask) != kKindGeneric16Bx2)
+      return false;
+    *out_flags = TEGRA_DC_EXT_FLIP_FLAG_BLOCKLINEAR;
+    *out_block_height_log2 = static_cast<uint8_t>(modifier & kBlockHeightMask);
+    return true;
+  }
+
+  if (modifier == kTegraTiled) {
+    *out_flags = TEGRA_DC_EXT_FLIP_FLAG_TILED;
+    return true;
+  }
+
+  /* Both spellings of "plain rows" reach here. Anything else is an
+   * arrangement this controller has never been told about, and reading it as
+   * rows would show a scramble rather than an error. */
+  return modifier == DRM_FORMAT_MOD_LINEAR ||
+         modifier == DRM_FORMAT_MOD_NONE;
+}
+
+}  // namespace android::drm_hwcomposer

@@ -1,0 +1,84 @@
+/*
+ * Copyright (C) 2022 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <string>
+
+namespace android::drm_hwcomposer {
+
+enum class CtmHandling {
+  kDrmOrGpu,    /* Handled by DRM is possible, otherwise by GPU */
+  kDrmOrIgnore, /* Handled by DRM is possible, otherwise displayed as is */
+};
+
+class Properties {
+ public:
+  static auto InternalDisplayNames() -> std::string;
+  static auto ScaleWithGpu() -> bool;
+  static auto MinCornerRadius() -> float;
+  static auto FlattenWhenIdle() -> bool;
+  static auto EnableVirtualDisplay() -> bool;
+  static auto EnableHdcpOnHotplug() -> bool;
+  static auto GetCtmHandling() -> CtmHandling;
+
+  /* Whether the display controller's colour pipeline consumes the client's
+   * transform. One switch read by all three parties -- the capability
+   * claim, the all-client substitution, the backend's consumer -- so they
+   * cannot disagree. */
+  static auto CmuColorPipeline() -> bool;
+
+  /* Whether layers the ones above hide are left out or cropped; see
+   * compositor/Occlusion.h. A switch for comparing. */
+  static auto Occlusion() -> bool;
+
+  /* Whether a buffer an engine drew before is drawn again only where its
+   * picture changed; see compositor/PartialRedraw.h. A switch for
+   * comparing. */
+  static auto PartialRedraw() -> bool;
+
+  /* Whether the composer times its own steps for the dump -- the planning,
+   * the engine's merges, the description of buffers. Off unless asked: a
+   * clock read here is a system call on this kernel, and a frame that is
+   * not being looked at should not pay for being measured. */
+  static auto Statistics() -> bool;
+
+  /* Whether the image engine's work is queued at validate for a worker
+   * of its own, rather than done on the binder thread at present. */
+  static auto VicWorker() -> bool;
+
+  /* Whether the pipeline's resting state corrects the panel's gamut toward
+   * sRGB rather than showing the panel as it is. */
+  static auto CalibratedColorMode() -> bool;
+
+  /* The display profile's saturation, as the device tree's LiveDisplay
+   * service writes it: 1.0 is the panel as calibrated, above it a boost.
+   *
+   * Unlike every other switch here this one is NOT read once. The profile
+   * is a setting the user changes while looking at the screen, so it is
+   * asked for on each validate and the matrix rebuilt only when the answer
+   * moves. A property read is a lookup in shared memory, not a message to
+   * another process -- unlike a log line, which is why one is on this path
+   * and the other is not. */
+  static auto DisplaySaturation() -> float;
+  static auto GetBackendOverride() -> std::string;
+  static auto UseColorPipeline() -> bool;
+  static auto ForceColorMode() -> int;
+  static auto PersistentHdrEnabled() -> bool;
+  static auto ExternalHdrEnabled() -> bool;
+};
+
+}  // namespace android::drm_hwcomposer
