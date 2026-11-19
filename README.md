@@ -15,9 +15,6 @@
 | Display                 | 1536 x 2048 pixels                |
 | Release Date            | July 29, 2014                     |
 
-## Device Picture
-![Nvidia SHIELD Tablet ](http://shield.nvidia.co.uk/images/home-page-sections/shield-tablet-controller-header-image.png "Nvidia SHIELD Tablet")
-
 ## LineageOS 21 (Android 14) port
 
 This tree is the Android 14 bring-up of the Mi Pad 1 (`mocha`, NVIDIA Tegra K1
@@ -54,8 +51,10 @@ build/make
 frameworks/av
 frameworks/base
 frameworks/native
+hardware/broadcom/wlan
 hardware/interfaces
 lineage-sdk
+packages/apps/Glimpse
 packages/apps/Settings
 packages/apps/Trebuchet
 packages/modules/adb
@@ -76,9 +75,22 @@ device/xiaomi/mocha/patches/install.sh    # apply it
 device/xiaomi/mocha/patches/uninstall.sh  # revert it
 ```
 
-All 23 patches apply cleanly, in sorted order, to a pristine checkout of the
-LineageOS 21 tree this device targets. See `patches/README` for the list of
-patches that were dropped because their change is already upstream.
+The series is 30 patches over 18 projects:
+
+| Project | Patches |
+| :------ | ------: |
+| `frameworks/av` | 7 |
+| `frameworks/base` | 6 |
+| `hardware/broadcom/wlan` | 2 |
+| `build/make`, `frameworks/native`, `hardware/interfaces`, `lineage-sdk` | 1 each |
+| `packages/apps/Glimpse`, `packages/apps/Settings`, `packages/apps/Trebuchet` | 1 each |
+| `packages/modules/adb`, `packages/modules/Connectivity`, `packages/modules/IntentResolver`, `packages/modules/Wifi` | 1 each |
+| `packages/services/Mms`, `prebuilts/gcc/.../arm-linux-androideabi-4.9`, `system/core`, `vendor/lineage` | 1 each |
+
+All 30 patches apply cleanly, in sorted order, to a pristine checkout of the
+LineageOS 21 tree this device targets. See `patches/README` for the naming
+scheme and for the list of patches that were dropped because their change is
+already upstream.
 
 ### Build
 
@@ -92,6 +104,18 @@ The `system` partition has been resized to 2.86 GB (`mmcblk0p26`). The bootloade
 still hardcodes the original 640 MB size and rejects large images through
 `fastboot`, so flash the OTA package from TWRP instead of using `fastboot flash
 system`.
+
+### Debug tools
+
+A few modules are deliberately **not** part of `PRODUCT_PACKAGES`: they are
+on-demand helpers, so build and push them by name when a bug needs them.
+
+| Module | Build with | Purpose |
+| :----- | :--------- | :------ |
+| `camera_shim_test` | `m camera_shim_test` | checks that the camera ABI shims resolve every symbol the NVIDIA blob asks for |
+| `gralloc-yuv-probe` | `m gralloc-yuv-probe` | asks the gralloc module which YUV/encoder formats it accepts |
+| `i2cprobe` | `m i2cprobe` | scans the camera I2C bus when a sensor does not probe |
+| `fmtest` | `m fmtest` | talks V4L2 radio ioctls straight to `/dev/radio0`; also has an antenna/RSSI test mode |
 
 ## Copyright
 
