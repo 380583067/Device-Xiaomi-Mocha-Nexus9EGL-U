@@ -12,6 +12,28 @@ if [[ ! -f "$ANDROID_TOP/build/envsetup.sh" || ! -d "$ANDROID_TOP/.repo" ]]; the
     exit 2
 fi
 
+ONLY=""
+while (( $# )); do
+    case "$1" in
+        --only)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --only needs a project path, e.g. --only frameworks/av" >&2
+                exit 2
+            fi
+            ONLY="${2%/}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: $(basename "$0") [--only <repo path>]"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
 patches=()
 while IFS= read -r -d '' patch_file; do
     patches+=("$patch_file")
@@ -24,6 +46,9 @@ for ((i=${#patches[@]} - 1; i >= 0; i--)); do
     patch_file="${patches[$i]}"
     relative_patch="${patch_file#"$SCRIPT_DIR"/}"
     repo_relative="${relative_patch%/*}"
+    if [[ -n "$ONLY" && "$repo_relative" != "$ONLY" ]]; then
+        continue
+    fi
     repo_path="$ANDROID_TOP/$repo_relative"
 
     if [[ ! -d "$repo_path" ]]; then

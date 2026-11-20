@@ -13,13 +13,40 @@ if [[ ! -f "$ANDROID_TOP/build/envsetup.sh" || ! -d "$ANDROID_TOP/.repo" ]]; the
     exit 2
 fi
 
-if ! "$SCRIPT_DIR/check.sh"; then
+ONLY=""
+while (( $# )); do
+    case "$1" in
+        --only)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --only needs a project path, e.g. --only frameworks/av" >&2
+                exit 2
+            fi
+            ONLY="${2%/}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: $(basename "$0") [--only <repo path>]"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! "$SCRIPT_DIR/check.sh" ${ONLY:+--only "$ONLY"}; then
     echo "ERROR: patch preflight failed; no patches were installed." >&2
     exit 1
 fi
 
 patches=()
 while IFS= read -r -d '' patch_file; do
+    repo_relative="${patch_file#"$SCRIPT_DIR"/}"
+    repo_relative="${repo_relative%/*}"
+    if [[ -n "$ONLY" && "$repo_relative" != "$ONLY" ]]; then
+        continue
+    fi
     patches+=("$patch_file")
 done < <(find "$SCRIPT_DIR" -type f -name '*.patch' -print0 | sort -z)
 

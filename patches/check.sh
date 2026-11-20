@@ -14,6 +14,28 @@ if [[ ! -f "$ANDROID_TOP/build/envsetup.sh" || ! -d "$ANDROID_TOP/.repo" ]]; the
     exit 2
 fi
 
+ONLY=""
+while (( $# )); do
+    case "$1" in
+        --only)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --only needs a project path, e.g. --only frameworks/av" >&2
+                exit 2
+            fi
+            ONLY="${2%/}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: $(basename "$0") [--only <repo path>]"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mocha-patches-check.XXXXXX")" || exit 2
 trap 'rm -rf -- "$TEMP_DIR"' EXIT
 
@@ -23,10 +45,13 @@ errors=0
 patch_count=0
 
 while IFS= read -r -d '' patch_file; do
-    patch_count=$((patch_count + 1))
     relative_patch="${patch_file#"$SCRIPT_DIR"/}"
     repo_relative="${relative_patch%/*}"
     repo_path="$ANDROID_TOP/$repo_relative"
+    if [[ -n "$ONLY" && "$repo_relative" != "$ONLY" ]]; then
+        continue
+    fi
+    patch_count=$((patch_count + 1))
 
     if [[ ! -d "$repo_path" ]]; then
         echo "ERROR: missing Git project for $relative_patch ($repo_path)" >&2
@@ -78,7 +103,7 @@ while IFS= read -r -d '' patch_file; do
 done < <(find "$SCRIPT_DIR" -type f -name '*.patch' -print0 | sort -z)
 
 if (( patch_count == 0 )); then
-    echo "ERROR: no .patch files found under $SCRIPT_DIR" >&2
+    echo "ERROR: no .patch files found under $SCRIPT_DIR${ONLY:+ for $ONLY}" >&2
     exit 2
 fi
 
