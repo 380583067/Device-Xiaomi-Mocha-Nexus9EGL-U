@@ -20,22 +20,26 @@ on boot
     # TBD: Remove the below line that give permissions for scaling_governor
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 
-    # CPU 调速器：interactive
-    # （内核 defconfig 里默认调速器是 userspace，不显式设置等于频率不会动。）
+    # CPU governor: interactive.
+    # (The kernel defconfig defaults to the userspace governor, so without an
+    # explicit write the frequency never moves.)
     #
-    # 【2026-11-21 修正】原来这里写的是：
-    #     interactive/awake_ideal_freq   1326000
-    #     interactive/boost_freq         1428000
-    #     interactive/touch_poke_freq    1326000
+    # [2026-11-21] This block used to write:
+    #     interactive/awake_ideal_freq     1326000
+    #     interactive/boost_freq           1428000
+    #     interactive/touch_poke_freq      1326000
     #     interactive/input_boost_duration 45000
-    # 这四个节点**只有 smartmax 有**（kernel/drivers/cpufreq/cpufreq_smartmax.c
-    # 的 smartmax_attributes[]），interactive 的 sysfs 里根本不存在
-    # （见 cpufreq_interactive.c 的 gov_sys_pol_attr_rw 列表）。所以这四行每次
-    # 开机都是 write 失败，等于**一点调优都没生效**，interactive 跑的是内核默认：
+    # Those four nodes only exist in smartmax (smartmax_attributes[] in
+    # kernel/drivers/cpufreq/cpufreq_smartmax.c); interactive does not export
+    # them (see the gov_sys_pol_attr_rw list in cpufreq_interactive.c). Every
+    # boot those four writes failed, so no tuning was in effect at all and
+    # interactive ran on the kernel defaults:
     #     target_loads 90 / go_hispeed_load 99 / min_sample_time 30ms
-    # go_hispeed_load=99 意味着负载不到 99% 就不往 hispeed 以上冲，滑动、转场
-    # 这种 50~70% 单核负载的动画就一直吊在低频上 —— 这就是"卡卡的"直接来源。
-    # 下面改成写 interactive 真实存在的节点，取值同 19.1 树 balanced 档的验证值。
+    # go_hispeed_load 99 means the governor does not go above hispeed until the
+    # CPU is 99% busy, so scrolling and transitions (50-70% load on one core)
+    # stayed at low frequency - that is the direct cause of the sluggish UI.
+    # The writes below use the nodes interactive really has, with the values the
+    # 19.1 tree validated in its balanced profile.
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor interactive
     write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 1428000
     write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 90
@@ -46,15 +50,18 @@ on boot
     write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay 40000
     write /sys/devices/system/cpu/cpufreq/interactive/io_is_busy 1
 
-    # 【2026-11-21 修正】把调速器节点交给 system，NVIDIA 的 power HAL
-    # （/system/vendor/bin/hw/android.hardware.power@1.0-service，日志 tag
-    # powerHAL::common，已监听 atmel-maxtouch）才能按场景调频。这些节点由内核
-    # 以 0644 root:root 创建，HAL 以 system 身份运行，原来每次开机都只能打：
+    # [2026-11-21] Hand the governor nodes to system so NVIDIA's power HAL
+    # (/system/vendor/bin/hw/android.hardware.power@1.0-service, log tag
+    # powerHAL::common, already listening to atmel-maxtouch) can tune frequencies
+    # per scenario. The kernel creates these nodes as 0644 root:root while the
+    # HAL runs as system, so every boot it could only log:
     #     E powerHAL::common: Error opening .../interactive/hispeed_freq: Permission denied
-    #     （target_loads / above_hispeed_delay / timer_rate / boost_factor 同样失败）
-    # 于是触控升频和它的整套 governor profile 全部失效。这里放开权限交还给 HAL。
-    # 注意：A14 的 init chown/chmod **不支持通配符**（system/core/init/builtins.cpp
-    # 的 do_chown/do_chmod 直接 lchown/fchmodat 字面路径），必须逐个列。
+    #     (target_loads / above_hispeed_delay / timer_rate / boost_factor failed the same way)
+    # which means touch boost and its whole governor profile never took effect.
+    # Permissions are opened up here to give the nodes back to the HAL.
+    # Note: init chown/chmod in Android 14 do NOT expand wildcards (do_chown /
+    # do_chmod in system/core/init/builtins.cpp call lchown/fchmodat on the
+    # literal path), so every node has to be listed.
     chown system system /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq
     chown system system /sys/devices/system/cpu/cpufreq/interactive/target_loads
     chown system system /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay
@@ -82,8 +89,8 @@ on boot
     chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
     chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_busy_threshold
 
-    # smartmax 同样的放开，方便以后 setprop 切过去做对比测试（节点见
-    # cpufreq_smartmax.c 的 smartmax_attributes[]）。
+    # smartmax gets the same treatment so it can be selected later with setprop
+    # for A/B testing (nodes: smartmax_attributes[] in cpufreq_smartmax.c).
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/awake_ideal_freq
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/boost_freq
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/touch_poke_freq
@@ -149,10 +156,12 @@ service conn_wifi /system/vendor/bin/conn_init -op
     seclabel u:r:conn_wifi:s0
     oneshot
 
-# 【格式修正 2026-11-17】段关键字统一顶格、去掉行尾空格。init 解析器会裁掉
-# 首尾空白，原写法实际也能解析，这里只是规范化，方便用 grep '^service ' 扫描。
-# 注意：这个服务是被 `on boot` 里的 `exec_start init-btloader-sh` 拉起的，
-# exec_start 走 Service::ExecStart()，不受 disabled 影响（builtins.cpp:269）。
+# [2026-11-17] Section keywords are now at the start of the line and trailing
+# spaces were removed. The parser trims leading/trailing whitespace so the old
+# form parsed as well; this only normalises things for `grep '^service '`.
+# Note: the service is started by `exec_start init-btloader-sh` in `on boot`.
+# exec_start goes through Service::ExecStart(), so `disabled` does not stop it
+# (builtins.cpp:269).
 service init-btloader-sh /system/bin/init.btloader.sh
     class main
     user root

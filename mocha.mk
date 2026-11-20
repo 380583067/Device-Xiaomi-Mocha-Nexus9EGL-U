@@ -309,19 +309,26 @@ PRODUCT_COPY_FILES += \
 # Enable nvidia framework enhancements if available
 -include vendor/lineage/product/nvidia.mk
 
-# 软解：默认走 Codec2（c2.android.*），OMX 仅作后备
-#   debug.stagefright.ccodec 取值（见 frameworks/av/media/codec2/sfplugin/
-#   Codec2InfoBuilder.cpp）：0=完全禁用 C2；1=只优先 c2.android.* 音频；
-#   2=c2.android.* 全部可用并排在最前，其它 .avc.decoder/.avc.encoder 可用
-#   但排最后；3=c2.android.* 排最前，其它按默认；4=全部按默认。
-#   本树不设该属性时默认是 4，而 OMX 默认 rank 0x100 高于 c2.android.* 的
-#   0x200，实际会选中 OMX.google.*.avc.decoder。这里取 2：软解默认用 C2，
-#   同时保留 OMX 作为末尾后备（万一某个流 C2 软解不吃，OMX 仍能被选中）。
-#   前置条件：frameworks/av 的 C2AllocatorGralloc 老 gralloc 适配补丁（
-#   lockYCbCr 缺失时回退 lock()、YV12 走 Y/V/U 平面、CPU_WRITE+YUV 补
-#   HW_TEXTURE）。没有这些补丁 C2 软解会直接 start() 失败或颜色红绿互换。
-#   C2 软解实测 720p 约 29.3~29.5fps，与 OMX 持平，颜色逐帧一致。
-#   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
+# Software decoding defaults to Codec2 (c2.android.*); OMX stays as fallback.
+#   Values of debug.stagefright.ccodec (see Codec2InfoBuilder.cpp in
+#   frameworks/av/media/codec2/sfplugin/): 0 = Codec2 disabled entirely;
+#   1 = only c2.android.* audio preferred; 2 = every c2.android.* available and
+#   ranked first, other .avc.decoder/.avc.encoder components available but last;
+#   3 = c2.android.* first, the rest at their normal rank; 4 = everything at its
+#   normal rank.
+#   Without this property the tree defaults to 4, and OMX's default rank 0x100
+#   is above c2.android.*'s 0x200, so OMX.google.*.avc.decoder is picked. Hence
+#   2: software decode uses Codec2 by default while OMX remains as the last
+#   resort (if some stream does not decode with Codec2, OMX can still be
+#   selected).
+#   Prerequisite: the C2AllocatorGralloc legacy-gralloc patch in frameworks/av
+#   (fall back to lock() when lockYCbCr is missing, planar Y/V/U for YV12, and
+#   HW_TEXTURE only for CPU_WRITE + YUV allocations). Without it Codec2 decode
+#   either fails start() outright or shows swapped colours.
+#   Measured: C2 software decode at 720p runs 29.3-29.5fps, on par with OMX and
+#   colour-identical frame by frame.
+#   c2-poolmask is the usage mask for the software Codec2 output buffer pool and
+#   keeps its original value.
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
     debug.stagefright.ccodec=2
