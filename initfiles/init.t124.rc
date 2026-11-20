@@ -20,14 +20,79 @@ on boot
     # TBD: Remove the below line that give permissions for scaling_governor
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 
-    # Smoke kernel default governor
+    # CPU 调速器：interactive
+    # （内核 defconfig 里默认调速器是 userspace，不显式设置等于频率不会动。）
+    #
+    # 【2026-11-21 修正】原来这里写的是：
+    #     interactive/awake_ideal_freq   1326000
+    #     interactive/boost_freq         1428000
+    #     interactive/touch_poke_freq    1326000
+    #     interactive/input_boost_duration 45000
+    # 这四个节点**只有 smartmax 有**（kernel/drivers/cpufreq/cpufreq_smartmax.c
+    # 的 smartmax_attributes[]），interactive 的 sysfs 里根本不存在
+    # （见 cpufreq_interactive.c 的 gov_sys_pol_attr_rw 列表）。所以这四行每次
+    # 开机都是 write 失败，等于**一点调优都没生效**，interactive 跑的是内核默认：
+    #     target_loads 90 / go_hispeed_load 99 / min_sample_time 30ms
+    # go_hispeed_load=99 意味着负载不到 99% 就不往 hispeed 以上冲，滑动、转场
+    # 这种 50~70% 单核负载的动画就一直吊在低频上 —— 这就是"卡卡的"直接来源。
+    # 下面改成写 interactive 真实存在的节点，取值同 19.1 树 balanced 档的验证值。
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor interactive
+    write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 1428000
+    write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 90
+    write /sys/devices/system/cpu/cpufreq/interactive/target_loads 80
+    write /sys/devices/system/cpu/cpufreq/interactive/timer_rate 20000
+    write /sys/devices/system/cpu/cpufreq/interactive/timer_slack 40000
+    write /sys/devices/system/cpu/cpufreq/interactive/min_sample_time 20000
+    write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay 40000
+    write /sys/devices/system/cpu/cpufreq/interactive/io_is_busy 1
 
-    # Smoke kernel default governor settings
-    write /sys/devices/system/cpu/cpufreq/interactive/awake_ideal_freq 1326000
-    write /sys/devices/system/cpu/cpufreq/interactive/boost_freq 1428000
-    write /sys/devices/system/cpu/cpufreq/interactive/touch_poke_freq 1326000
-    write /sys/devices/system/cpu/cpufreq/interactive/input_boost_duration 45000
+    # 【2026-11-21 修正】把调速器节点交给 system，NVIDIA 的 power HAL
+    # （/system/vendor/bin/hw/android.hardware.power@1.0-service，日志 tag
+    # powerHAL::common，已监听 atmel-maxtouch）才能按场景调频。这些节点由内核
+    # 以 0644 root:root 创建，HAL 以 system 身份运行，原来每次开机都只能打：
+    #     E powerHAL::common: Error opening .../interactive/hispeed_freq: Permission denied
+    #     （target_loads / above_hispeed_delay / timer_rate / boost_factor 同样失败）
+    # 于是触控升频和它的整套 governor profile 全部失效。这里放开权限交还给 HAL。
+    # 注意：A14 的 init chown/chmod **不支持通配符**（system/core/init/builtins.cpp
+    # 的 do_chown/do_chmod 直接 lchown/fchmodat 字面路径），必须逐个列。
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/target_loads
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/timer_rate
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/timer_slack
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/min_sample_time
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/boost
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/boost_factor
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+    chown system system /sys/devices/system/cpu/cpufreq/interactive/io_busy_threshold
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/target_loads
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/timer_rate
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/timer_slack
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/min_sample_time
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/boost
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/boost_factor
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+    chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_busy_threshold
+
+    # smartmax 同样的放开，方便以后 setprop 切过去做对比测试（节点见
+    # cpufreq_smartmax.c 的 smartmax_attributes[]）。
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/awake_ideal_freq
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/boost_freq
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/touch_poke_freq
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/input_boost_duration
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/sampling_rate
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/up_rate
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/down_rate
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/max_cpu_load
+    chown system system /sys/devices/system/cpu/cpufreq/smartmax/min_cpu_load
 
     chown system system /sys/devices/platform/host1x/tegradc.0/enable
     chown system system /sys/devices/platform/host1x/tegradc.1/enable

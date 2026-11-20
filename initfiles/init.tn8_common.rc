@@ -73,8 +73,18 @@ on init
     setprop input.nonwhitelistedmode 3
     setprop keyguard.no_require_sim true
     setprop persist.tegra.didim.enable 0
-    write /proc/sys/vm/page-cluster 0
-    write /d/tegra_actmon/cpu_emc/avg_act_threshold 50000
+
+    # 【2026-11-21 修正】page-cluster 原来是 0（每次换入只读 1 页），这是给
+    # "swap 在 eMMC 上" 那个年代留的省 IO 设置。本机 fstab 里挂的是 1GB
+    # /dev/block/zram0，换入换出都在内存里，1 页粒度只增加循环次数和锁开销；
+    # 内存压力大（A14 + 2GB）时表现就是"越用越卡"。改回内核默认 3（8 页=32KB）。
+    write /proc/sys/vm/page-cluster 3
+
+    # 原来这里还有一行：
+    #     write /d/tegra_actmon/cpu_emc/avg_act_threshold 50000
+    # 本内核（kernel/xiaomi/mocha）里没有 tegra_actmon 的 debugfs 节点，连 /d
+    # 这个符号链接都不存在（init.tegra.rc 只把 debugfs 挂到 /sys/kernel/debug），
+    # 这行每次开机都是 write 失败。删掉，避免日志噪声和误以为在配 EMC 采样。
 
 service charger /system/bin/charger
     class charger

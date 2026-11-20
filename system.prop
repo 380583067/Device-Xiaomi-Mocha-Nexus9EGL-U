@@ -89,15 +89,28 @@ debug.renderengine.backend=gles
 persist.lineage.nofool=true
 
 # LMKD Memory Tuning for mocha 2GB, A14, use_minfree_levels mode
-ro.lmk.low=8192
-ro.lmk.medium=6144
-ro.lmk.high=4096
-ro.lmk.critical=2048
+#
+# 【2026-11-21 修正】先弄清这几个属性在 A14 里到底是什么含义
+# （system/memory/lmkd/lmkd.cpp 的 update_props()）：
+#   ro.lmk.low / medium / critical 是 **vmpressure 三个级别各自对应的
+#   oom_score_adj 阈值**，取值范围 -1000~1000；默认 low=1001，而
+#   "> OOM_SCORE_ADJ_MAX(1000)" 的语义是"该级别不杀进程"。
+# 原配置写的是 8192 / 6144 / 4096 / 2048，全部越界，等于把 vmpressure 分级
+# 彻底废掉；其中 ro.lmk.high 在 A14 的 lmkd 里连对应级别都不存在（只有
+# VMPRESS_LEVEL_LOW/MEDIUM/CRITICAL），纯属死配置。
+# 而且 use_minfree_levels=true 时判定走的是 framework 下发的 minfree 表
+# （sys.lmk.minfree_levels），根本不会用这几个 oom_score_adj。
+# 这里恢复成默认值（low 关闭），只保留真正生效的开关。
+ro.lmk.low=1001
+ro.lmk.medium=800
+ro.lmk.critical=0
 ro.lmk.critical_upgrade=1
 ro.lmk.upgrade_pressure=70
 ro.lmk.downgrade_pressure=50
 ro.lmk.kill_heaviest_task=1
 ro.lmk.kill_timeout_ms=500
+# 本内核没有 CONFIG_PSI（3.10 内核），PSI 模式必须关掉，否则 lmkd 拿不到压力
+# 信号就只剩硬杀；minfree 模式是这台机器上唯一可用的路径。
 ro.lmk.use_minfree_levels=true
 ro.lmk.use_psi=false
 
@@ -144,7 +157,12 @@ persist.wlan.ti.calibrated=0
 persist.sys.binary_xml=false
 
 # Disable unlock
-ro.oem_unlock_supported=false
+# 【2026-11-21 修正】原来写的是 false，但 ro.oem_unlock_supported 是 **int**
+# 属性（framework 侧读的是 SystemProperties.getInt），开机日志里一直报：
+#   E init: Do not have permissions to set 'ro.oem_unlock_supported' to 'false'
+#           in property file '/system/build.prop': Property type check failed
+# 也就是说这行从来没生效过。改成 0。
+ro.oem_unlock_supported=0
 
 # 【开机动画循环修复 2026-11-17】原厂 NVIDIA gralloc（Android 7/8 时代的 blob）
 # 在 NvGrUnregisterBuffer 里会对一个已经关闭的 fd 再 close 一次（实测报
