@@ -101,6 +101,14 @@ Only the three quirks included above are recognized at this point:
              media_codecs_google_video.xml 里的软件解码器，
              配合 SoftwareRenderer 的 gralloc 兜底（见 frameworks/av 补丁）
              可以正常播放。 -->
+        <!-- mocha 2026-11-20（结论）：非 secure 硬解**永久移除**，不要再加回。
+             实测链：设备无 /dev/nvhost-msdec|vde、内核 drivers/video/tegra/host/
+             下只有 msenc/vi/vic03/isp，没有解码引擎驱动 →
+             NvxVideoDecoderAcquireResources: NvxNvMMTransformOpen failed →
+             ACodec ERROR(0x80001000) → ExoPlayer "Decoder failed"（直接黑屏报错）。
+             即：这个 blob 的硬解在本内核上无法初始化，与 ACodec/metadata 协商
+             无关（那些补丁解决的是崩溃，不是可解码性）。
+             本机 H.264 只能走 OMX.google.h264.decoder 软解。 -->
         <MediaCodec name="OMX.Nvidia.h264.decode.secure" type="video/avc" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
