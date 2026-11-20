@@ -1,38 +1,112 @@
-Mocha LineageOS 21 patch set
-===========================
+Mocha (Xiaomi Mi Pad 1, Tegra K1) LineageOS 21 patch set
+========================================================
 
-Patch files are grouped by their LineageOS source project. Keep each patch in
-the directory matching its repository path, for example:
+Every change this device tree needs outside of `device/xiaomi/mocha` lives here
+as a patch, grouped by the LineageOS source project it belongs to. Nothing in
+this directory is built into the image; the scripts apply the series to the
+source tree after a `repo sync`.
 
-  frameworks/av/*.patch
-  frameworks/base/*.patch
-  system/core/*.patch
+Layout
+------
 
-File names follow `NNNN-<short-slug>.patch`, where NNNN is the position of the
-patch inside its project directory and the slug summarises the change (it is
-the same wording used in the commit subject of the upstream project). Scripts
-glob for `*.patch` and sort by path, so the numeric prefix alone decides the
-apply order inside a project.
+  patches/<repo path>/NNNN-<slug>.patch
 
-Run these scripts from any directory; they locate the source root relative to
-their own location:
+`<repo path>` is the project path inside the Android tree, so
+`frameworks/av/*.patch` targets `$ANDROID_TOP/frameworks/av`. `NNNN` is the
+apply position inside that project and `-<slug>` repeats the commit subject.
+The scripts glob `*.patch`, sort by path and apply in that order, so the numeric
+prefix alone decides the order within one project.
 
-  device/xiaomi/mocha/patches/check.sh
-  device/xiaomi/mocha/patches/install.sh
-  device/xiaomi/mocha/patches/uninstall.sh
+Scripts
+-------
 
-check.sh checks patches in sorted order against a temporary Git index, so
-dependent patches are checked as a series without changing source files or the
-real Git index. install.sh applies the same ordered series and rolls back only
-patches it applied if an error occurs. uninstall.sh reverses only patches that
-match this patch set, in reverse order; it never runs git checkout or git clean.
+  patches/check.sh      validate the series without touching any worktree
+  patches/install.sh    apply the series (check first, roll back on failure)
+  patches/uninstall.sh  reverse only the patches from this series
 
-If a patch conflicts, inspect the source revision and patch intent before
-editing it. Do not resolve conflicts by discarding unrelated source changes.
+All three locate the Android root relative to their own path, so they can be
+run from anywhere. `--only <repo path>` restricts a run to one project, e.g.
 
-Every patch in this directory applies cleanly, in sorted order, to a pristine
-checkout of the LineageOS 21 source tree this device tree targets.
+  patches/check.sh --only frameworks/av
+  patches/install.sh --only frameworks/native
+  patches/uninstall.sh --only frameworks/av
 
+`check.sh` uses a throwaway Git index per project, so dependent patches see the
+patches before them without changing files or the real index. It prints one of:
+
+  APPLIED   the change is already in the worktree
+  READY     applies cleanly, not applied yet
+  COVERED   the change is already included by an earlier patch
+  CONFLICT  does not apply; the diff is printed
+
+`install.sh` runs `check.sh` first and aborts if anything conflicts. It applies
+in the same order and, if a patch fails mid-way, reverses only the patches it
+applied during that run. `uninstall.sh` reverses in reverse order and never runs
+`git checkout` or `git clean`, so local work is preserved.
+
+Source tree dependencies
+------------------------
+
+Two projects come from personal forks instead of the LineageOSUL organisation,
+because that organisation is read-only for this account
+(`permissions.push=false`). The local manifest pins:
+
+  frameworks/av      -> 380583067/android_frameworks_av      lineage-21.0-mocha
+  frameworks/native  -> 380583067/android_frameworks_native  lineage-21.0-mocha
+
+Those branches contain exactly the patches below for the corresponding project:
+
+  frameworks/av      0001, 0031, 0033, 0035, 0041, 0042, 0043, 0050
+  frameworks/native  0001
+
+If the manifest is switched back to `LineageOSUL/android_frameworks_{av,native}`
+at `lineage-21.0`, run `install.sh` after `repo sync` and the tree ends up in the
+same state. Keeping both in sync matters: the device tree assumes the changes
+are present either way.
+
+What the patches are for
+------------------------
+
+frameworks/av
+  0001  re-enable the software OMX nodes (the NVIDIA OMX store hides them)
+  0031  accept YVU420 semi-planar from the camera
+  0033  ACodec: resolve empty vendor parameters (upstream LineageOS fix the
+        mocha tree was missing; without it getVendorParameters loops over an
+        empty key list and spams OMX failures)
+  0035  use 64-bit usage for native_window_set_usage
+  0041  fix the OMX buffer leak on lock timeout
+  0042  SoftwareRenderer: fall back when gralloc has no lockYCbCr
+  0043  skip the broken NVIDIA h264 encoder
+  0050  Codec2: make c2.android.* software video decode work on the legacy
+        Tegra gralloc0 (this is what lets `debug.stagefright.ccodec=2` work):
+        - add GRALLOC_USAGE_HW_TEXTURE only for CPU_WRITE + YUV allocations,
+          so SurfaceFlinger can sample the decoder output while BLOB/CSD
+          buffers stay untouched (HW_TEXTURE on those makes gralloc lock()
+          return -ENOSYS and codec start() throws)
+        - fall back to plain lock() when lockYCbCr() is missing, passing only
+          the SW access bits
+        - describe YV12 as planar Y/V/U instead of interleaved UV (the old
+          description swapped red and green on screen)
+
+frameworks/native
+  0001  three display/binder compatibility changes bundled together:
+        legacy camera HIDL/AIDL interfaces in kDownstreamManualInterfaces,
+        format/size/usage logging when SurfaceFlinger blacks a layer out, and
+        persist.sf.force_gpu_composition (the Tegra HWC blob crashes the
+        composer during surface teardown; a userspace reboot loop follows)
+
+The remaining directories hold the small compatibility fixes needed to build
+LineageOS 21 for this device: frameworks/base, system/core, hardware/broadcom,
+hardware/interfaces, lineage-sdk, packages/*, prebuilts/gcc, build/make and
+vendor/lineage.
+
+Working tree notes
+------------------
+
+The author keeps the longer explanatory comments in Chinese in the local
+working copy; the commits pushed to GitHub carry the English wording. If the
+tree shows those files as modified while `git diff` only touches comments, that
+is expected - `git checkout -- <file>` restores the committed English version.
 
 Removed entries and why
 -----------------------
@@ -56,7 +130,6 @@ only so that an older build log can still be matched:
   `0001-adb-fix-legacy-functionfs-offline-transport-detached.patch`, which is
   a different change: it stops the legacy transport from reporting the USB
   endpoint as detached while the host is still probing it.
-
 
 Note on frameworks/av/0041
 --------------------------

@@ -1,0 +1,260 @@
+diff --git a/media/codec2/vndk/C2AllocatorGralloc.cpp b/media/codec2/vndk/C2AllocatorGralloc.cpp
+index 971b5a5..b49f8b7 100644
+--- a/media/codec2/vndk/C2AllocatorGralloc.cpp
++++ b/media/codec2/vndk/C2AllocatorGralloc.cpp
+@@ -18,7 +18,10 @@
+ #define LOG_TAG "C2AllocatorGralloc"
+ #include <utils/Log.h>
+ 
++#include <inttypes.h>
+ #include <mutex>
++#include <stdlib.h>
++#include <sys/system_properties.h>
+ 
+ #include <aidl/android/hardware/graphics/common/PlaneLayoutComponentType.h>
+ #include <android/hardware/graphics/common/1.2/types.h>
+@@ -68,12 +71,71 @@ C2MemoryUsage C2AndroidMemoryUsage::FromGrallocUsage(uint64_t usage) {
+             (usage & PASSTHROUGH_USAGE_MASK));
+ }
+ 
++/* [mocha 2026-11-20] Debug override for the extra gralloc usage bits.
++ *
++ * Tegra's gralloc0 is very sensitive to usage bits: adding GPU-only bits
++ * (HW_RENDER / HW_COMPOSER, ...) makes lock()/lockYCbCr() on the same buffer
++ * return -ENOSYS (38), so the software decoder can no longer write its output;
++ * SurfaceFlinger on the other side insists on HW_TEXTURE (0x100) or it reports
++ * "buffer is not gpu readable" and blanks the layer. To try "CPU writable +
++ * GPU sampleable" combinations without a rebuild, a property switch is kept
++ * here; setprop and restart media.swcodec / mediaserver to switch:
++ *   debug.mocha.c2extra_usage=0x0     SW bits only (control baseline)
++ *   debug.mocha.c2extra_usage=0x100   HW_TEXTURE (default, verified on device)
++ *   debug.mocha.c2extra_usage=0x2100  HW_TEXTURE|EXTERNAL_DISP (as the OMX renderer)
++ * The default is used when the property is unset. Only applies to CPU_WRITE YUV
++ * buffers (decoder output). */
++static bool getDebugExtraUsage(uint64_t *out) {
++    char value[PROP_VALUE_MAX] = {};
++    if (__system_property_get("debug.mocha.c2extra_usage", value) <= 0) {
++        return false;
++    }
++    *out = strtoull(value, nullptr, 0);
++    return true;
++}
++
++static bool isYuvPixelFormat(uint32_t format) {
++    switch (format) {
++        case HAL_PIXEL_FORMAT_YV12:
++        case HAL_PIXEL_FORMAT_YCbCr_420_888:
++        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
++        case HAL_PIXEL_FORMAT_YCbCr_422_SP:
++        case HAL_PIXEL_FORMAT_YCbCr_422_I:
++        case HAL_PIXEL_FORMAT_Y8:
++            return true;
++        default:
++            return false;
++    }
++}
++
++/* [mocha 2026-11-20] Only "CPU writable + YUV graphic" buffers (software
++ * decoder output) get HW_TEXTURE:
++ *  - without it SurfaceFlinger declares the buffer "not gpu readable" and
++ *    blanks the whole SurfaceView;
++ *  - adding it to BLOB (CSD / codec-specific data) buffers makes tegra gralloc
++ *    return -ENOSYS from lock(), and codec start() throws CodecException
++ *    (measured).
++ * That makes this format dependent, so it cannot live inside
++ * C2AndroidMemoryUsage::asGrallocUsage() (format is not available there). */
++static uint64_t getExtraGraphicUsage(uint32_t format, const C2MemoryUsage &usage) {
++    if (!(usage.expected & C2MemoryUsage::CPU_WRITE) || !isYuvPixelFormat(format)) {
++        return 0;
++    }
++    uint64_t extra;
++    if (!getDebugExtraUsage(&extra)) {
++        extra = GRALLOC_USAGE_HW_TEXTURE;
++    }
++    return extra;
++}
++
+ uint64_t C2AndroidMemoryUsage::asGrallocUsage() const {
+     // gralloc does not support WRITE_PROTECTED
+-    return (((expected & C2MemoryUsage::CPU_READ) ? GRALLOC_USAGE_SW_READ_OFTEN : 0) |
++    uint64_t usage =
++            (((expected & C2MemoryUsage::CPU_READ) ? GRALLOC_USAGE_SW_READ_OFTEN : 0) |
+             ((expected & C2MemoryUsage::CPU_WRITE) ? GRALLOC_USAGE_SW_WRITE_OFTEN : 0) |
+             ((expected & C2MemoryUsage::READ_PROTECTED) ? GRALLOC_USAGE_PROTECTED : 0) |
+             (expected & PASSTHROUGH_USAGE_MASK));
++    return usage;
+ }
+ 
+ namespace /* unnamed */ {
+@@ -628,7 +690,9 @@ static c2_status_t PopulatePlaneLayout(
+             status_t err = GraphicBufferMapper::get().lock(
+                     const_cast<native_handle_t*>(buffer), grallocUsage, rect, &pointer);
+             if (err) {
+-                ALOGE("failed transaction: lock(BLOB)");
++                ALOGE("failed transaction: lock(BLOB) err=%d usage=%#" PRIx64
++                      " %dx%d stride=%u", err, grallocUsage,
++                      rect.getWidth(), rect.height(), stride);
+                 return C2_CORRUPTED;
+             }
+             *addr = (uint8_t *)pointer;
+@@ -648,9 +712,147 @@ static c2_status_t PopulatePlaneLayout(
+ 
+             status_t err = GraphicBufferMapper::get().lockYCbCr(
+                     const_cast<native_handle_t*>(buffer), grallocUsage, rect, &ycbcrLayout);
+-            if (err) {
+-                ALOGE("failed transaction: lockYCbCr (err=%d)", err);
+-                return C2_CORRUPTED;
++            if (err || !ycbcrLayout.y || !ycbcrLayout.cb || !ycbcrLayout.cr
++                    || ycbcrLayout.ystride == 0
++                    || ycbcrLayout.cstride == 0
++                    || ycbcrLayout.chroma_step == 0) {
++                /* [mocha 2026-11-20] Tegra's gralloc0 only implements lock();
++                 * the mapper's lockYCbCr() returns -ENOSYS/errno 38 (measured),
++                 * which makes every Codec2 software decoder (c2.android.*) fail
++                 * while mapping its output buffer:
++                 *   C2AllocatorGralloc: failed transaction: lockYCbCr (err=-38)
++                 *   C2SoftAvcDec: graphic view map failed 14
++                 * Fall back to plain lock() and compute the plane addresses
++                 * here (YV12 uses the planar branch below, the other 420
++                 * formats are treated as interleaved UV).
++                 * The fallback only affects old platforms without lockYCbCr. */
++                void *pointer = nullptr;
++                /* lock() only accepts the SW access bits: passing the HW_*
++                 * bits along makes tegra gralloc return -ENOSYS as well
++                 * (measured). Keep the SW bits only. */
++                uint64_t lockUsage = grallocUsage &
++                        (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK);
++                if (lockUsage == 0) {
++                    lockUsage = GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN;
++                }
++                status_t lerr = GraphicBufferMapper::get().lock(
++                        const_cast<native_handle_t*>(buffer), lockUsage, rect,
++                        &pointer);
++                if (lerr || pointer == nullptr) {
++                    ALOGE("failed transaction: lockYCbCr(%d) / lock(%d) "
++                          "fmt=%u usage=%#" PRIx64 " lockUsage=%#" PRIx64
++                          " rect=%dx%d stride=%u",
++                            err, lerr, format, grallocUsage, lockUsage,
++                            rect.getWidth(), rect.height(), stride);
++                    return C2_CORRUPTED;
++                }
++                const uint32_t yStride = stride ? stride : rect.getWidth();
++                const uint32_t sliceHeight = rect.height();
++                uint8_t *base = static_cast<uint8_t *>(pointer);
++                ALOGV("lockYCbCr unavailable, fallback layout: stride=%u slice=%u "
++                      "fmt=%u", yStride, sliceHeight, format);
++                layout->type = C2PlanarLayout::TYPE_YUV;
++                layout->numPlanes = 3;
++                layout->rootPlanes = 3;
++                if (format == static_cast<uint32_t>(PixelFormat4::YV12)) {
++                    /* YV12 is planar: Y / V / U (V before U), not interleaved
++                     * UV. This used to describe NV12, so the decoder wrote
++                     * interleaved data into a YV12 buffer and SurfaceFlinger
++                     * read it as planar -> wrong colours (red/green swapped).
++                     * Layout matches the verified SoftwareRenderer fallback:
++                     *   Y = base
++                     *   V = base + yStride * height
++                     *   U = V + (yStride/2) * (height/2) */
++                    const uint32_t cStride = yStride / 2;
++                    const size_t cPlaneSize = (size_t)cStride * (sliceHeight / 2);
++                    addr[C2PlanarLayout::PLANE_Y] = base;
++                    addr[C2PlanarLayout::PLANE_V] = base + (size_t)yStride * sliceHeight;
++                    addr[C2PlanarLayout::PLANE_U] = addr[C2PlanarLayout::PLANE_V] + cPlaneSize;
++                    layout->planes[C2PlanarLayout::PLANE_Y] = {
++                        C2PlaneInfo::CHANNEL_Y,         // channel
++                        1,                              // colInc
++                        static_cast<int32_t>(yStride),  // rowInc
++                        1,                              // mColSampling
++                        1,                              // mRowSampling
++                        8,                              // allocatedDepth
++                        8,                              // bitDepth
++                        0,                              // rightShift
++                        C2PlaneInfo::NATIVE,            // endianness
++                        C2PlanarLayout::PLANE_Y,        // rootIx
++                        0,                              // offset
++                    };
++                    layout->planes[C2PlanarLayout::PLANE_U] = {
++                        C2PlaneInfo::CHANNEL_CB,        // channel
++                        1,                              // colInc
++                        static_cast<int32_t>(cStride),  // rowInc
++                        2,                              // mColSampling
++                        2,                              // mRowSampling
++                        8,                              // allocatedDepth
++                        8,                              // bitDepth
++                        0,                              // rightShift
++                        C2PlaneInfo::NATIVE,            // endianness
++                        C2PlanarLayout::PLANE_U,        // rootIx
++                        0,                              // offset
++                    };
++                    layout->planes[C2PlanarLayout::PLANE_V] = {
++                        C2PlaneInfo::CHANNEL_CR,        // channel
++                        1,                              // colInc
++                        static_cast<int32_t>(cStride),  // rowInc
++                        2,                              // mColSampling
++                        2,                              // mRowSampling
++                        8,                              // allocatedDepth
++                        8,                              // bitDepth
++                        0,                              // rightShift
++                        C2PlaneInfo::NATIVE,            // endianness
++                        C2PlanarLayout::PLANE_V,        // rootIx
++                        0,                              // offset
++                    };
++                    break;
++                }
++                /* Other 420 formats (NV12/NV21, ...) use interleaved UV */
++                addr[C2PlanarLayout::PLANE_Y] = base;
++                addr[C2PlanarLayout::PLANE_U] = base + yStride * sliceHeight;
++                addr[C2PlanarLayout::PLANE_V] = addr[C2PlanarLayout::PLANE_U] + 1;
++                layout->planes[C2PlanarLayout::PLANE_Y] = {
++                    C2PlaneInfo::CHANNEL_Y,         // channel
++                    1,                              // colInc
++                    static_cast<int32_t>(yStride),  // rowInc
++                    1,                              // mColSampling
++                    1,                              // mRowSampling
++                    8,                              // allocatedDepth
++                    8,                              // bitDepth
++                    0,                              // rightShift
++                    C2PlaneInfo::NATIVE,            // endianness
++                    C2PlanarLayout::PLANE_Y,        // rootIx
++                    0,                              // offset
++                };
++                layout->planes[C2PlanarLayout::PLANE_U] = {
++                    C2PlaneInfo::CHANNEL_CB,        // channel
++                    2,                              // colInc
++                    static_cast<int32_t>(yStride),  // rowInc
++                    2,                              // mColSampling
++                    2,                              // mRowSampling
++                    8,                              // allocatedDepth
++                    8,                              // bitDepth
++                    0,                              // rightShift
++                    C2PlaneInfo::NATIVE,            // endianness
++                    C2PlanarLayout::PLANE_U,        // rootIx
++                    0,                              // offset
++                };
++                layout->planes[C2PlanarLayout::PLANE_V] = {
++                    C2PlaneInfo::CHANNEL_CR,        // channel
++                    2,                              // colInc
++                    static_cast<int32_t>(yStride),  // rowInc
++                    2,                              // mColSampling
++                    2,                              // mRowSampling
++                    8,                              // allocatedDepth
++                    8,                              // bitDepth
++                    0,                              // rightShift
++                    C2PlaneInfo::NATIVE,            // endianness
++                    C2PlanarLayout::PLANE_V,        // rootIx
++                    0,                              // offset
++                };
++                break;
+             }
+             if (!ycbcrLayout.y || !ycbcrLayout.cb || !ycbcrLayout.cr
+                     || ycbcrLayout.ystride == 0
+@@ -1211,8 +1413,7 @@ c2_status_t C2AllocatorGralloc::Impl::newGraphicAllocation(
+         uint32_t width, uint32_t height, uint32_t format, const C2MemoryUsage &usage,
+         std::shared_ptr<C2GraphicAllocation> *allocation) {
+     uint64_t grallocUsage = static_cast<C2AndroidMemoryUsage>(usage).asGrallocUsage();
+-    ALOGV("allocating buffer with usage %#llx => %#llx",
+-          (long long)usage.expected, (long long)grallocUsage);
++    grallocUsage |= getExtraGraphicUsage(format, usage);
+ 
+     buffer_handle_t buffer;
+ 

@@ -1,8 +1,8 @@
 diff --git a/libs/binder/include/binder/IInterface.h b/libs/binder/include/binder/IInterface.h
-index 711615495..463e31ce5 100644
+index ac845bc..1e3c376 100644
 --- a/libs/binder/include/binder/IInterface.h
 +++ b/libs/binder/include/binder/IInterface.h
-@@ -313,6 +313,15 @@ constexpr const char* const kManualInterfaces[] = {
+@@ -296,6 +296,15 @@ constexpr const char* const kManualInterfaces[] = {
  
  constexpr const char* const kDownstreamManualInterfaces[] = {
    // Add downstream interfaces here.
@@ -18,11 +18,35 @@ index 711615495..463e31ce5 100644
    nullptr,
  };
  
+diff --git a/services/surfaceflinger/LayerFE.cpp b/services/surfaceflinger/LayerFE.cpp
+index 115e997..c258ce1 100644
+--- a/services/surfaceflinger/LayerFE.cpp
++++ b/services/surfaceflinger/LayerFE.cpp
+@@ -220,8 +220,17 @@ void LayerFE::prepareBufferStateClientComposition(
+     const bool bufferCanBeUsedAsHwTexture =
+             mSnapshot->externalTexture->getUsage() & GraphicBuffer::USAGE_HW_TEXTURE;
+     if (blackOutLayer || !bufferCanBeUsedAsHwTexture) {
+-        ALOGE_IF(!bufferCanBeUsedAsHwTexture, "%s is blacked out as buffer is not gpu readable",
+-                 mSnapshot->name.c_str());
++        /* [mocha 2026-11-20] Print the real format/usage so it is possible to
++         * tell whether the allocation side missed a usage bit or the format
++         * itself is not accepted by the GPU. */
++        ALOGE_IF(!bufferCanBeUsedAsHwTexture,
++                 "%s is blacked out as buffer is not gpu readable "
++                 "(fmt=%u %dx%d usage=%#" PRIx64 ")",
++                 mSnapshot->name.c_str(),
++                 mSnapshot->externalTexture->getPixelFormat(),
++                 mSnapshot->externalTexture->getWidth(),
++                 mSnapshot->externalTexture->getHeight(),
++                 mSnapshot->externalTexture->getUsage());
+         prepareClearClientComposition(layerSettings, true /* blackout */);
+         return;
+     }
 diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
-index 878761b07..fa66ed5bd 100644
+index c559a34..42dd991 100644
 --- a/services/surfaceflinger/SurfaceFlinger.cpp
 +++ b/services/surfaceflinger/SurfaceFlinger.cpp
-@@ -457,4 +457,9 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
+@@ -457,6 +457,11 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
      maxGraphicsWidth = std::max(max_graphics_width(0), 0);
      maxGraphicsHeight = std::max(max_graphics_height(0), 0);
  
@@ -32,3 +56,5 @@ index 878761b07..fa66ed5bd 100644
 +    mDebugDisableHWC = property_get_bool("persist.sf.force_gpu_composition", false);
 +
      mSupportsWideColor = has_wide_color_display(false);
+     mDefaultCompositionDataspace =
+             static_cast<ui::Dataspace>(default_composition_dataspace(Dataspace::V0_SRGB));
