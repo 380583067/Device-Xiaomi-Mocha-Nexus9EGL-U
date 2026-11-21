@@ -324,14 +324,27 @@ PRODUCT_COPY_FILES += \
 #   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
-    debug.stagefright.ccodec=1
+    debug.stagefright.ccodec=2
 
-# 【2026-11-21】ccodec=1 而不是 2：C2 软解的"解码到 Surface 播放"路径还是黑的
-# （解码本身正常、帧已提交到 SurfaceView 层（SF frame 计数在走），但 GPU 合成出来
-# 全黑 —— C2AllocatorGralloc 的 lock() fallback 在 tegra gralloc0 的 blocklinear
-# buffer 上，CPU 写入没落到 GPU 可见的 backing store；OMX 的 SoftwareRenderer
-# fallback（0042 补丁）同一 gralloc 路径是好的。所以视频解码先用 OMX 软解，
-# 音频继续走 C2；等 C2→Surface 路径修好（对照 0042 的 lock/flush 语义）再切回 2。
+# [mocha 2026-11-21] ccodec=2, not 1: with 1 only the c2.android.* *audio* codecs
+# are ranked first, so a video stream can still land on one of the NVIDIA OMX
+# decoders. Those decoders cannot initialise on this kernel (there is no
+# /dev/nvhost-msdec or vde node) and the 2014 blob also predates the Android 14
+# ACodec buffer ABI, but the OMX plugin keeps registering them and their default
+# rank (0x100) beats c2.android.* (0x200). When one is picked the SurfaceView
+# stays black while the progress bar keeps running, because ExoPlayer fails with
+# CodecException 0x80001000 and has no frame to show.
+# Measured on the 13:10 build: a 20 s VP8/WebM clip picked OMX.Nvidia.vp8.decode
+# and stayed black with ccodec=1; with 2 it goes to c2.android.vp8.decoder and
+# renders. A 16-clip matrix (H.264 720p-4K, HEVC 8-bit 720p/1080p, VP9, VP8,
+# MPEG-4 Part 2 in mp4/mkv/avi, 3GP, interlaced, anamorphic, non-16-aligned,
+# AC3-in-MKV, H.264 in MPEG-TS) renders correctly with this value, and the
+# encoder side still works (screenrecord -> c2.android.avc.encoder, playable).
+# Still unsupported for other reasons: HEVC Main10 (no 10-bit decoder at all)
+# and MPEG-2 (no software decoder in this build, the NVIDIA one fails).
+# The earlier claim "C2 software video output to a Surface is always black" was a
+# misdiagnosis - the black layers were NVIDIA decoders being selected; C2 decode
+# to a SurfaceView composites fine under the forced GPU composition.
 
 # Packages the inherited product lists ship but this board cannot use; see
 # RemovePackages/Android.mk for which one and why.
