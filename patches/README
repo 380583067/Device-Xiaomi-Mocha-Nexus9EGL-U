@@ -88,6 +88,16 @@ frameworks/av
         - describe YV12 as planar Y/V/U instead of interleaved UV (the old
           description swapped red and green on screen)
 
+system/sepolicy
+  0001  two gaps in the system-private policy this board needs and vendor
+        policy cannot express (both domains live in
+        system/sepolicy/private, so no device-side rule can name them):
+        - linkerconfig reads the NVIDIA /vendor blobs while building the
+          linker namespaces
+        - misctrl reads its own property block (upstream only grants set_prop)
+        This is the only patch series outside the device tree that touches a
+        system-private domain; everything else is done in device sepolicy.
+
 frameworks/native
   0001  three display/binder compatibility changes bundled together:
         legacy camera HIDL/AIDL interfaces in kDownstreamManualInterfaces,

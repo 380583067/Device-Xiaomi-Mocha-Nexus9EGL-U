@@ -77,6 +77,9 @@
 # 类型 tegradc_device 与 surfaceflinger/system_server/system_app 的规则早就写好了，
 # 缺的只是这一行标签。
 /dev/tegra_dc_.*			u:object_r:tegradc_device:s0
+# misc 分区：misctrl 读它（system 策略里已有 allow misctrl misc_block_device）。
+/dev/block/platform/sdhci-tegra\.3/by-name/MSC	u:object_r:misc_block_device:s0
+/dev/block/mmcblk0p10				u:object_r:misc_block_device:s0
 # rpmb 块设备
 #/dev/block/platform/sdhci-tegra\.3/mmcblk0rpmb		u:object_r:rpmb_block_device:s0
 # setup_fs emmc：TN8 分区名与 AOSP 默认名不同，必须逐个映射，
@@ -183,8 +186,14 @@
 # update_js_touch_fw
 #/system/bin/update_js_touch_fw.sh	u:object_r:update_js_touch_fw_exec:s0
 # phs
-#(/system)?/vendor/bin/ussrd		u:object_r:ussrd_exec:s0
-#/system/bin/ussr_setup.sh		u:object_r:ussr_setup_exec:s0
+# 2026-11-21: 打开这行。之前注释掉，ussrd 二进制落成 vendor_file，init 执行时
+# 被拒 execute，且 init_daemon_domain(ussrd) 的域转换永远不生效。
+# 必须写成 (vendor|system/vendor)：这台机器 system-as-root，/vendor 只是指向
+# /system/vendor 的软链，运行时真实路径是 /system/vendor/bin/...，只写 /vendor
+# 匹配不上（实测标签没生效）。
+/(vendor|system/vendor)/bin/ussrd		u:object_r:ussrd_exec:s0
+/(vendor|system/vendor)/bin/conn_init	u:object_r:conn_wifi_exec:s0
+/system/bin/ussr_setup.sh		u:object_r:ussr_setup_exec:s0
 # dual wifi
 /system/bin/wpa_supplicant_2		u:object_r:hal_wifi_supplicant_default_exec:s0
 

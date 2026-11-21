@@ -1,0 +1,40 @@
+diff --git a/private/linkerconfig.te b/private/linkerconfig.te
+index bd46ca4..fee1dd9 100644
+--- a/private/linkerconfig.te
++++ b/private/linkerconfig.te
+@@ -27,4 +27,11 @@ allow linkerconfig otapreopt_chroot:fd use;
+ allow linkerconfig postinstall_apex_mnt_dir:dir r_dir_perms;
+ allow linkerconfig postinstall_apex_mnt_dir:file r_file_perms;
+ 
++# [mocha] linkerconfig scans /vendor on this board and reads the NVIDIA graphics
++# blobs while building the linker namespaces (hwcomposer.tegra.so and friends):
++# 8 denials per boot. The files are 0644 libraries, the read is the same one
++# init and the HALs already do, so grant it instead of leaving the namespace
++# search partially failed.
++allow linkerconfig vendor_file:file r_file_perms;
++
+ neverallow { domain -init -linkerconfig -otapreopt_chroot } linkerconfig_exec:file no_x_file_perms;
+diff --git a/private/misctrl.te b/private/misctrl.te
+index 2352067..f201d5d 100644
+--- a/private/misctrl.te
++++ b/private/misctrl.te
+@@ -8,10 +8,19 @@ allow misctrl misc_block_device:blk_file rw_file_perms;
+ allow misctrl block_device:dir r_dir_perms;
+ read_fstab(misctrl)
+ 
++# [mocha] misctrl reads its own property block as well as setting it; the read
++# was denied twice per boot.
++get_prop(misctrl, misctrl_prop)
+ set_prop(misctrl, misctrl_prop)
+ 
+ # bootloader_message tries to find the fstab in the device config path first,
+ # but because we've already booted up we can use the ro.boot properties instead,
+ # so we can just ignore the SELinux denial.
++# [mocha] Same intent as the line below, for the /proc copy of the device tree
++# this kernel exposes (the compatible string misctrl reads to decide whether it
++# is running on the board it supports). Upstream silences the sysfs variant;
++# this board has no sysfs copy at all.
++dontaudit misctrl proc:file r_file_perms;
++
+ dontaudit misctrl sysfs_dt_firmware_android:dir search;
+ dontaudit misctrl vendor_property_type:file read;

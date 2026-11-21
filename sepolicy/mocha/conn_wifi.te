@@ -7,3 +7,9 @@ allow conn_wifi sysfs:file { open read write };
 # conn_wifi bluetooth_data_file
 allow conn_wifi bluetooth_data_file:dir { search write add_name };
 allow conn_wifi bluetooth_data_file:file { create write setattr open };
+
+# conn_init runs with an explicit `seclabel u:r:conn_wifi:s0` in init.t124.rc, so
+# the domain was never the problem: the binary had no exec type, stayed
+# vendor_file, and init's exec of it was denied. Give it a type of its own.
+type conn_wifi_exec, exec_type, vendor_file_type, file_type;
+allow init conn_wifi_exec:file { getattr open read execute execute_no_trans };

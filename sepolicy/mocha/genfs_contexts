@@ -29,3 +29,10 @@ genfscon sysfs /devices/platform/tegra12-i2c.0/i2c-0/0-0008 u:object_r:sysfs_moc
 genfscon sysfs /module/tegra_fuse/parameters u:object_r:sysfs_tegra_info:s0
 genfscon sysfs /devices/soc0 u:object_r:sysfs_tegra_info:s0
 genfscon sysfs /devices/platform/host1x u:object_r:sysfs_host1x:s0
+
+# The GPADC (a second sensor exposed by the same NVIDIA sensors HAL, which runs
+# inside system_server) lives on another i2c client.
+genfscon sysfs /devices/platform/tegra12-i2c.4/i2c-4/4-0058 u:object_r:sysfs_mocha_imu:s0
+
+# Input device attributes (see sysfs_input.te).
+genfscon sysfs /devices/virtual/input u:object_r:sysfs_input:s0
