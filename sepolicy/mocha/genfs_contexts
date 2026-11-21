@@ -1,0 +1,13 @@
+# Tegra GPU clock controls. sysfs is a pseudo filesystem, so these have to be
+# labelled with genfscon - file_contexts does not apply.
+#
+# Without this the nodes stay u:object_r:sysfs:s0 and every write from the power
+# HAL shows up as "avc: denied { write } ... scontext=u:r:hal_power_default:s0
+# tcontext=u:object_r:sysfs:s0 tclass=file" (40 of them per boot), which is only
+# harmless while the device runs permissive.
+genfscon sysfs /kernel/tegra_gpu/gpu_floor_rate    u:object_r:sysfs_tegra_gpu:s0
+genfscon sysfs /kernel/tegra_gpu/gpu_floor_state   u:object_r:sysfs_tegra_gpu:s0
+genfscon sysfs /kernel/tegra_gpu/gpu_cap_rate      u:object_r:sysfs_tegra_gpu:s0
+genfscon sysfs /kernel/tegra_gpu/gpu_cap_state     u:object_r:sysfs_tegra_gpu:s0
+genfscon sysfs /kernel/tegra_gpu/gpu_rate          u:object_r:sysfs_tegra_gpu:s0
+genfscon sysfs /kernel/tegra_gpu/gpu_available_rates u:object_r:sysfs_tegra_gpu:s0

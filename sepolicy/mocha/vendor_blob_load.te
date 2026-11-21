@@ -1,0 +1,21 @@
+# Domains that dlopen the 2014 NVIDIA blobs and were being denied on every boot.
+#
+# Counted from /cache/boot_log.txt of the 13:10 build: 1890 "avc: denied" lines
+# per boot, of which the biggest single group is reading vendor blobs -
+# hwcomposer.tegra.so (144), gralloc.tegra.so (36), libnvglsi.so (8),
+# android.hardware.sensors@1.0-impl.so (6) - from domains that never got the
+# rule because they are AOSP domains, not NVIDIA ones.
+#
+# Reading a vendor library is not a privilege escalation: the file is world
+# readable (0644) and the access already happens today because the device runs
+# permissive. These rules only make the same access legal, so that a future
+# enforcing boot does not lose display composition or sensor enumeration.
+allow hal_graphics_composer_default vendor_file:file r_file_perms;
+allow surfaceflinger vendor_file:file r_file_perms;
+allow mediaserver vendor_file:file r_file_perms;
+allow mediaswcodec vendor_file:file r_file_perms;
+allow cameraserver vendor_file:file r_file_perms;
+allow bootanim vendor_file:file r_file_perms;
+allow idmap vendor_file:file r_file_perms;
+allow netd vendor_file:file r_file_perms;
+allow hal_health_default vendor_file:file r_file_perms;

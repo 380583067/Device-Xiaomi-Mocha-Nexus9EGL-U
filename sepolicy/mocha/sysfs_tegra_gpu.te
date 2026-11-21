@@ -1,0 +1,12 @@
+# /sys/kernel/tegra_gpu/{gpu_floor_rate,gpu_floor_state,gpu_cap_rate,...}
+# See genfs_contexts in this directory for the labels.
+type sysfs_tegra_gpu, fs_type, sysfs_type;
+
+# The power HAL owns the floor (GpuFloor.cpp). It needs write for the rate and
+# the state switch, and read to sample the current rate.
+allow hal_power_default sysfs_tegra_gpu:file rw_file_perms;
+
+# The thermal guard (mocha_thermal.sh, run from init) and platform services read
+# the clock for logging/diagnostics only.
+allow init sysfs_tegra_gpu:file r_file_perms;
+allow system_server sysfs_tegra_gpu:file r_file_perms;
