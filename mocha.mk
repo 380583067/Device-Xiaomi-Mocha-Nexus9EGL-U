@@ -327,9 +327,31 @@ PRODUCT_COPY_FILES += \
 #   HW_TEXTURE）。没有这些补丁 C2 软解会直接 start() 失败或颜色红绿互换。
 #   C2 软解实测 720p 约 29.3~29.5fps，与 OMX 持平，颜色逐帧一致。
 #   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
+# OMX first, Codec2 second, and every implementation kept registered.
+#
+# ccodec=4 means each component keeps its own rank. The ranking that follows is
+# then decided by two properties OmxInfoBuilder reads directly
+# (frameworks/av/media/libstagefright/OmxInfoBuilder.cpp:141):
+#
+#   omx_default_rank           default for hardware OMX, 0x100
+#   omx_default_rank.sw-other  default for OMX.google video, 0x210
+#
+# and by the Codec2 software rank, 0x200. Raising the hardware OMX rank to 768
+# puts the NVIDIA decoders behind Codec2, and dropping the OMX.google video rank
+# to 100 puts them in front of it:
+#
+#   OMX.google video (100) -> c2.android (512) -> OMX.Nvidia (768)
+#   OMX.google audio (16, its own property) stays first for audio.
+#
+# A warning if this is ever "fixed" through media_codecs.xml instead: the rank
+# attribute there is parsed with sscanf("%u%c"), i.e. decimal only. rank="0x300"
+# silently fails to parse and the component keeps its default rank - which is
+# exactly how the first attempt at this ended up changing nothing.
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
-    debug.stagefright.ccodec=4
+    debug.stagefright.ccodec=4 \
+    debug.stagefright.omx_default_rank=768 \
+    debug.stagefright.omx_default_rank.sw-other=100
 
 # [mocha 2026-11-21] 4 = every component keeps its normal rank, so OMX (0x100)
 # outranks Codec2 software (0x200) and OMX is tried first - which is what the
