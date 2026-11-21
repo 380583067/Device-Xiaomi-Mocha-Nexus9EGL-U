@@ -109,6 +109,25 @@ PRODUCT_PROPERTY_OVERRIDES += \
     ro.bluetooth.remote.autoconnect=true \
     bluetooth.a2dp.sink.enabled=false
 
+# Runtime hygiene: two things today's debugging tripped over.
+#
+# use_freezer=false - the cached-app freezer needs a working freezer cgroup,
+# and this kernel cannot provide one: it is 3.10.108, which predates cgroup v2
+# entirely (v2 arrived in 3.16), and /dev/freezer is not mounted either, so
+# /sys/fs/cgroup/uid_X creation fails on every process start. AMS's
+# isFreezerSupported() already fails on the missing /dev/freezer, so freezing
+# never really engages - the property makes that state explicit instead of
+# accidental. The real fix is the cgroup v2 backport from SmokeR24.1-kernel
+# stable (same 3.10.108 base, see the merge plan in .workbuddy notes); until
+# that lands, do not let AMS half-freeze apps.
+#
+# persist.logd.size - the default logd buffer is 256 KiB and gets overwritten
+# within minutes, which cost us the scene of a mediaserver lockup today. 4 MiB
+# keeps a full boot plus some debugging around.
+PRODUCT_PROPERTY_OVERRIDES += \
+    persist.device_config.activity_manager_native_boot.use_freezer=false \
+    persist.logd.size=4M
+
 # Camera
 # 修复说明：原厂 NVIDIA 相机 blob（camera.vendor.tegra.so）在运行时读取
 # /system/etc/nvcamera.conf 和 /system/etc/model_frontal.xml（绝对路径，见 blob 源码
