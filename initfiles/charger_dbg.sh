@@ -53,21 +53,22 @@ while [ $i -lt 4 ]; do
     } >> "$OUT" 2>&1
 done
 
-# Decisive test: if the charger is alive but the panel still shows the
-# bootloader logo, there are two very different explanations - the charger never
-# drew, or it drew and fb0 does not reach the panel. Writing a frame straight
-# into fb0 tells them apart: the screen either fills with noise (the fb path
-# works, so the problem is in minui/charger) or it does not (the display
-# controller is not scanning this buffer out at all).
-{
-    echo
-    echo "=== stage 3 (fb0 write test) $(date) ==="
-    echo "charger=$(getprop init.svc.charger) frame_bytes=$((1536 * 2048 * 4))"
-    dd if=/dev/urandom of=/dev/graphics/fb0 bs=4096 count=3072 2>&1
-    echo "dd rc=$?"
-} >> "$OUT" 2>&1
+# Control test, but only if the charger is already gone: if it is alive it may
+# well be drawing, and painting over it would destroy the very thing we are
+# trying to prove. A dead charger plus noise on screen means the fb path works
+# and the fault was upstream of it; a dead charger plus no noise means the DC is
+# not scanning this buffer at all.
+if [ "$(getprop init.svc.charger)" != "running" ]; then
+    {
+        echo
+        echo "=== stage 3 (fb0 write test, charger is not running) $(date) ==="
+        echo "frame_bytes=$((1536 * 2048 * 4))"
+        dd if=/dev/urandom of=/dev/graphics/fb0 bs=4096 count=3072 2>&1
+        echo "dd rc=$?"
+    } >> "$OUT" 2>&1
 
-sleep 5
+    sleep 5
+fi
 
 # Whatever is still visible now is the tail end: if the noise is gone the
 # charger is drawing over it (and the panel works), if it is still there the
