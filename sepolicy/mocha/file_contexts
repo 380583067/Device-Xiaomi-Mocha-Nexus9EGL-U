@@ -1,0 +1,4 @@
+# The AIDL power HAL. system/sepolicy/vendor/file_contexts only labels the
+# generic names (power@1.0-service, power-service.example); without this the
+# binary runs as vendor_file and init has no domain transition for it.
+/(vendor|system/vendor)/bin/hw/android\.hardware\.power-service\.mocha  u:object_r:hal_power_default_exec:s0

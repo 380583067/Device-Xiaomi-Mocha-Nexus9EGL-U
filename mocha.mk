@@ -324,7 +324,14 @@ PRODUCT_COPY_FILES += \
 #   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
-    debug.stagefright.ccodec=2
+    debug.stagefright.ccodec=1
+
+# 【2026-11-21】ccodec=1 而不是 2：C2 软解的"解码到 Surface 播放"路径还是黑的
+# （解码本身正常、帧已提交到 SurfaceView 层（SF frame 计数在走），但 GPU 合成出来
+# 全黑 —— C2AllocatorGralloc 的 lock() fallback 在 tegra gralloc0 的 blocklinear
+# buffer 上，CPU 写入没落到 GPU 可见的 backing store；OMX 的 SoftwareRenderer
+# fallback（0042 补丁）同一 gralloc 路径是好的。所以视频解码先用 OMX 软解，
+# 音频继续走 C2；等 C2→Surface 路径修好（对照 0042 的 lock/flush 语义）再切回 2。
 
 # Packages the inherited product lists ship but this board cannot use; see
 # RemovePackages/Android.mk for which one and why.

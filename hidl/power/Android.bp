@@ -19,7 +19,11 @@ cc_binary {
     defaults: ["android.hardware.power-ndk_shared"],
     relative_install_path: "hw",
     init_rc: ["android.hardware.power-service.mocha.rc"],
-    vintf_fragments: ["android.hardware.power.xml"],
+    // The IPower/default declaration lives in manifest.xml. A separate vintf
+    // fragment would declare the same instance twice; libvintf refuses the
+    // merge ("Conflicting FqInstance") and then EVERY vendor HAL fails to
+    // register at boot - the composer included, which took the whole boot
+    // down once already (gk20a_vm_put NULL deref in surfaceflinger).
     srcs: [
         "BoostPulse.cpp",
         "CameraHints.cpp",

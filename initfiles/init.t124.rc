@@ -24,6 +24,14 @@ on boot
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
 
+    # GPU floor：内核其实有 /sys/kernel/tegra_gpu/gpu_floor_rate（之前源码 grep
+    # 没搜到是因为节点名是运行时拼出来的），power HAL 的 GpuFloor 要写它。
+    # 本树强制 GPU 合成，SurfaceFlinger 会持续上报 EXPENSIVE_RENDERING，
+    # floor 生效后 GPU 抬到 252MHz 合成不再从 72MHz 爬坡；不放开权限的话
+    # HAL 每次尝试都 EACCES，一次开机刷 1500+ 行错误日志。
+    chown system system /sys/kernel/tegra_gpu/gpu_floor_rate
+    chmod 0664 /sys/kernel/tegra_gpu/gpu_floor_rate
+
     # CPU 调速器：interactive
     # （内核 defconfig 里默认调速器是 userspace，不显式设置等于频率不会动。）
     #
