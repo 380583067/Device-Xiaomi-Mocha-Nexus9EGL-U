@@ -73,7 +73,10 @@
 # 旧 modem 客户端策略使用的 Qualcomm QMUX socket 端点
 /dev/socket/qmux_[^/]+(/.*)?		u:object_r:qmuxd_socket:s0
 # /dev/tegra_dc 显示控制器节点
-#/dev/tegra_dc_.*			u:object_r:tegradc_device:s0
+# 之前注释掉，节点落在 device 类型上，composer 每次 ioctl 都被记 32 条 denied。
+# 类型 tegradc_device 与 surfaceflinger/system_server/system_app 的规则早就写好了，
+# 缺的只是这一行标签。
+/dev/tegra_dc_.*			u:object_r:tegradc_device:s0
 # rpmb 块设备
 #/dev/block/platform/sdhci-tegra\.3/mmcblk0rpmb		u:object_r:rpmb_block_device:s0
 # setup_fs emmc：TN8 分区名与 AOSP 默认名不同，必须逐个映射，

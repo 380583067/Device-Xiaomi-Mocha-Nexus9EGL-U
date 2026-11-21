@@ -11,3 +11,11 @@ genfscon sysfs /kernel/tegra_gpu/gpu_cap_rate      u:object_r:sysfs_tegra_gpu:s0
 genfscon sysfs /kernel/tegra_gpu/gpu_cap_state     u:object_r:sysfs_tegra_gpu:s0
 genfscon sysfs /kernel/tegra_gpu/gpu_rate          u:object_r:sysfs_tegra_gpu:s0
 genfscon sysfs /kernel/tegra_gpu/gpu_available_rates u:object_r:sysfs_tegra_gpu:s0
+
+# Power supply nodes. /sys/class/power_supply is labelled sysfs_batteryinfo by
+# the platform policy, but this board exposes the supplies under
+# /sys/devices/platform/... instead, so the health HAL's reads of them stayed on
+# the generic sysfs type: 36 "avc: denied" per boot, all from
+# hal_health_default, which already holds r_dir_file() on sysfs_batteryinfo.
+genfscon sysfs /devices/platform/psy_extcon.3/power_supply u:object_r:sysfs_batteryinfo:s0
+genfscon sysfs /devices/platform/tegra12-i2c.1/i2c-1/1-0055/power_supply u:object_r:sysfs_batteryinfo:s0

@@ -1,6 +1,8 @@
 # /sys/kernel/tegra_gpu/{gpu_floor_rate,gpu_floor_state,gpu_cap_rate,...}
-# See genfs_contexts in this directory for the labels.
-type sysfs_tegra_gpu, fs_type, sysfs_type;
+# The type itself is declared in sepolicy/common/file.te; the labels are set by
+# genfscon in the mocha directory (sysfs is a pseudo filesystem, so the
+# file_contexts entry that NVIDIA shipped for gpu_available_rates was commented
+# out and could not work anyway).
 
 # The power HAL owns the floor (GpuFloor.cpp). It needs write for the rate and
 # the state switch, and read to sample the current rate.

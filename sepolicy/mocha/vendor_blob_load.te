@@ -19,3 +19,8 @@ allow bootanim vendor_file:file r_file_perms;
 allow idmap vendor_file:file r_file_perms;
 allow netd vendor_file:file r_file_perms;
 allow hal_health_default vendor_file:file r_file_perms;
+allow system_server vendor_file:file r_file_perms;
+
+# RemovePackages deletes a few stock blobs at boot with `rm`, which runs in the
+# toolbox domain and gets its own 40 denials reading the very file it unlinks.
+allow toolbox vendor_file:file r_file_perms;

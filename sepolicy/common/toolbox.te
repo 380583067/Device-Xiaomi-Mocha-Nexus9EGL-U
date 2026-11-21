@@ -1,1 +1,4 @@
 allow toolbox ram_device:blk_file { read write open getattr }; 
+# The thermal guard reads zone temperatures here (mocha_thermal.sh runs through
+# init as toolbox): 31 "avc: denied" per boot on sysfs_thermal.
+r_dir_file(toolbox, sysfs_thermal)
