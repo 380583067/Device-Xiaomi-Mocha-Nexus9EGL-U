@@ -191,6 +191,12 @@ on property:sys.boot_completed=1
     # is too early, the directory does not exist yet) and is correct from the
     # next boot on.
     restorecon_recursive /data/misc/phs
+    # logd reads persist.logd.size when it starts, which is before the persist
+    # properties are loaded - so the 4M setting in build.prop never reaches it
+    # and every boot silently comes up with the 256 KiB default. Re-apply the
+    # size once boot has finished; persist.logd.size stays in build.prop for
+    # the next logd start after a manual "stop logd; start logd".
+    exec_background - root root -- /system/bin/logcat -G 4M
 
 # Note on why there is no mkdir for /data/sns_lsm6db0_pipes here: the HAL
 # removes the directory and recreates it on every start (the boot log shows
