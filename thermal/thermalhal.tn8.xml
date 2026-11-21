@@ -25,6 +25,12 @@ Attributes for cpu-usages
 		<thermal_device>
 			<thermal-prop name="GPU" type="DEVICE_TEMPERATURE_GPU" sensor-label="GPU-therm" multiplier='0.001' />
 		</thermal_device>
+		<thermal_device>
+			<thermal-prop name="BATTERY" type="DEVICE_TEMPERATURE_BATTERY" sensor-label="battery" multiplier='0.001' />
+		</thermal_device>
+		<thermal_device>
+			<thermal-prop name="SKIN" type="DEVICE_TEMPERATURE_SKIN" sensor-label="Tboard_tegra" multiplier='0.001' />
+		</thermal_device>
 	</thermal_devices>
 	<cpu_usages cpus="4" />
 </thermalhal>

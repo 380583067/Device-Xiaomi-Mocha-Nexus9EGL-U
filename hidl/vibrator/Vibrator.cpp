@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2017 The LineageOS Project
+ * Copyright (C) 2026 Artem Bambalov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,101 +15,88 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "VibratorService"
-
-#include <log/log.h>
+#define LOG_TAG "android.hardware.vibrator@1.3-service.mocha"
 
 #include "Vibrator.h"
 
-#include <cmath>
-#include <fstream>
+#include "Effects.h"
 
 namespace android {
 namespace hardware {
 namespace vibrator {
-namespace V1_0 {
+namespace V1_3 {
 namespace implementation {
 
-static constexpr int MAX_INTENSITY = 127;
-static constexpr int MIN_INTENSITY = 1;
-
-static const char *ENABLE_PATH = "/sys/class/timed_output/vibrator/enable";
-static const char *AMPLITUDE_PATH = "/sys/vibrator/pwmvalue";
-
-#define CLICK_TIMING_MS 20
-
-Vibrator::Vibrator() :
-        mEnable(ENABLE_PATH),
-        mAmplitude(AMPLITUDE_PATH) {}
-
-// Methods from ::android::hardware::vibrator::V1_0::IVibrator follow.
-Return<Status> Vibrator::on(uint32_t timeout_ms) {
-    mEnable << timeout_ms << std::endl;
-    if (!mEnable) {
-        ALOGE("Failed to turn vibrator on (%d): %s", errno, strerror(errno));
-        return Status::UNKNOWN_ERROR;
-    }
-    return Status::OK;
+Return<Status> Vibrator::on(uint32_t timeoutMs) {
+    return mMotor.run(timeoutMs) ? Status::OK : Status::UNKNOWN_ERROR;
 }
 
-Return<Status> Vibrator::off()  {
-    mEnable << 0 << std::endl;
-    if (!mEnable) {
-        ALOGE("Failed to turn vibrator off (%d): %s", errno, strerror(errno));
-        return Status::UNKNOWN_ERROR;
-    }
-    return Status::OK;
+Return<Status> Vibrator::off() {
+    return mMotor.stop() ? Status::OK : Status::UNKNOWN_ERROR;
 }
 
-Return<bool> Vibrator::supportsAmplitudeControl()  {
-    return true;
+Return<bool> Vibrator::supportsAmplitudeControl() {
+    /* Answered from what the node did rather than with a constant yes. The
+     * framework builds on this: told yes, it stops scaling durations to fake
+     * intensity and sets amplitudes instead, and a yes that is not true
+     * leaves it doing neither. */
+    return mMotor.strengthAdjustable();
 }
 
 Return<Status> Vibrator::setAmplitude(uint8_t amplitude) {
-    if (amplitude == 0) {
-        return Status::BAD_VALUE;
-    }
-    // Scale the intensity such that an amplitude of 1 is MIN_INTENSITY, an amplitude of 255 is
-    // MAX_INTENSITY, and there are equal steps for every value in between.
-    long intensity =
-            std::lround((amplitude - 1) / 254.0 * (MAX_INTENSITY - MIN_INTENSITY) + MIN_INTENSITY);
-    ALOGI("Setting amplitude to: %ld", intensity);
-    mAmplitude << intensity << std::endl;
-    if (!mAmplitude) {
-        ALOGE("Failed to set amplitude (%d): %s", errno, strerror(errno));
-        return Status::UNKNOWN_ERROR;
-    }
-    return Status::OK;
+    if (amplitude == 0) return Status::BAD_VALUE;
+
+    return mMotor.setStrength(amplitude) ? Status::OK : Status::UNKNOWN_ERROR;
 }
 
-Return<void> Vibrator::perform(Effect effect, EffectStrength strength, perform_cb _hidl_cb) {
-    if (effect == Effect::CLICK) {
-/*        uint8_t amplitude;
-        switch (strength) {
-        case EffectStrength::LIGHT:
-            amplitude = 65;
-            break;
-        case EffectStrength::MEDIUM:
-            amplitude = 131;
-            break;
-        case EffectStrength::STRONG:
-            amplitude = 255;
-            break;
-        default:
-            _hidl_cb(Status::UNSUPPORTED_OPERATION, 0);
-            return Void();
-        }*/
-        on(CLICK_TIMING_MS);
-        //setAmplitude(amplitude);
-        _hidl_cb(Status::OK, CLICK_TIMING_MS);
-    } else {
-        _hidl_cb(Status::UNSUPPORTED_OPERATION, 0);
+Return<void> Vibrator::perform(V1_0::Effect effect, EffectStrength strength,
+                               perform_cb _hidl_cb) {
+    return answerWith(static_cast<Effect>(effect), strength, _hidl_cb);
+}
+
+Return<void> Vibrator::perform_1_1(Effect_1_1 effect, EffectStrength strength,
+                                   perform_1_1_cb _hidl_cb) {
+    return answerWith(static_cast<Effect>(effect), strength, _hidl_cb);
+}
+
+Return<void> Vibrator::perform_1_2(V1_2::Effect effect, EffectStrength strength,
+                                   perform_1_2_cb _hidl_cb) {
+    return answerWith(static_cast<Effect>(effect), strength, _hidl_cb);
+}
+
+Return<void> Vibrator::perform_1_3(Effect effect, EffectStrength strength,
+                                   perform_1_3_cb _hidl_cb) {
+    return answerWith(effect, strength, _hidl_cb);
+}
+
+Return<bool> Vibrator::supportsExternalControl() {
+    return false;
+}
+
+Return<Status> Vibrator::setExternalControl(bool /* enabled */) {
+    /* Never reached while the answer above is no, and answered properly
+     * regardless: the interface names this the reply for a device that
+     * cannot hand its motor to the audio system. */
+    return Status::UNSUPPORTED_OPERATION;
+}
+
+Return<void> Vibrator::answerWith(Effect effect, EffectStrength strength,
+                                  const std::function<void(Status, uint32_t)>& reply) {
+    Effects::Shape shape = Effects::of(effect, strength, mCadence.mark());
+
+    if (shape.steps.empty()) {
+        reply(Status::UNSUPPORTED_OPERATION, 0);
+        return Void();
     }
+
+    bool played = mMotor.play(shape.steps);
+
+    reply(played ? Status::OK : Status::UNKNOWN_ERROR, played ? shape.lengthMs : 0);
     return Void();
 }
 
-} // namespace implementation
-}  // namespace V1_0
+}  // namespace implementation
+}  // namespace V1_3
 }  // namespace vibrator
 }  // namespace hardware
 }  // namespace android

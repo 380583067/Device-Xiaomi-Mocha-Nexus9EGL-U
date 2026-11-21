@@ -182,8 +182,12 @@ on boot
     chown system system /sys/devices/platform/tegra12-i2c.0/i2c-3/3-0020/input/input0/0dbutton
     chown system system /sys/devices/platform/tegra12-i2c.0/i2c-3/3-0020/input/input3/0dbutton
 
-    # vibrator intensity
+    # vibrator intensity / pattern playback (vibrator@1.3 HAL runs as system)
     chown system system /sys/vibrator/pwmvalue
+    chown system system /sys/class/timed_output/vibrator/enable
+    chmod 0660 /sys/class/timed_output/vibrator/enable
+    chown system system /sys/class/timed_output/vibrator/pattern
+    chmod 0660 /sys/class/timed_output/vibrator/pattern
 
     # CMU
     chown system system /sys/devices/platform/host1x/tegradc.0/cmu_enable
@@ -290,3 +294,11 @@ service logger /system/bin/logcat -b all -D -r 4096 -n 2 -f /cache/boot_log.txt
 on property:sys.boot_completed=1
     # Stop the logger service
     stop logger
+
+# Userspace thermal guard: clamps scaling_max_freq before the kernel starts
+# throttling at 84 C (see the header of the script). late_start so it begins
+# once the profile from power.mocha.rc has been applied at boot_completed.
+service mocha_thermal /system/bin/sh /vendor/bin/mocha_thermal.sh
+    class late_start
+    user root
+    group root system

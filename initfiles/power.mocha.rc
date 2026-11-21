@@ -1,0 +1,225 @@
+# power.mocha.rc -- performance profiles for mocha (Tegra K1).
+#
+# Ported from arttttt's Android 11 tree (github.com/arttttt/
+# android_device_xiaomi_mocha, lineage-19.1) to LineageOS 21. The values are
+# the ones measured on this board by the upstream author; see the comments
+# inline.
+#
+# Adaptations for this tree (kernel/xiaomi/mocha, 3.10-based R21.8):
+#  - /sys/kernel/tegra_gpu/gpu_floor_rate and gpu_cap_rate do not exist in
+#    this kernel, so every GPU floor/cap write is dropped. GpuFloor in the
+#    power HAL logs once and stays out of the way; the profiles control the
+#    CPU side only.
+#  - /sys/kernel/debug/vic03.0_scaling/load_target does not exist here, so
+#    the VIC watermark write is dropped.
+#  - The debugfs undervoltage knobs (vdd_core_offs / vdd_gpu_offs) do not
+#    exist here, so the sys.perf.undervoltage sections are dropped.
+#
+# Installed to /vendor/etc/init/hw/. The battery saver maps to power save
+# through vendor.power.low_power and the user's choice comes back after.
+
+# Copyright (C) 2017 arttttt
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Start with the battery saver off; the framework says otherwise once it is
+# up, if it is on. Setting it is what puts the profile in force below, so
+# this is also how the device leaves boot on the user's profile instead of
+# on whatever the kernel's governor defaults happen to be.
+on boot
+  setprop vendor.power.low_power 0
+
+# The profile in force, sys.perf.profile, has one writer: these rules. The
+# user's choice is persist.vendor.mocha.perf.profile, which the mochamanager
+# service sets for the performance tile and MiPad Manager; balanced (1)
+# until there is one. The battery saver, as the power HAL hears
+# it, holds power save (0) while it lasts and hands the choice back after. A
+# choice made in the meantime waits for it to end, since the tile is
+# unavailable then and anything else setting the property should not undo
+# the saver either.
+on property:vendor.power.low_power=1
+  setprop sys.perf.profile 0
+
+on property:vendor.power.low_power=0
+  setprop sys.perf.profile ${persist.vendor.mocha.perf.profile:-1}
+
+on property:persist.vendor.mocha.perf.profile=* && property:vendor.power.low_power=0
+  setprop sys.perf.profile ${persist.vendor.mocha.perf.profile}
+
+# power save
+on property:sys.perf.profile=0
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor "interactive"
+  # Root-owned as the kernel makes them, and the HAL is not root -- the
+  # balanced profile says what this is for.
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chmod 0220 /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 1044000
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 204000
+  # Off. The clock is raised by the pulse the power HAL sends instead --
+  # see the note in the balanced profile. Values kept so that turning this
+  # back on is one character.
+  write /sys/module/input_cfboost/parameters/boost_enabled 0
+  write /sys/module/input_cfboost/parameters/boost_freq 696000
+  write /sys/module/input_cfboost/parameters/boost_time 75
+  write /sys/module/input_cfboost/parameters/boost_emc 0
+  write /sys/module/input_cfboost/parameters/boost_gpu 252000
+  # No core management, in any profile. Cores used to be parked here --
+  # two for power save, three for the bias -- until the board's own
+  # ammeter was asked: four idle cores in WFI against two offlined
+  # measured one milliampere apart on a 430 mA idle, which is noise.
+  # An offline core saves nothing that this silicon's WFI does not
+  # already save -- the cluster-depth states that made parking worth it
+  # elsewhere are not compiled on this config -- and a parked core
+  # under load is jank with no counterweight.
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_rate 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_slack 80000
+  write /sys/devices/system/cpu/cpufreq/interactive/min_sample_time 40000
+  write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay "0 696000:20000"
+  write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 99
+  write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 696000
+  write /sys/devices/system/cpu/cpufreq/interactive/target_loads "80 204000:85 564000:90"
+  write /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration 250000
+
+# bias power save
+on property:sys.perf.profile=3
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor "interactive"
+  # Root-owned as the kernel makes them, and the HAL is not root -- the
+  # balanced profile says what this is for.
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chmod 0220 /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 1530000
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 204000
+  write /sys/module/input_cfboost/parameters/boost_enabled 0
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_rate 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_slack 80000
+  write /sys/devices/system/cpu/cpufreq/interactive/min_sample_time 60000
+  write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay "0 828000:20000"
+  write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 99
+  write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 828000
+  write /sys/devices/system/cpu/cpufreq/interactive/target_loads "75 204000:80 564000:88"
+  write /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration 400000
+
+# balanced
+on property:sys.perf.profile=1
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor "interactive"
+  # This governor's control nodes belong to root, and the power HAL does not.
+  # boostpulse is created 0200 root:root and io_is_busy 0644 root:root, while
+  # android.hardware.power-service.mocha runs as system, so every open of
+  # them returned EACCES -- and the HAL says so exactly once:
+  #
+  #   no .../interactive/boostpulse; touch and launch hints will not raise
+  #   the clock
+  #
+  # after which the failure is silent. The pulse this whole profile is built
+  # around had therefore never fired at all. A trace of an application opening
+  # shows the governor climbing 312 -> 1734 MHz in eight sampling ticks with
+  # nobody pushing it, which is what that looks like from the outside.
+  #
+  # Granted here rather than in ueventd because this directory does not exist
+  # until a governor is chosen -- the kernel default is userspace -- so a rule
+  # there would race the node into being. Repeated in every profile because
+  # leaving interactive and coming back destroys the group and recreates it,
+  # taking the ownership with it.
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chmod 0220 /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 1836000
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 204000
+  # One boost mechanism, not two.
+  #
+  # input_cfboost is a kernel module that watches raw input events and puts a
+  # PM QoS floor under the governor. It is switched off in every profile, in
+  # favour of the pulse the power HAL sends to this governor's own boostpulse
+  # node, for three reasons:
+  #
+  #   It knows why. The framework sends INTERACTION and LAUNCH, so a touch and
+  #   an application starting are told apart -- and a launch may involve no
+  #   touch at all, which the kernel module can never see.
+  #
+  #   Its unique contribution is currently empty. The only thing it does that
+  #   boostpulse cannot is raise memory and graphics; boost_emc is 0 in every
+  #   profile that had it on, so memory was never raised, and the GPU was
+  #   measured not to be the constraint -- three times its clock changed the
+  #   frame not at all.
+  #
+  #   Two sources of frequency decisions are twice the work to reason about
+  #   when the clock behaves oddly: whose floor was that.
+  #
+  # Turning it back on is one character per profile; the values are kept.
+  write /sys/module/input_cfboost/parameters/boost_enabled 0
+  # The only set below that has been measured; the other three profiles are
+  # this shape scaled to their own ceilings and are not.
+  #
+  # Everything the frame needs is raised by the boost the power HAL pulses on
+  # touch and on launch, not by the load path -- which is why go_hispeed_load
+  # is left where it cannot be reached, exactly as the two Tegra devices that
+  # shipped with this governor do.
+  #
+  # Measured on the same hand test: presents arriving one refresh apart went
+  # from 52 % to 94 %, SystemUI's frame from 36.4 ms to 14.97 against a budget
+  # of 16.66, and its frames longer than two refreshes from 48 % to none.
+  #
+  # The hold is 500 ms rather than the 1000 the Tegra devices use. A hundred
+  # was measured and is too short -- the clock drops between frames of one
+  # animation and the next frame starts late. Between 500 and 1000 a single
+  # hand test cannot tell the difference, so the cheaper one is taken.
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_rate 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_slack 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/min_sample_time 80000
+  # The climb below hispeed is instant; the brake above it stays. The
+  # pulse covers a touch's first half second, a drawer animation outlives
+  # it, and the governor then climbed one sampling tick at a time: frames
+  # beyond two refreshes were 25 % of the burst scene and dropped to 9
+  # when the lower steps stopped waiting. The same scene on the board's
+  # ammeter: no cost -- work finished sooner is work powered shorter.
+  write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay "0 1122000:20000"
+  write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 99
+  write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 1122000
+  write /sys/devices/system/cpu/cpufreq/interactive/target_loads "65 204000:75 564000:85"
+  write /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration 500000
+
+# high performance
+on property:sys.perf.profile=2
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor "interactive"
+  # Root-owned as the kernel makes them, and the HAL is not root -- the
+  # balanced profile says what this is for.
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chmod 0220 /sys/devices/system/cpu/cpufreq/interactive/boostpulse
+  chown system system /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2218000
+  # The floor stays at the bottom even here. A flat profile pinned to
+  # 1836 was measured: ninety-nine milliamperes of idle, all day, for a
+  # jank change the burst scene could not tell from noise -- the instant
+  # climb below hispeed already covers the ramp.
+  write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 204000
+  # Off, as in every profile now -- see the balanced one for why.
+  write /sys/module/input_cfboost/parameters/boost_enabled 0
+  write /sys/module/input_cfboost/parameters/boost_freq 1044000
+  write /sys/module/input_cfboost/parameters/boost_time 100
+  write /sys/module/input_cfboost/parameters/boost_emc 0
+  write /sys/module/input_cfboost/parameters/boost_gpu 252000
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_rate 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/timer_slack 20000
+  write /sys/devices/system/cpu/cpufreq/interactive/min_sample_time 80000
+  write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay "0 1428000:20000"
+  write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 99
+  write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 1428000
+  write /sys/devices/system/cpu/cpufreq/interactive/target_loads "60 204000:70 564000:80"
+  write /sys/devices/system/cpu/cpufreq/interactive/boostpulse_duration 1000000
+  write /sys/devices/system/cpu/cpufreq/interactive/io_busy_threshold 100
+  write /sys/devices/system/cpu/cpufreq/interactive/io_is_busy 1

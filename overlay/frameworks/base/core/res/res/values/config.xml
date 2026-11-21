@@ -273,4 +273,13 @@
   <!-- Disable rounded corners on windows to improve graphics performance -->
     <bool name="config_supportsRoundedCornersOnWindows">false</bool>
 
+    <!-- [2026-11-21] lmkd's minfree table is derived from RAM size and panel
+         resolution (ProcessList.updateOomLevels). 2GB and 2048x1536 clamp the
+         scale to 1.0, which selects the "high" table 72MB..180MB - so every
+         cached app was killed as soon as free memory dropped below 180MB even
+         though the device has a 1GB zram swap sitting unused. Capping the table
+         at 128MB lets zram absorb anonymous pages first and keeps recents
+         alive. Absolute value is in KB and rescales the whole table. -->
+    <integer name="config_lowMemoryKillerMinFreeKbytesAbsolute">131072</integer>
+
 </resources>

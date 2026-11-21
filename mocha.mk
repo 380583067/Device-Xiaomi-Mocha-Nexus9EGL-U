@@ -309,29 +309,27 @@ PRODUCT_COPY_FILES += \
 # Enable nvidia framework enhancements if available
 -include vendor/lineage/product/nvidia.mk
 
-# Software decoding defaults to Codec2 (c2.android.*); OMX stays as fallback.
-#   Values of debug.stagefright.ccodec (see Codec2InfoBuilder.cpp in
-#   frameworks/av/media/codec2/sfplugin/): 0 = Codec2 disabled entirely;
-#   1 = only c2.android.* audio preferred; 2 = every c2.android.* available and
-#   ranked first, other .avc.decoder/.avc.encoder components available but last;
-#   3 = c2.android.* first, the rest at their normal rank; 4 = everything at its
-#   normal rank.
-#   Without this property the tree defaults to 4, and OMX's default rank 0x100
-#   is above c2.android.*'s 0x200, so OMX.google.*.avc.decoder is picked. Hence
-#   2: software decode uses Codec2 by default while OMX remains as the last
-#   resort (if some stream does not decode with Codec2, OMX can still be
-#   selected).
-#   Prerequisite: the C2AllocatorGralloc legacy-gralloc patch in frameworks/av
-#   (fall back to lock() when lockYCbCr is missing, planar Y/V/U for YV12, and
-#   HW_TEXTURE only for CPU_WRITE + YUV allocations). Without it Codec2 decode
-#   either fails start() outright or shows swapped colours.
-#   Measured: C2 software decode at 720p runs 29.3-29.5fps, on par with OMX and
-#   colour-identical frame by frame.
-#   c2-poolmask is the usage mask for the software Codec2 output buffer pool and
-#   keeps its original value.
+# 软解：默认走 Codec2（c2.android.*），OMX 仅作后备
+#   debug.stagefright.ccodec 取值（见 frameworks/av/media/codec2/sfplugin/
+#   Codec2InfoBuilder.cpp）：0=完全禁用 C2；1=只优先 c2.android.* 音频；
+#   2=c2.android.* 全部可用并排在最前，其它 .avc.decoder/.avc.encoder 可用
+#   但排最后；3=c2.android.* 排最前，其它按默认；4=全部按默认。
+#   本树不设该属性时默认是 4，而 OMX 默认 rank 0x100 高于 c2.android.* 的
+#   0x200，实际会选中 OMX.google.*.avc.decoder。这里取 2：软解默认用 C2，
+#   同时保留 OMX 作为末尾后备（万一某个流 C2 软解不吃，OMX 仍能被选中）。
+#   前置条件：frameworks/av 的 C2AllocatorGralloc 老 gralloc 适配补丁（
+#   lockYCbCr 缺失时回退 lock()、YV12 走 Y/V/U 平面、CPU_WRITE+YUV 补
+#   HW_TEXTURE）。没有这些补丁 C2 软解会直接 start() 失败或颜色红绿互换。
+#   C2 软解实测 720p 约 29.3~29.5fps，与 OMX 持平，颜色逐帧一致。
+#   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
     debug.stagefright.ccodec=2
+
+# Packages the inherited product lists ship but this board cannot use; see
+# RemovePackages/Android.mk for which one and why.
+PRODUCT_PACKAGES += \
+    RemovePackages
 
 # Overlay
 DEVICE_PACKAGE_OVERLAYS += \
@@ -397,9 +395,14 @@ PRODUCT_PACKAGES += \
     nvphsd.conf
 
 # Power
+# 换成 AIDL power HAL（arttttt 那棵 19.1 树的实现，Power/Profiles/BoostPulse/
+# GpuFloor/CameraHints），顶掉"通用 HIDL 包装 + NVIDIA blob（power.tegra.so）"的
+# 组合。blob 没法审计，而且它的 sysfs 写入在被修好 DAC 权限之前一直是静默失败的；
+# 新 HAL 同样负责调频，还带性能档位（power.mocha.rc）、GPU floor 和相机提示。
+# power.stats@1.0-service.mock 暂时保留，还没有替代实现。
+# blob 本体已从 proprietary-files.txt / vendor 仓库删除（那个包装服务是唯一使用者）。
 PRODUCT_PACKAGES += \
-    android.hardware.power@1.0-impl \
-    android.hardware.power@1.0-service \
+    android.hardware.power-service.mocha \
     android.hardware.power.stats@1.0-service.mock
 
 # Ramdisk
@@ -415,7 +418,7 @@ PRODUCT_PACKAGES += \
     init.tn8.usb.rc \
     init.tn8_common.rc \
     init.ussrd.rc \
-    power.tn8.rc \
+    power.mocha.rc \
     ueventd.tn8.rc
 
 # Permissions
@@ -434,6 +437,14 @@ PRODUCT_COPY_FILES += \
 # 两个标志都写上，避免卡在设置向导里。
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/mocha_provision.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_provision.sh
+
+# Performance profiles (power.mocha.rc) and the userspace thermal guard.
+# The guard owns scaling_max_freq: profile ceiling from persist.mocha.perf_profile,
+# clamped further when CPU-therm crosses persist.mocha.thermal.threshold. The
+# kernel itself only throttles at 84 C, which is too late for a fanless tablet.
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/initfiles/power.mocha.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/power.mocha.rc \
+    $(LOCAL_PATH)/initfiles/mocha_thermal.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_thermal.sh
 
 # Sensors
 PRODUCT_PACKAGES += \
@@ -465,11 +476,12 @@ PRODUCT_PACKAGES += \
 PRODUCT_PROPERTY_OVERRIDES += \
     ro.adb.nonblocking_ffs=false
 
-# Vibrator
+# Vibrator: board HAL (HIDL 1.3, DRV2604 over /sys/class/timed_output/vibrator
+# and /sys/vibrator/pwmvalue). Replaces the generic 1.0 impl, which only knows
+# on/off and cannot play patterns or set strength.
 PRODUCT_PACKAGES += \
-	android.hardware.vibrator@1.0-impl \
-    android.hardware.vibrator@1.0-service \
-    android.hardware.vibrator@1.3
+    android.hardware.vibrator@1.3 \
+    android.hardware.vibrator@1.3-service.mocha
 
 # Vendor seccomp policy files for media components:
 PRODUCT_COPY_FILES += \

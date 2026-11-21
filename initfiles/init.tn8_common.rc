@@ -37,12 +37,10 @@ on fs
     setprop ro.crypto.umount_sd false
     setprop ro.crypto.fuse_sdcard true
     setprop audio.custompolicy 1
-    # [2026-11-17] This used to create /dev/cpuset/camera-daemon and write its
-    # cpus/mems. The kernel only enables CONFIG_CGROUPS, not CONFIG_CPUSETS
-    # (enabling it hangs the boot on the MI logo), so /dev/cpuset never exists
-    # and those mkdir/write calls failed on every boot and filled the log.
-    # The framework creates the camera-daemon cpuset itself when cpuset is
-    # available, so the block was dropped.
+    # 【2026-11-17 修正】原来这里创建 /dev/cpuset/camera-daemon 并写 cpus/mems。
+    # 本机内核只开了 CONFIG_CGROUPS、没开 CONFIG_CPUSETS（开了会开机死锁到 MI logo），
+    # /dev/cpuset 根本不存在，这些 mkdir/write 每次开机必然失败刷错误日志。
+    # camera-daemon 的 cpuset 由 frameworks 侧在 cpuset 可用时才创建，这里直接删掉。
 
 on boot
     #max resolution supported for Miracast is 1080p, represented interms of macroblocks
@@ -76,20 +74,17 @@ on init
     setprop keyguard.no_require_sim true
     setprop persist.tegra.didim.enable 0
 
-    # [2026-11-21] page-cluster used to be 0 (one page read per swap-in), an
-    # IO-saving setting from the era when swap lived on eMMC. This device mounts
-    # a 1GB /dev/block/zram0 swap in fstab, so pages go in and out of RAM and a
-    # one-page granularity only adds loop iterations and lock overhead; under
-    # memory pressure (Android 14 on 2GB) that shows up as "slower the longer it
-    # runs". Back to the kernel default of 3 (8 pages = 32KB).
+    # 【2026-11-21 修正】page-cluster 原来是 0（每次换入只读 1 页），这是给
+    # "swap 在 eMMC 上" 那个年代留的省 IO 设置。本机 fstab 里挂的是 1GB
+    # /dev/block/zram0，换入换出都在内存里，1 页粒度只增加循环次数和锁开销；
+    # 内存压力大（A14 + 2GB）时表现就是"越用越卡"。改回内核默认 3（8 页=32KB）。
     write /proc/sys/vm/page-cluster 3
 
-    # This file used to contain:
+    # 原来这里还有一行：
     #     write /d/tegra_actmon/cpu_emc/avg_act_threshold 50000
-    # kernel/xiaomi/mocha has no tegra_actmon debugfs node and /d does not even
-    # exist (init.tegra.rc only mounts debugfs at /sys/kernel/debug), so that
-    # write failed on every boot. Removed to keep the log clean and to avoid the
-    # impression that EMC sampling was being configured.
+    # 本内核（kernel/xiaomi/mocha）里没有 tegra_actmon 的 debugfs 节点，连 /d
+    # 这个符号链接都不存在（init.tegra.rc 只把 debugfs 挂到 /sys/kernel/debug），
+    # 这行每次开机都是 write 失败。删掉，避免日志噪声和误以为在配 EMC 采样。
 
 service charger /system/bin/charger
     class charger
@@ -108,21 +103,19 @@ service charger_led /system/bin/sh /system/bin/charger_led.sh
 on charger
     start charger_led
 
-    # [2026-11-18] Off-mode charging gets stuck on the MI logo and the evidence
-    # has to survive. Charger mode only runs the early-init / init / charger
-    # triggers, never `on fs`, so /cache is normally NOT mounted - that is why
-    # no charger log could ever be found (the logger service in init.tegra.rc is
-    # class main and does not start in charger mode either). Mount the CAC
-    # partition on /cache by hand and dump the kernel log (charger prints via
-    # klog) plus the fb device state after 12 seconds, so the next system boot
-    # or TWRP can read /cache/charger_dbg.txt directly.
+    # 【2026-11-18 诊断】关机充电卡在 MI logo，需要留下证据。
+    #
+    # charger 模式只跑 `early-init`/`init`/`charger` 三个触发器，`on fs` 不会执行，
+    # 所以 /cache 平时是**没有挂载**的 —— 这就是之前一直查不到 charger 日志的原因
+    # （init 里的 logger 服务是 class main，charger 模式也不会启动）。
+    # 这里手动把 CAC 分区挂到 /cache，并在 12 秒后把内核日志（charger 用 klog 输出）
+    # 和 fb 设备状态落盘，下次进系统或 TWRP 都能直接读 /cache/charger_dbg.txt。
     mkdir /cache 0770 system cache
     mount ext4 /dev/block/platform/sdhci-tegra.3/by-name/CAC /cache noatime nosuid nodev
     exec - root root -- /system/bin/sh -c "/system/bin/sleep 12; { echo '=== bootmode ==='; getprop ro.bootmode; echo '=== fb ==='; ls -la /dev/graphics/ 2>&1; echo '=== minui props ==='; getprop | grep -i minui; echo '=== klog ==='; dmesg; } > /cache/charger_dbg.txt 2>&1"
 
-    # Diagnostics: let charger mode enumerate USB as well, so the host can see
-    # the device when the cable is plugged in (best effort). This still depends
-    # on adbd; switching the USB config just makes it observable.
+    # 诊断用：让 charger 模式下也能枚举 USB，插线后 host 能看到设备（best effort）。
+    # 真正生效还依赖 adbd 服务，这里只是把 usb 配置切出来便于观察。
     setprop sys.usb.config adb
 
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave

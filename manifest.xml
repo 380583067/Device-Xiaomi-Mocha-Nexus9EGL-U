@@ -133,14 +133,13 @@
             <instance>default</instance>
         </interface>
     </hal>
-    <hal format="hidl">
+    <!-- The AIDL power HAL (android.hardware.power-service.mocha). Replaces the
+         HIDL wrapper around the stock NVIDIA blob, which could not be audited
+         and needed DAC permissions patched around it (see init.t124.rc). -->
+    <hal format="aidl">
         <name>android.hardware.power</name>
-        <transport>hwbinder</transport>
-        <version>1.0</version>
-        <interface>
-            <name>IPower</name>
-            <instance>default</instance>
-        </interface>
+        <version>5</version>
+        <fqname>IPower/default</fqname>
     </hal>
     <hal format="hidl">
         <name>android.hardware.renderscript</name>
@@ -181,7 +180,7 @@
     <hal format="hidl">
         <name>android.hardware.vibrator</name>
         <transport>hwbinder</transport>
-        <version>1.0</version>
+        <version>1.3</version>
         <interface>
             <name>IVibrator</name>
             <instance>default</instance>

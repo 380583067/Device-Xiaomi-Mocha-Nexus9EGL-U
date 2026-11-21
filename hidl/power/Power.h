@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2018 The LineageOS Project
+ * Copyright (C) 2026 Artem Bambalov
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,42 +14,68 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef MOCHA_POWER_POWER_H
+#define MOCHA_POWER_POWER_H
 
-#ifndef ANDROID_HARDWARE_POWER_V1_0_POWER_H
-#define ANDROID_HARDWARE_POWER_V1_0_POWER_H
+#include <aidl/android/hardware/power/BnPower.h>
 
-#include <android/hardware/power/1.0/IPower.h>
-#include <hidl/MQDescriptor.h>
-#include <hidl/Status.h>
-#include <hardware/power.h>
+#include <mutex>
 
-namespace android {
-namespace hardware {
-namespace power {
-namespace V1_0 {
-namespace implementation {
+#include "BoostPulse.h"
+#include "CameraHints.h"
+#include "GpuFloor.h"
+#include "Profiles.h"
+#include "ProviderWatch.h"
 
-using ::android::hardware::power::V1_0::Feature;
-using ::android::hardware::power::V1_0::PowerHint;
-using ::android::hardware::power::V1_0::IPower;
-using ::android::hardware::Return;
-using ::android::hardware::Void;
+namespace aidl::android::hardware::power::impl::mocha {
 
-struct Power : public IPower{
-    // Methods from ::android::hardware::power::V1_0::IPower follow.
+class Power : public BnPower {
+  public:
     Power();
-    status_t registerAsSystemService();
 
-    Return<void> setInteractive(bool interactive) override;
-    Return<void> powerHint(PowerHint hint, int32_t data) override;
-    Return<void> setFeature(Feature feature, bool activate) override;
-    Return<void> getPlatformLowPowerStats(getPlatformLowPowerStats_cb _hidl_cb) override;
+    ndk::ScopedAStatus setMode(Mode type, bool enabled) override;
+    ndk::ScopedAStatus isModeSupported(Mode type, bool* _aidl_return) override;
+    ndk::ScopedAStatus setBoost(Boost type, int32_t durationMs) override;
+    ndk::ScopedAStatus isBoostSupported(Boost type, bool* _aidl_return) override;
+    ndk::ScopedAStatus createHintSession(int32_t tgid, int32_t uid,
+                                         const std::vector<int32_t>& threadIds,
+                                         int64_t durationNanos,
+                                         std::shared_ptr<IPowerHintSession>* _aidl_return) override;
+    ndk::ScopedAStatus getHintSessionPreferredRate(int64_t* outNanoseconds) override;
+    ndk::ScopedAStatus createHintSessionWithConfig(
+            int32_t tgid, int32_t uid, const std::vector<int32_t>& threadIds, int64_t durationNanos,
+            SessionTag tag, SessionConfig* config,
+            std::shared_ptr<IPowerHintSession>* _aidl_return) override;
+    ndk::ScopedAStatus getSessionChannel(int32_t tgid, int32_t uid,
+                                         ChannelConfig* _aidl_return) override;
+    ndk::ScopedAStatus closeSessionChannel(int32_t tgid, int32_t uid) override;
+
+  private:
+    /* What a hint means on this board. */
+    void setInteractive(bool interactive);
+    void handleExpensiveRendering(bool expensive);
+    void handleLowPower(bool on);
+    void hurry();
+    void streamCamera(CameraHints::Level level, bool on);
+
+    /* Whether the user has asked this device to spend less: the battery
+     * saver, or the power save profile chosen outright. */
+    bool sparingLocked() const;
+
+    BoostPulse mBoost;
+    GpuFloor mGpuFloor;
+    Profiles mProfiles;
+    CameraHints mCamera;
+    ProviderWatch mProvider{[this] { mCamera.reset(); }};
+
+    /* Holds a whole decision together. The pieces each look after their own
+     * state, but a decision made of two of them -- the battery saver coming
+     * on and the floors going down with it -- has to be one thing or the
+     * other, not half of each when two hints cross. */
+    std::mutex mPolicyLock;
+    bool mLowPower = false;
 };
 
-}  // namespace implementation
-}  // namespace V1_0
-}  // namespace power
-}  // namespace hardware
-}  // namespace android
+}  // namespace aidl::android::hardware::power::impl::mocha
 
-#endif  // ANDROID_HARDWARE_POWER_V1_0_POWER_H
+#endif  // MOCHA_POWER_POWER_H
