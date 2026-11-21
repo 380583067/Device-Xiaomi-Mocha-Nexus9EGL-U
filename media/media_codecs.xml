@@ -169,6 +169,23 @@ Only the three quirks included above are recognized at this point:
             <Limit name="bitrate" range="1-50000000" />
         </MediaCodec>
     </Encoders>
+
+    <!-- Diagnostic: the Codec2 software audio decoders have been observed to
+         accept a track and then never deliver a single output buffer (decoder
+         created, 0 CPU time in media.swcodec, NuPlayer stuck waiting for the
+         first decoded frame, AudioTrack never opened - silence). Pushing them
+         behind the OMX.google software decoders routes audio through the legacy
+         OMX audio path instead; if sound comes back, the fault is in the C2
+         audio components. decimal rank on purpose: OmxInfoBuilder parses the
+         attribute with sscanf("%u"), so hex silently fails. -->
+    <Decoders>
+        <MediaCodec name="c2.android.mp3.decoder" update="true" rank="768" />
+        <MediaCodec name="c2.android.vorbis.decoder" update="true" rank="768" />
+        <MediaCodec name="c2.android.aac.decoder" update="true" rank="768" />
+        <MediaCodec name="c2.android.flac.decoder" update="true" rank="768" />
+        <MediaCodec name="c2.android.opus.decoder" update="true" rank="768" />
+    </Decoders>
+
     <Include href="media_codecs_google_audio.xml" />
     <Include href="media_codecs_google_video.xml" />
 </MediaCodecs>
