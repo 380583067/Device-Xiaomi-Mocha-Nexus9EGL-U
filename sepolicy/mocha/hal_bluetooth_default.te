@@ -1,0 +1,3 @@
+# Bluetooth is a UART device here (/dev/ttyTHS2, shared with FM - see uim.te),
+# and the HAL needs the full set: open, read, write and configure the line.
+allow hal_bluetooth_default tty_device:chr_file rw_file_perms;

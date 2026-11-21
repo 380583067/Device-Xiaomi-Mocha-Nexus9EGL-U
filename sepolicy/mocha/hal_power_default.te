@@ -6,3 +6,4 @@ allow hal_power_default sysfs_devices_system_cpu:file rw_file_perms;
 # Reading the profile properties; the battery-saver switch is written by the
 # HAL itself (see power.mocha.rc for the consumer side).
 get_prop(hal_power_default, vendor_default_prop)
+get_prop(hal_power_default, system_prop)

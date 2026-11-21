@@ -27,3 +27,4 @@ allow cameraserver same_process_hal_file:file { execute getattr open read };
 # allow cameraserver to read files/dirs in /data/camera_config/
 r_dir_file(cameraserver, camera_config_file)
 
+get_prop(cameraserver, vendor_default_prop)

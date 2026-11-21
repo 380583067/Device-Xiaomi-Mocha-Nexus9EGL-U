@@ -1,0 +1,8 @@
+# NVIDIA's sensors HAL is a passthrough one, so it creates its IPC pipes inside
+# system_server: /data/sns_lsm6db0_pipes with one FIFO per sensor. That showed
+# up as 14 denials on system_data_root_file:dir (create/add_name) plus 10 on
+# fifo_file, which is both noisy and, under enforcing, would break the IMU.
+type mocha_sns_pipes, file_type, data_file_type;
+
+allow system_server mocha_sns_pipes:dir rw_dir_perms;
+allow system_server mocha_sns_pipes:{ file fifo_file } rw_file_perms;

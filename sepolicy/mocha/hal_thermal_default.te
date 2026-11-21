@@ -1,0 +1,11 @@
+# The thermal HAL on this board is NVIDIA's, and it reads the zone list from
+# /sys/class/thermal (sysfs_thermal) and its config from
+# /system/etc/thermalhal.tn8.xml. Both were denied 18 times per boot, which
+# under enforcing would leave the HAL with an empty zone list.
+r_dir_file(hal_thermal_default, sysfs_thermal)
+allow hal_thermal_default sysfs_thermal:file rw_file_perms;
+allow hal_thermal_default system_file:file r_file_perms;
+
+# The thermal zones are symlinked under /sys/class/thermal, and init resolves
+# those links while running the thermal guard.
+allow init sysfs_thermal:lnk_file r_file_perms;

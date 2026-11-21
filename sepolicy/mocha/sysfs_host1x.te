@@ -1,0 +1,20 @@
+# /sys/devices/platform/host1x: the host1x capabilities (num_pts), the display
+# controller nodes (tegradc.0/enable) and the GPU power hints
+# (gk20a.0/ptimer_scale_factor) that the graphics stack touches at startup.
+# Same story as sysfs_tegra_info: the nodes were on the generic sysfs type and
+# accounted for 20+ denials per boot, all of them reads.
+type sysfs_host1x, fs_type, sysfs_type;
+
+r_dir_file(system_server, sysfs_host1x)
+r_dir_file(mediaswcodec, sysfs_host1x)
+r_dir_file(mediacodec, sysfs_host1x)
+r_dir_file(surfaceflinger, sysfs_host1x)
+r_dir_file(system_app, sysfs_host1x)
+r_dir_file(platform_app, sysfs_host1x)
+r_dir_file(bootanim, sysfs_host1x)
+r_dir_file(hal_graphics_allocator_default, sysfs_host1x)
+r_dir_file(init, sysfs_host1x)
+
+# The composer both reads and drives the display controller.
+allow hal_graphics_composer_default sysfs_host1x:dir r_dir_perms;
+allow hal_graphics_composer_default sysfs_host1x:file rw_file_perms;

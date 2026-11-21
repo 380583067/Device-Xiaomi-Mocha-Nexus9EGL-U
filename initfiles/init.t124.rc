@@ -179,3 +179,11 @@ service init-btloader-sh /system/bin/init.btloader.sh
     group root system
     disabled
     oneshot
+
+# The sensors HAL is a passthrough one, so system_server creates its IPC pipe
+# directory /data/sns_lsm6db0_pipes after the one-time restorecon pass init
+# does over /data. Without this the directory keeps the generic
+# system_data_root_file label forever and the pipes are relabelled only on a
+# fresh install. Idempotent and cheap; harmless if the HAL did not run.
+on property:sys.boot_completed=1
+    restorecon_recursive /data/sns_lsm6db0_pipes

@@ -1,0 +1,20 @@
+# Chip identification nodes that the graphics stack reads on startup:
+# /sys/module/tegra_fuse/parameters/tegra_chip_id and /sys/devices/soc0/{family}.
+# The type already existed in sepolicy/common/file.te, but the label was never
+# hooked up (NVIDIA shipped it as a commented-out file_contexts line, which
+# could not have worked for sysfs anyway), so every read landed on the generic
+# sysfs type - 12 denials per boot from bootanim alone.
+#
+# r_dir_file() rather than a bare file rule: labelling the directory as well is
+# what makes the read possible, and without the dir half the denial simply
+# moves from "sysfs file" to "sysfs_tegra_info dir".
+r_dir_file(bootanim, sysfs_tegra_info)
+r_dir_file(system_server, sysfs_tegra_info)
+r_dir_file(system_app, sysfs_tegra_info)
+r_dir_file(platform_app, sysfs_tegra_info)
+r_dir_file(mediaswcodec, sysfs_tegra_info)
+r_dir_file(mediacodec, sysfs_tegra_info)
+r_dir_file(surfaceflinger, sysfs_tegra_info)
+r_dir_file(hal_graphics_composer_default, sysfs_tegra_info)
+r_dir_file(hal_graphics_allocator_default, sysfs_tegra_info)
+r_dir_file(hal_power_default, sysfs_tegra_info)

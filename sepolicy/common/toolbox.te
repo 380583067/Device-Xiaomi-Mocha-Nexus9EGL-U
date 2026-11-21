@@ -6,3 +6,12 @@ r_dir_file(toolbox, sysfs_thermal)
 # getprop from the thermal guard and the diagnostic scripts reads vendor
 # properties (18 denials per boot reading vendor_default_prop).
 get_prop(toolbox, vendor_default_prop)
+
+# The boot and thermal scripts also setprop (property_socket write) and
+# chown/chmod the thermal zone nodes they read.
+allow toolbox property_socket:sock_file write;
+allow toolbox sysfs_thermal:file setattr;
+get_prop(toolbox, serialno_prop)
+
+# The MAC address script writes /data/misc/bluetooth/mocha_btmacaddr.txt.
+allow toolbox bluetooth_data_file:file rw_file_perms;

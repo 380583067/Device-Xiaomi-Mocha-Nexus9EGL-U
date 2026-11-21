@@ -28,3 +28,14 @@ allow toolbox vendor_file:file r_file_perms;
 # init and apexd also read the vendor tree during boot (14 and 6 denials).
 allow init vendor_file:file r_file_perms;
 allow apexd vendor_file:file r_file_perms;
+
+# The same hwcomposer blob is read by these startup helpers while they build
+# their views of /vendor (8 denials each). linkerconfig also does, but its
+# domain lives in system/sepolicy/private and vendor policy cannot name it.
+allow vdc vendor_file:file r_file_perms;
+allow zygote vendor_file:file r_file_perms;
+allow bootstat vendor_file:file r_file_perms;
+allow prng_seeder vendor_file:file r_file_perms;
+
+# init reads the seapp_contexts it is about to load.
+allow init seapp_contexts_file:file r_file_perms;
