@@ -79,3 +79,31 @@ allow ussrd self:capability sys_nice;
 # netlink access
 allow ussrd self:capability net_admin;
 allow ussrd self:netlink_socket { create_socket_perms_no_ioctl listen accept };
+
+# [mocha 2026-11-21] Everything below only started to matter once /vendor/bin/
+# ussrd got a real exec type: before that the binary stayed vendor_file, the
+# domain transition never fired and these accesses were attributed to init,
+# whose rules allowed them. With ussrd running in its own domain its own rules
+# have to cover what it does.
+#
+# Its runtime directory: /data/misc/phs (the FIFO/pid files it shares with
+# phsd). Labelled in mocha/file_contexts.
+type mocha_phs_data_file, file_type, data_file_type;
+allow ussrd mocha_phs_data_file:dir rw_dir_perms;
+allow ussrd mocha_phs_data_file:file rw_file_perms;
+
+# Configuration and the display controller node it pokes to keep the panel
+# awake.
+allow ussrd system_file:file r_file_perms;
+allow ussrd sysfs_host1x:file rw_file_perms;
+
+get_prop(ussrd, system_prop)
+
+# ussrd polls init.svc.* style properties through default_prop while it waits
+# for phsd; 6 denials per boot. default_prop is a public type
+# (system_internal_prop in public/property.te), so this one can be fixed here.
+# The other one it reads, init_service_status_private_prop (init.svc.*), cannot
+# be fixed from here and cannot be fixed from system/sepolicy either: the type
+# is private to plat policy, while `ussrd` is a vendor domain that plat policy
+# is not allowed to name. It stays as the last 6 denials per boot.
+get_prop(ussrd, default_prop)

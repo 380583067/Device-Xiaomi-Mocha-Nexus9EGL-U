@@ -103,19 +103,34 @@ service charger_led /system/bin/sh /system/bin/charger_led.sh
 on charger
     start charger_led
 
-    # 【2026-11-18 诊断】关机充电卡在 MI logo，需要留下证据。
+    # Charger mode runs only early-init/init/charger, and `on charger` starts
+    # nothing but class charger. servicemanager, hwservicemanager and
+    # vndservicemanager all belong to class core, so none of them came up - and
+    # the health HAL is a HIDL service (android.hardware.health@2.1) that
+    # registers with hwservicemanager and is found through servicemanager. With
+    # neither present it registered nowhere, libbatterymonitor never received a
+    # battery reading, and the charger UI sat waiting while the panel kept
+    # showing whatever the bootloader had left on it. That is exactly the
+    # "charging is stuck on the MI logo" symptom: nothing draws, nothing fails.
     #
-    # charger 模式只跑 `early-init`/`init`/`charger` 三个触发器，`on fs` 不会执行，
-    # 所以 /cache 平时是**没有挂载**的 —— 这就是之前一直查不到 charger 日志的原因
-    # （init 里的 logger 服务是 class main，charger 模式也不会启动）。
-    # 这里手动把 CAC 分区挂到 /cache，并在 12 秒后把内核日志（charger 用 klog 输出）
-    # 和 fb 设备状态落盘，下次进系统或 TWRP 都能直接读 /cache/charger_dbg.txt。
+    # The HAL itself is already `class hal charger`, so it comes up on its own
+    # as soon as there is somewhere to register. Order does not matter; the
+    # HIDL client retries until the service appears.
+    start servicemanager
+    start hwservicemanager
+    start vndservicemanager
+
+    # Charger mode has no logcat, no /data and no boot log, so this file is the
+    # only record of what the charger did. exec_background, not exec: `exec`
+    # blocks init until the command returns, which would hold up everything
+    # after it (including the USB setup below) for the full 60 s the collector
+    # runs. Invoked through sh because PRODUCT_COPY_FILES installs 0644.
     mkdir /cache 0770 system cache
     mount ext4 /dev/block/platform/sdhci-tegra.3/by-name/CAC /cache noatime nosuid nodev
-    exec - root root -- /system/bin/sh -c "/system/bin/sleep 12; { echo '=== bootmode ==='; getprop ro.bootmode; echo '=== fb ==='; ls -la /dev/graphics/ 2>&1; echo '=== minui props ==='; getprop | grep -i minui; echo '=== klog ==='; dmesg; } > /cache/charger_dbg.txt 2>&1"
+    exec_background - root root -- /system/bin/sh /system/bin/charger_dbg.sh
 
-    # 诊断用：让 charger 模式下也能枚举 USB，插线后 host 能看到设备（best effort）。
-    # 真正生效还依赖 adbd 服务，这里只是把 usb 配置切出来便于观察。
+    # Diagnostic: let the host see the device while it is charging (best
+    # effort; adbd itself is class core and is not started here).
     setprop sys.usb.config adb
 
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave

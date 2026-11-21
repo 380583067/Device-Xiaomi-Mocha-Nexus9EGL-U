@@ -6,3 +6,12 @@ type mocha_sns_pipes, file_type, data_file_type;
 
 allow system_server mocha_sns_pipes:dir rw_dir_perms;
 allow system_server mocha_sns_pipes:{ file fifo_file } rw_file_perms;
+
+# The HAL is a passthrough one, so it is system_server that removes and
+# recreates /data/sns_lsm6db0_pipes on every start: `remove_name` and
+# `add_name` on the entry, `write` on /data itself. Those land on
+# system_data_root_file:dir, not on the labelled subdirectory, so labelling the
+# pipes (above) is not enough - under enforcing the HAL would fail to start
+# them, and this is the one place where the wide permission is the honest
+# description of what the blob does.
+allow system_server system_data_root_file:dir { write add_name remove_name };

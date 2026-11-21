@@ -159,6 +159,11 @@ PRODUCT_PACKAGES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/charger_led.sh:system/bin/charger_led.sh
 
+# Charger-mode evidence collector: charger mode has no logcat and no /data, so
+# what it writes to /cache/charger_dbg.txt is the only record (see the file).
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/initfiles/charger_dbg.sh:system/bin/charger_dbg.sh
+
 # DRM HAL
 PRODUCT_PACKAGES += \
     android.hardware.drm-service.clearkey

@@ -39,3 +39,8 @@ allow prng_seeder vendor_file:file r_file_perms;
 
 # init reads the seapp_contexts it is about to load.
 allow init seapp_contexts_file:file r_file_perms;
+
+# logd and adbd also touch the composer blob (crash reporting reads it back to
+# symbolise a tombstone).
+allow logd vendor_file:file r_file_perms;
+allow adbd vendor_file:file r_file_perms;
