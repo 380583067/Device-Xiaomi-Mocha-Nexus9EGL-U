@@ -27,6 +27,26 @@ dump_state() {
     echo "battery: $(for d in /sys/class/power_supply/*; do [ -d "$d" ] && echo -n "$(basename $d) cap=$(cat $d/capacity 2>&1) st=$(cat $d/status 2>&1); "; done)"
 }
 
+# Two questions that answer each other. If fb0 holds drawing, the charger did
+# paint and the problem is downstream of the buffer (display controller); if it
+# is all zeroes, the charger never painted - and then wchan and the fd list say
+# what it was waiting on instead.
+dump_probe() {
+    pid=$(getprop init.svc_debug_pid.charger)
+    echo "--- charger proc (pid=$pid) ---"
+    if [ -n "$pid" ]; then
+        echo "wchan: $(cat /proc/$pid/wchan 2>&1)"
+        echo "state: $(awk '{print $3}' /proc/$pid/stat 2>/dev/null)"
+        ls -l /proc/$pid/fd 2>&1 | head -14
+    else
+        echo "no charger pid"
+    fi
+    echo "--- fb0 holds drawing? (non-zero bytes in first 32KB) ---"
+    dd if=/dev/graphics/fb0 bs=4096 count=8 2>/dev/null | tr -d '\000' | wc -c
+    echo "--- fb0 first 48 bytes ---"
+    dd if=/dev/graphics/fb0 bs=48 count=1 2>/dev/null | od -An -tx1
+}
+
 {
     echo "=== stage 1 (t+0s) $(date) ==="
     dump_state
@@ -35,6 +55,7 @@ dump_state() {
     for f in virtual_size stride bits_per_pixel blank modes name; do
         echo "fb0/$f: $(cat /sys/class/graphics/fb0/$f 2>&1)"
     done
+    dump_probe
     echo "--- full kmsg tail ---"
     dmesg 2>&1 | tail -60
     dump_kmsg
@@ -49,6 +70,7 @@ while [ $i -lt 4 ]; do
         echo
         echo "=== stage 2.$i (t+$((i * 2))s) $(date) ==="
         dump_state
+        dump_probe
         dump_kmsg
     } >> "$OUT" 2>&1
 done
@@ -77,6 +99,7 @@ fi
     echo
     echo "=== stage 4 (t+~15s, after fb0 test) $(date) ==="
     dump_state
+    dump_probe
     dump_kmsg
     echo "--- full kmsg tail ---"
     dmesg 2>&1 | tail -80
