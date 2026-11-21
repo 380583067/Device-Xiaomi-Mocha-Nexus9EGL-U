@@ -329,27 +329,50 @@ PRODUCT_COPY_FILES += \
 #   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0x80000 \
-    debug.stagefright.ccodec=2
+    debug.stagefright.ccodec=4
 
-# [mocha 2026-11-21] ccodec=2, not 1: with 1 only the c2.android.* *audio* codecs
-# are ranked first, so a video stream can still land on one of the NVIDIA OMX
-# decoders. Those decoders cannot initialise on this kernel (there is no
-# /dev/nvhost-msdec or vde node) and the 2014 blob also predates the Android 14
-# ACodec buffer ABI, but the OMX plugin keeps registering them and their default
-# rank (0x100) beats c2.android.* (0x200). When one is picked the SurfaceView
-# stays black while the progress bar keeps running, because ExoPlayer fails with
-# CodecException 0x80001000 and has no frame to show.
-# Measured on the 13:10 build: a 20 s VP8/WebM clip picked OMX.Nvidia.vp8.decode
-# and stayed black with ccodec=1; with 2 it goes to c2.android.vp8.decoder and
-# renders. A 16-clip matrix (H.264 720p-4K, HEVC 8-bit 720p/1080p, VP9, VP8,
-# MPEG-4 Part 2 in mp4/mkv/avi, 3GP, interlaced, anamorphic, non-16-aligned,
-# AC3-in-MKV, H.264 in MPEG-TS) renders correctly with this value, and the
-# encoder side still works (screenrecord -> c2.android.avc.encoder, playable).
+# [mocha 2026-11-21] 4 = every component keeps its normal rank, so OMX (0x100)
+# outranks Codec2 software (0x200) and OMX is tried first - which is what the
+# device is meant to ship with: OMX first, Codec2 second, and both always
+# present so a stream that one of them chokes on still plays on the other.
+#
+# That only works because the NVIDIA OMX decoders are pushed to rank 0x300 in
+# media/media_codecs.xml. They cannot initialise on this kernel (no
+# /dev/nvhost-msdec, and the 2014 blob predates the Android 14 ACodec buffer
+# ABI), and at their default 0x100 they would win the race and leave the
+# SurfaceView black with CodecException 0x80001000 - the bug fixed on the 13:10
+# build by forcing ccodec=2. Ranking them last keeps them listed (some streams
+# may still want them, and hiding them hides real failures) while making
+# OMX.google.* the first choice.
+#
+# Resulting order per MIME: OMX.google.* (0x100) -> c2.android.* (0x200) ->
+# OMX.Nvidia.* (0x300).
+
+# History, because both conclusions in it still matter.
+#
+# ccodec=1 was the original value and left video black: option 1 ranks only the
+# c2.android.* *audio* codecs first, so video still landed on the NVIDIA OMX
+# decoders. Those cannot initialise on this kernel (no /dev/nvhost-msdec, and
+# the 2014 blob predates the Android 14 ACodec buffer ABI), failing with
+# CodecException 0x80001000: the SurfaceView stays black while the progress bar
+# keeps running, which looked like a compositor bug for a long time.
+#
+# Forcing ccodec=2 fixed that by ranking all c2.android.* first. A 16-clip matrix
+# (H.264 720p-4K, HEVC 8-bit 720p/1080p, VP9, VP8, MPEG-4 Part 2 in mp4/mkv/avi,
+# 3GP, interlaced, anamorphic, non-16-aligned, AC3-in-MKV, H.264 in MPEG-TS)
+# rendered correctly with it, encoder side included (screenrecord ->
+# c2.android.avc.encoder, playable).
+#
+# It is 4 now, for the ordering described above: the same protection is provided
+# by ranking the NVIDIA decoders last in media/media_codecs.xml instead of by
+# suppressing Codec2, so OMX can still be tried first.
+#
 # Still unsupported for other reasons: HEVC Main10 (no 10-bit decoder at all)
 # and MPEG-2 (no software decoder in this build, the NVIDIA one fails).
-# The earlier claim "C2 software video output to a Surface is always black" was a
-# misdiagnosis - the black layers were NVIDIA decoders being selected; C2 decode
-# to a SurfaceView composites fine under the forced GPU composition.
+#
+# The earlier claim "C2 software video output to a Surface is always black" was
+# a misdiagnosis - the black layers were NVIDIA decoders being selected; C2
+# decode to a SurfaceView composites fine under the forced GPU composition.
 
 # Packages the inherited product lists ship but this board cannot use; see
 # RemovePackages/Android.mk for which one and why.

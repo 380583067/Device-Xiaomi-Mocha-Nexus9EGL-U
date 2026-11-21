@@ -80,7 +80,7 @@ Only the three quirks included above are recognized at this point:
         <Setting name="max-video-encoder-input-buffers" value="6" />
     </Settings>
     <Decoders>
-        <MediaCodec name="OMX.Nvidia.mp4.decode" type="video/mp4v-es" >
+        <MediaCodec name="OMX.Nvidia.mp4.decode" type="video/mp4v-es" rank="0x300" >
             <Limit name="size" min="32x32" max="1920x1088" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
@@ -88,7 +88,7 @@ Only the three quirks included above are recognized at this point:
             <Limit name="bitrate" range="1-10000000" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
-        <MediaCodec name="OMX.Nvidia.h263.decode" type="video/3gpp" >
+        <MediaCodec name="OMX.Nvidia.h263.decode" type="video/3gpp" rank="0x300" >
             <Limit name="size" min="32x32" max="720x576" />
             <Limit name="alignment" value="2x2" />
             <Feature name="adaptive-playback" />
@@ -109,7 +109,7 @@ Only the three quirks included above are recognized at this point:
              即：这个 blob 的硬解在本内核上无法初始化，与 ACodec/metadata 协商
              无关（那些补丁解决的是崩溃，不是可解码性）。
              本机 H.264 只能走 OMX.google.h264.decoder 软解。 -->
-        <MediaCodec name="OMX.Nvidia.h264.decode.secure" type="video/avc" >
+        <MediaCodec name="OMX.Nvidia.h264.decode.secure" type="video/avc" rank="0x300" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
@@ -118,7 +118,7 @@ Only the three quirks included above are recognized at this point:
             <Feature name="adaptive-playback" />
             <Feature name="secure-playback" required="true" />
         </MediaCodec>
-        <MediaCodec name="OMX.Nvidia.vp8.decode" type="video/x-vnd.on2.vp8" >
+        <MediaCodec name="OMX.Nvidia.vp8.decode" type="video/x-vnd.on2.vp8" rank="0x300" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
@@ -126,7 +126,7 @@ Only the three quirks included above are recognized at this point:
             <Limit name="bitrate" range="1-62500000" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
-        <MediaCodec name="OMX.Nvidia.h265.decode" type="video/hevc" >
+        <MediaCodec name="OMX.Nvidia.h265.decode" type="video/hevc" rank="0x300" >
             <Limit name="size" min="32x32" max="1920x1088" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
@@ -134,7 +134,7 @@ Only the three quirks included above are recognized at this point:
             <Limit name="bitrate" range="1-10000000" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
-        <MediaCodec name="OMX.Nvidia.mpeg2v.decode" type="video/mpeg2" >
+        <MediaCodec name="OMX.Nvidia.mpeg2v.decode" type="video/mpeg2" rank="0x300" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
@@ -146,7 +146,7 @@ Only the three quirks included above are recognized at this point:
         <!-- mocha 修复：原声明为 audio/mpeg-L2，Android 14 的 MediaCodecsXmlParser
              不接受该 MIME，启动时报 "OMX.Nvidia.mp3.decoder does not support any
              media types"，组件等于不生效。MP3 对应 MIME 为 audio/mpeg。 -->
-        <MediaCodec name="OMX.Nvidia.mp3.decoder" type="audio/mpeg" >
+        <MediaCodec name="OMX.Nvidia.mp3.decoder" type="audio/mpeg" rank="0x300" >
             <Limit name="channel-count" max="2" />
             <Limit name="sample-rate" ranges="16000,22050,24000,32000,44100,48000" />
             <Limit name="bitrate" range="8000-320000" />
@@ -154,14 +154,14 @@ Only the three quirks included above are recognized at this point:
     </Decoders>
 
     <Encoders>
-        <MediaCodec name="OMX.Nvidia.h264.encoder" type="video/avc" >
+        <MediaCodec name="OMX.Nvidia.h264.encoder" type="video/avc" rank="0x300" >
             <Limit name="size" min="48x48" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
             <Limit name="blocks-per-second" min="1" max="783360" />
             <Limit name="bitrate" range="1-50000000" />
         </MediaCodec>
-        <MediaCodec name="OMX.Nvidia.vp8.encoder" type="video/x-vnd.on2.vp8" >
+        <MediaCodec name="OMX.Nvidia.vp8.encoder" type="video/x-vnd.on2.vp8" rank="0x300" >
             <Limit name="size" min="48x48" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
             <Limit name="block-size" value="16x16" />
