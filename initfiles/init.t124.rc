@@ -192,13 +192,9 @@ on property:sys.boot_completed=1
     # next boot on.
     restorecon_recursive /data/misc/phs
 
-# Creating it here is what makes the label stick from the first boot: SELinux
-# labels a newly created file from its parent, so if the HAL makes the
-# directory itself it inherits system_data_root_file from /data and every FIFO
-# inside inherits that too - the ~20 denials seen per boot, every boot, because
-# the directory is recreated before the restorecon above can run. mkdir here,
-# label it, and the HAL then finds an existing, correctly labelled directory.
-on post-fs-data
-    mkdir /data/sns_lsm6db0_pipes 0770 system system
-    restorecon_recursive /data/sns_lsm6db0_pipes
+# Note on why there is no mkdir for /data/sns_lsm6db0_pipes here: the HAL
+# removes the directory and recreates it on every start (the boot log shows
+# remove_name on that very name), so anything init creates in post-fs-data is
+# gone by the time the HAL runs. The restorecon above is what actually keeps
+# the label correct, and it runs after the HAL has had its turn.
 
