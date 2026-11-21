@@ -88,6 +88,20 @@ frameworks/av
         - describe YV12 as planar Y/V/U instead of interleaved UV (the old
           description swapped red and green on screen)
 
+bootable/recovery
+  0001  charger-mode display fix. minui's fbdev backend flips its double buffer
+        with FBIOPUT_VSCREENINFO alone, but tegra_fb_set_par() only takes the
+        pixel format, stride and mode out of the var - it never touches
+        yoffset and never re-points the display controller. The offset is
+        applied in tegra_fb_pan_display(), the FBIOPAN_DISPLAY handler, which
+        recomputes win.phys_addr and calls tegra_dc_update_windows(). Without
+        it every frame the charger draws lands in a buffer nobody scans out:
+        the charger runs, plays the animation and even suspends afterwards,
+        while the panel keeps showing what the bootloader left there.
+        SetDisplayedFramebuffer() now issues FBIOPAN_DISPLAY as well, and Init()
+        unblanks before binding the window, because a pan issued against a
+        disabled display controller has nothing to update.
+
 system/sepolicy
   0001  two gaps in the system-private policy this board needs and vendor
         policy cannot express (both domains live in

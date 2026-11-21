@@ -1,0 +1,49 @@
+diff --git a/minui/graphics_fbdev.cpp b/minui/graphics_fbdev.cpp
+index c3e9c10..775d374 100644
+--- a/minui/graphics_fbdev.cpp
++++ b/minui/graphics_fbdev.cpp
+@@ -65,6 +65,25 @@ void MinuiBackendFbdev::SetDisplayedFramebuffer(size_t n) {
+   if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vi) < 0) {
+     perror("active fb swap failed");
+   }
++  /*
++   * FBIOPUT_VSCREENINFO alone does not move the picture on tegra_fb.
++   *
++   * tegra_fb_set_par() only takes the pixel format, stride and mode out of the
++   * var; it never touches yoffset and never re-points the display controller.
++   * The offset is applied in tegra_fb_pan_display(), which is the
++   * FBIOPAN_DISPLAY handler: it recomputes win.phys_addr from yoffset and calls
++   * tegra_dc_update_windows(). Without this second ioctl the var says
++   * "yoffset = 2048" while the DC keeps scanning the first buffer, so every
++   * frame the charger draws lands in a buffer nobody displays and the panel
++   * stays on whatever the bootloader left there.
++   *
++   * This is what "charging shows no animation" looked like: the charger ran,
++   * played the animation and even suspended afterwards (the animation state
++   * machine works fine), it just drew into an invisible buffer.
++   */
++  if (ioctl(fb_fd, FBIOPAN_DISPLAY, &vi) < 0) {
++    perror("pan display failed");
++  }
+   displayed_buffer = n;
+ }
+ 
+@@ -154,10 +173,17 @@ next_fb:
+   gr_draw = gr_framebuffer[1].get();
+   memset(gr_draw->buffer_, 0, gr_draw->height * gr_draw->row_bytes);
+   fb_fd = std::move(fd);
+-  SetDisplayedFramebuffer(0);
+ 
+   printf("framebuffer: %d (%zu x %zu)\n", fb_fd.get(), gr_draw->width, gr_draw->height);
++
++  /*
++   * Unblank before panning: tegra_fb_blank(FB_BLANK_UNBLANK) is what enables
++   * the display controller, and a pan issued against a disabled DC has nothing
++   * to update. SetDisplayedFramebuffer() then binds the first buffer through
++   * its FBIOPAN_DISPLAY path, which is the only one tegra_fb honours.
++   */
+   Blank(false);
++  SetDisplayedFramebuffer(0);
+ 
+   return gr_draw;
+ }
