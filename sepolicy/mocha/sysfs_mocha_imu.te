@@ -1,0 +1,12 @@
+# The IMU (lsm6db0) exposes itself through iio:device nodes under
+# /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008, which the platform policy
+# does not know about, so they stayed on the generic sysfs type.
+#
+# The sensor HAL is a passthrough one - it runs inside system_server, which is
+# why system_server itself opens both the sysfs attributes (name,
+# sampling_frequency, buffer/enable) and the /dev/iio:deviceN character device.
+# That gave 19 sysfs denials plus 6 on iio_device per boot.
+type sysfs_mocha_imu, fs_type, sysfs_type;
+
+allow system_server sysfs_mocha_imu:file rw_file_perms;
+allow system_server iio_device:chr_file rw_file_perms;

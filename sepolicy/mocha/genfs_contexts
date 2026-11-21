@@ -19,3 +19,7 @@ genfscon sysfs /kernel/tegra_gpu/gpu_available_rates u:object_r:sysfs_tegra_gpu:
 # hal_health_default, which already holds r_dir_file() on sysfs_batteryinfo.
 genfscon sysfs /devices/platform/psy_extcon.3/power_supply u:object_r:sysfs_batteryinfo:s0
 genfscon sysfs /devices/platform/tegra12-i2c.1/i2c-1/1-0055/power_supply u:object_r:sysfs_batteryinfo:s0
+
+# The IMU subtree (see sysfs_mocha_imu.te). Declared once at the i2c client so
+# every lsm6db0_* iio:device below it inherits the label.
+genfscon sysfs /devices/platform/tegra12-i2c.0/i2c-0/0-0008 u:object_r:sysfs_mocha_imu:s0
