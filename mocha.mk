@@ -359,7 +359,13 @@ PRODUCT_COPY_FILES += \
 #   lockYCbCr 缺失时回退 lock()、YV12 走 Y/V/U 平面、CPU_WRITE+YUV 补
 #   HW_TEXTURE）。没有这些补丁 C2 软解会直接 start() 失败或颜色红绿互换。
 #   C2 软解实测 720p 约 29.3~29.5fps，与 OMX 持平，颜色逐帧一致。
-#   c2-poolmask：软件 C2 输出 buffer 池的 usage 掩码，沿用原值。
+#   c2-poolmask：允许的 C2 平台 block pool/allocator 位掩码（bit16 ION、
+#   bit17 GRALLOC、bit18 BUFFERQUEUE、bit19 BLOB）。之前误用 0x80000（仅
+#   BLOB），把 BUFFERQUEUE 禁掉后软解输出块不走 BQ 池，落到 BASIC_GRAPHIC，
+#   块不带 bqId，OutputBufferQueue 只能走 attachBuffer 旁路——而 BLAST 下
+#   producer 从未 connect，attach 每帧报 INVALID_OPERATION(-38)，播放器只
+#   有声音没有画面。0xF0000 = ION|GRALLOC|BUFFERQUEUE|BLOB 全开，输出池
+#   正常选中 BUFFERQUEUE（allocatorID 18），画面恢复（2026-11-22 实测）。
 # OMX first, Codec2 second, and every implementation kept registered.
 #
 # ccodec=4 means each component keeps its own rank. The ranking that follows is
@@ -381,7 +387,7 @@ PRODUCT_COPY_FILES += \
 # silently fails to parse and the component keeps its default rank - which is
 # exactly how the first attempt at this ended up changing nothing.
 PRODUCT_PROPERTY_OVERRIDES += \
-    debug.stagefright.c2-poolmask=0x80000 \
+    debug.stagefright.c2-poolmask=0xF0000 \
     debug.stagefright.ccodec=4 \
     debug.stagefright.omx_default_rank=768 \
     debug.stagefright.omx_default_rank.sw-other=100

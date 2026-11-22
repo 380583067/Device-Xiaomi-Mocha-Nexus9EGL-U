@@ -228,27 +228,49 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
      * HW_VIDEO_ENCODER）在分配时也被 EINVAL 拒绝。这类拒绝 vendor 的口味是
      * "要一个软件读位"——给 YV12/YCbCr 都放宽：只要还没有 SW 读位就补一个
      * SW_READ_RARELY 再试一次（SW_WRITE 已在的用法同样能补）。 */
-    if (result != -EINVAL) {
+    if (result == 0 || format != HAL_PIXEL_FORMAT_YCbCr_420_888) {
         return result;
     }
 
-    if (format != HAL_PIXEL_FORMAT_YCbCr_420_888 &&
-        format != HAL_PIXEL_FORMAT_YV12) {
-        return result;
+    if (!(usage & GRALLOC_USAGE_SW_READ_MASK)) {
+        /* 无 SW 位的情形（C2BqBuffer 探测等）：vendor 拒的是"一个软件位都
+         * 没有"，补 SW_READ_RARELY 就能过。 */
+        int retried = usage | GRALLOC_USAGE_SW_READ_RARELY;
+
+        int second = gVendorAlloc(dev, w, h, format, retried, handle, stride);
+
+        ALOGI("YCbCr_420_888 %dx%d refused for usage %#x, asked again with a "
+              "software read: %d", w, h, usage, second);
+
+        if (second == 0) {
+            return 0;
+        }
+
+        if (second == result) {
+            return result;
+        }
     }
 
-    if (usage & GRALLOC_USAGE_SW_READ_MASK) {
-        return result;
+    /* 【2026-11-22 录像】带 SW_READ_OFTEN 的 YCbCr_420_888 被 vendor 以
+     * -ENOMEM(NO_RESOURCES) 拒绝——它的门槛是"YCbCr_420_888 一律不许带软件
+     * 访问位"（3516/35bc 的第一道闸）。这挡住了 MediaRecorder 的
+     * StageFright-CameraSource 队列（usage 0x3 = SW_READ_OFTEN）：分配失败
+     * 后 CameraSource 视频轨道 0 帧，停止时报 -1007，文件被删，表现为
+     * "录像保存不下来/退出"。
+     *
+     * YV12 是 vendor 唯一放行的带软件位 YUV 格式（软解缩略图一路都在用）。
+     * 同参数改报 YV12：写方（相机 HAL）与读方（软编码器）都走 lock_ycbcr /
+     * lock() 的平面布局，拿到的是 vendor 真实给出的 YV12，双方一致。
+     * 格式写在 GraphicBuffer 元数据里仍是 35，无碍：两侧都不信那个字段。 */
+    {
+        int yv12 = gVendorAlloc(dev, w, h, HAL_PIXEL_FORMAT_YV12, usage, handle,
+                                stride);
+
+        ALOGI("YCbCr_420_888 %dx%d refused for usage %#x, allocated as YV12 "
+              "instead: %d", w, h, usage, yv12);
+
+        return yv12;
     }
-
-    int retried = usage | GRALLOC_USAGE_SW_READ_RARELY;
-
-    result = gVendorAlloc(dev, w, h, format, retried, handle, stride);
-
-    ALOGI("YCbCr_420_888 %dx%d refused for usage %#x, asked again with a "
-          "software read: %d", w, h, usage, result);
-
-    return result;
 }
 
 /*

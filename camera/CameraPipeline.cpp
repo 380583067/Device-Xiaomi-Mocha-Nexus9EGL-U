@@ -493,7 +493,11 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     float avgG = (float)sumG / pixelCount;
     float avgB = (float)sumB / pixelCount;
 
-    if (avgR < 5.0f || avgG < 5.0f || avgB < 5.0f) return;
+    /* 【2026-11-22 前摄偏绿】暗场里三通道均值都很低，原来 <5 直接跳过 AWB，
+     * 于是 OV5693 的原生绿色偏色（前摄"偏绿"的来源）在暗场完全无人修正。
+     * 降到 2：10-bit raw 下 2/4≈八位 0.5，噪声仍不至于把均值推到假平衡。
+     * 5 的门槛只对后摄高亮度场景有意义，前摄暗场必须也参与。 */
+    if (avgR < 2.0f || avgG < 2.0f || avgB < 2.0f) return;
 
     float rGain = avgG / avgR;
     float bGain = avgG / avgB;

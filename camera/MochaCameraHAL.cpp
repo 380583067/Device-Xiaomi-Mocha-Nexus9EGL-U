@@ -1128,8 +1128,11 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
     /* 【2026-11-22 过曝】AE 是在 gamma 之前的线性域测亮度，0.55 相当于把画面推到
      * 接近饱和（实测白窗帘场景 57% 像素贴到 255、均值 231/255）。线性域中灰约
      * 0.18~0.22，取 0.20。软件增益同时从 1.5 收回 1.0：那是早先为了压暗场加的，
-     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。 */
-    pipelineConfig.targetLuma = 0.20f;
+     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。
+     * 【2026-11-22 前摄偏暗】0.20 是按后摄 IMX179（原生灵敏度）定的。前摄
+     * OV5693 在同样目标下明显偏暗（用户实测"非常暗黑"），提到 0.32：
+     * 线性域 0.32 过 gamma(0.55) 后约 60/255，暗场可用又不至于把亮部推饱和。 */
+    pipelineConfig.targetLuma = (dev->camera_id == 1) ? 0.32f : 0.20f;
     pipelineConfig.digitalGain = 1.0f;
     /* 高分辨率拍照重建 pipeline 时继承已经收敛的曝光/增益（见 PipelineConfig 注释）。 */
     pipelineConfig.initialExposure = inheritExposure;
