@@ -74,7 +74,16 @@ persist.tegra.compositor=glcomposer
 ro.surface_flinger.use_frame_rate_api=false
 debug.sf.disable_hwc=0
 ro.sf.use_hwc_vsync=1
-persist.sf.force_gpu_composition=0
+# Force GPU composition from SurfaceFlinger start. The legacy Tegra K1 HWC
+# blob hits a use-after-free in gralloc.nvgpu NvGrDecompressBuffer during
+# heavy buffer-churn transitions (bootanim exit, launcher first frame):
+# composer@2.1-se dies, SurfaceFlinger follows, and surfaceflinger.rc's
+# "onrestart restart --only-if-running zygote" takes system_server down with
+# it - which replays the boot animation on every cycle. With this property
+# set, SF hands the composer no application buffers at all (equivalent to
+# the manual "service call SurfaceFlinger 1008 i32 1" workaround, but
+# effective from the very first frame).
+persist.sf.force_gpu_composition=true
 persist.tegra.decompression=disabled
 persist.vendor.tegra.composite.policy=composite-yuv
 persist.sys.ui.hw=true
