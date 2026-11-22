@@ -317,6 +317,60 @@ int CameraPipeline::configure(const PipelineConfig& config) {
 int CameraPipeline::startStreaming() {
     if (mState != PIPELINE_OPENED) return -EINVAL;
 
+    /* 【2026-11-22 录像 0 帧】stopStreaming() 在 STREAMOFF 后 munmap 全部缓冲
+     * 并把 mBufferCount 清零；本函数原来只 QBUF mBufferCount 个——flush 之后
+     * （录像启动必然触发 camera_device_flush → STREAMOFF → 重启流）这里就是
+     * 0 个，STREAMON 时 VI 的 buf_queue 为空（内核日志 "0 buffers ... buf_queue=
+     * EMPTY"），之后每次 DQBUF 都拿不到帧，录像的视频轨道全程 0 帧。
+     * 现在检测到无缓冲就按 configure() 的同一套流程重新 REQBUFS + mmap。 */
+    if (mBufferCount == 0) {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = 2;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(mFd, VIDIOC_REQBUFS, &req) < 0) {
+            ALOGE("VIDIOC_REQBUFS failed (restart): %s", strerror(errno));
+            return -errno;
+        }
+        if (req.count < 2) {
+            ALOGE("VIDIOC_REQBUFS gave only %d buffers (restart)", req.count);
+            return -ENOMEM;
+        }
+        mBufferCount = req.count;
+
+        for (int i = 0; i < mBufferCount; i++) {
+            struct v4l2_buffer qbuf;
+            memset(&qbuf, 0, sizeof(qbuf));
+            qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            qbuf.memory = V4L2_MEMORY_MMAP;
+            qbuf.index = i;
+
+            if (ioctl(mFd, VIDIOC_QUERYBUF, &qbuf) < 0) {
+                ALOGE("VIDIOC_QUERYBUF failed (restart): %s", strerror(errno));
+                mBufferCount = 0;
+                return -errno;
+            }
+            mBuffers[i].length = qbuf.length;
+            mBuffers[i].start = mmap(NULL, qbuf.length, PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, mFd, qbuf.m.offset);
+            if (mBuffers[i].start == MAP_FAILED) {
+                mBuffers[i].start = nullptr;
+                for (int j = 0; j < i; j++) {
+                    if (mBuffers[j].start) munmap(mBuffers[j].start, mBuffers[j].length);
+                    mBuffers[j].start = nullptr;
+                    mBuffers[j].allocated = false;
+                }
+                mBufferCount = 0;
+                ALOGE("mmap failed (restart): %s", strerror(errno));
+                return -ENOMEM;
+            }
+            mBuffers[i].allocated = true;
+        }
+        ALOGI("Buffers re-allocated after stop: %d", mBufferCount);
+    }
+
     /* Re-request buffers (idempotent: reuses existing if count matches) */
     for (int i = 0; i < mBufferCount; i++) {
         struct v4l2_buffer buf;

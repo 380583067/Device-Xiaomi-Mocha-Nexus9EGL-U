@@ -143,6 +143,9 @@ static int (*gVendorOpen)(const hw_module_t *, const char *, hw_device_t **);
 static int (*gVendorLockYCbCr)(const gralloc_module_t *, buffer_handle_t, int,
                                int, int, int, int, struct android_ycbcr *) = NULL;
 
+static int (*gVendorLock)(const gralloc_module_t *, buffer_handle_t, int,
+                          int, int, int, int, void **) = NULL;
+
 static int (*gVendorLockAsyncYCbCr)(const gralloc_module_t *, buffer_handle_t,
                                     int, int, int, int, int,
                                     struct android_ycbcr *, int) = NULL;
@@ -224,6 +227,41 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
               usage, result, (result == 0 && stride != NULL) ? *stride : -1);
     }
 
+    /* 【2026-11-22 录像色度条纹】只被 CPU 摸的 YUV 缓冲（MediaRecorder 的
+     * CameraSource 队列：usage 仅含 SW 位）不用 vendor 的 YV12——vendor 对
+     * YV12 的 unlock blit 按它自己的真实布局重排数据，任何按别的布局写入
+     * 的内容都会在解锁时被搅乱（编码出的视频 chroma 逐行错位、绿黑条纹）。
+     * 改为分配一块 BLOB 线性内存、由本 shim 重解释成 YV12：布局完全由我们
+     * 定义（ystride=w、cstride=w/2、V@w*h、U@w*h+(w/2)(h/2)），没有 blit，
+     * 写方（相机 HAL）和读方（软编码器）都通过下面的 lock_ycbcr 合成视图，
+     * 端到端一致。带 GPU/显示位的分配（解码输出等）不走这条，仍交给 vendor。 */
+    bool cpuOnlyYuv = (format == HAL_PIXEL_FORMAT_YCbCr_420_888) &&
+                      (usage & GRALLOC_USAGE_SW_READ_MASK) &&
+                      !(usage & (GRALLOC_USAGE_HW_TEXTURE |
+                                 GRALLOC_USAGE_HW_RENDER |
+                                 GRALLOC_USAGE_HW_COMPOSER |
+                                 GRALLOC_USAGE_HW_VIDEO_ENCODER));
+
+    if (cpuOnlyYuv) {
+        size_t total = static_cast<size_t>(w) * h
+                     + static_cast<size_t>(w >> 1) * (h >> 1) * 2;
+        int blobUsage = GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN;
+        int blobStride = 0;
+
+        int bret = gVendorAlloc(dev, static_cast<int>(total), 1,
+                                HAL_PIXEL_FORMAT_BLOB, blobUsage, handle,
+                                &blobStride);
+
+        ALOGI("YCbCr_420_888 %dx%d usage %#x -> BLOB-reinterpreted as YV12 "
+              "(%zu bytes): %d", w, h, usage, total, bret);
+
+        if (bret == 0) {
+            if (stride != NULL) *stride = w;
+            return 0;
+        }
+        /* BLOB 分配失败则落到下面的 YV12 重试。 */
+    }
+
     /* 【2026-11-22 录像 0 帧】编码器流（YCbCr_420_888，HAL 已剥掉
      * HW_VIDEO_ENCODER）在分配时也被 EINVAL 拒绝。这类拒绝 vendor 的口味是
      * "要一个软件读位"——给 YV12/YCbCr 都放宽：只要还没有 SW 读位就补一个
@@ -301,10 +339,61 @@ static void trace_lock(const char *what, int w, int h, int usage,
           (long)(static_cast<const char *>(ycbcr->cr) - y));
 }
 
+/*
+ * Synthesize an android_ycbcr for a buffer the vendor refuses to lock_ycbcr.
+ * Applies to two populations: BLOB-reinterpreted CPU-only YUV staging buffers
+ * (the recording queue -- our own YV12 layout, no shadow blit involved), and
+ * vendor YV12 allocations whose lockYCbCr the blob blanket-refuses. Both are
+ * pitch linear: ystride = w, chroma stride = w/2, V plane then U plane
+ * (YV12 order). The caller only ever reads what another shim user wrote
+ * through the same view, so the view is the layout.
+ */
+static int synthesize_ycbcr(const gralloc_module_t *module,
+                            buffer_handle_t handle, int usage, int l, int t,
+                            int w, int h, struct android_ycbcr *ycbcr) {
+    void *vaddr = NULL;
+
+    if (gVendorLock == NULL) {
+        return -ENOSYS;
+    }
+
+    int result = gVendorLock(module, handle, usage, l, t, w, h, &vaddr);
+
+    if (result != 0 || vaddr == NULL) {
+        return result;
+    }
+
+    uint8_t *yBase = static_cast<uint8_t *>(vaddr);
+
+    memset(ycbcr, 0, sizeof(*ycbcr));
+    ycbcr->y = yBase;
+    ycbcr->ystride = static_cast<size_t>(w);
+    ycbcr->cr = yBase + static_cast<size_t>(w) * h;
+    ycbcr->cb = yBase + static_cast<size_t>(w) * h
+              + static_cast<size_t>(w >> 1) * (h >> 1);
+    ycbcr->cstride = static_cast<size_t>(w >> 1);
+    ycbcr->chroma_step = 1;
+
+    return 0;
+}
+
 static int tegra_lock_ycbcr(const gralloc_module_t *module,
                             buffer_handle_t handle, int usage, int l, int t,
                             int w, int h, struct android_ycbcr *ycbcr) {
     int result = gVendorLockYCbCr(module, handle, usage, l, t, w, h, ycbcr);
+
+    if (result != 0) {
+        /* vendor 对 YCbCr_420_888/YV12 的 lockYCbCr 一律 -ENOSYS：退化为普通
+         * lock 并按 synthesize_ycbcr 注释的线性布局合成视图。 */
+        int syn = synthesize_ycbcr(module, handle, usage, l, t, w, h, ycbcr);
+
+        if (tracing()) {
+            ALOGI("lock_ycbcr %dx%d usage %#x -> vendor %d, synthesized %d",
+                  w, h, usage, result, syn);
+        }
+
+        result = syn;
+    }
 
     trace_lock("lock_ycbcr", w, h, usage, ycbcr, result);
 
@@ -317,6 +406,19 @@ static int tegra_lock_async_ycbcr(const gralloc_module_t *module,
                                   struct android_ycbcr *ycbcr, int fence) {
     int result = gVendorLockAsyncYCbCr(module, handle, usage, l, t, w, h, ycbcr,
                                        fence);
+
+    if (result != 0) {
+        /* 同 tegra_lock_ycbcr：vendor 拒绝时合成线性 YV12 视图。fence 由
+         * 调用方持有，普通 lock 不动它。 */
+        int syn = synthesize_ycbcr(module, handle, usage, l, t, w, h, ycbcr);
+
+        if (tracing()) {
+            ALOGI("lockAsync_ycbcr %dx%d usage %#x -> vendor %d, synthesized %d",
+                  w, h, usage, result, syn);
+        }
+
+        result = syn;
+    }
 
     trace_lock("lockAsync_ycbcr", w, h, usage, ycbcr, result);
 
@@ -476,6 +578,11 @@ __attribute__((constructor)) static void tegra_take_vendor_module() {
      * The lock is taken over only to say what it returned, and only when the
      * vendor has one to call. A null stays null: a caller checks for it.
      */
+    if (HAL_MODULE_INFO_SYM.base.lock != NULL) {
+        /* synthesize_ycbcr 依赖它：vendor 拒绝 lock_ycbcr 时退化为普通 lock。 */
+        gVendorLock = HAL_MODULE_INFO_SYM.base.lock;
+    }
+
     if (HAL_MODULE_INFO_SYM.base.lock_ycbcr != NULL) {
         gVendorLockYCbCr = HAL_MODULE_INFO_SYM.base.lock_ycbcr;
         HAL_MODULE_INFO_SYM.base.lock_ycbcr = tegra_lock_ycbcr;

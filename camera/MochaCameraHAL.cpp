@@ -1917,9 +1917,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
     // Check if this frame was marked as error by flush()
     uint32_t frameNum = request->frame_number;
     if (dev->inflight_tracker && dev->inflight_tracker->isError(frameNum)) {
-        ALOGW("Frame %u marked as error by flush, returning EAGAIN", frameNum);
+        /* 【2026-11-22 录像 -38】原来这里直接 return -EAGAIN。HAL3 规范要求
+         * process_capture_request 只对畸形请求报错；CamDevSession 包装层把
+         * 其它错误一律映射为 INTERNAL_ERROR，框架再映射成 INVALID_OPERATION
+         * (-38)，Camera2Client 当致命错误直接拆会话（Error 1 → App 退出）。
+         * 改为清除标记、正常取帧：捕获成功交 OK，失败走尾部统一的 REQUEST
+         * 错误通知 + 缓冲 ERROR 状态（框架丢弃并重试）。 */
+        ALOGW("Frame %u was marked by flush, recapturing", frameNum);
         dev->inflight_tracker->remove(frameNum);
-        return -EAGAIN;
     }
 
     // Track this request
@@ -2161,10 +2166,9 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         int captureRet = -ENOMEM;
         if (dev->temp_rgba)
             captureRet = pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
-        if (captureRet == -EAGAIN) {
-            if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-            return -EAGAIN;
-        }
+        /* 【2026-11-22 录像 -38】取帧失败（含 -EAGAIN）不再 return：CamDevSession
+         * 包装层把任何非 BAD_VALUE 错误映射为致命错误，录制会话直接被拆。
+         * 落到下面的 else 走 REQUEST 错误通知流程。 */
         if (captureRet == 0) {
             bool allOk = true;
             for (uint32_t i = 0; i < request->num_output_buffers; i++) {
@@ -2276,10 +2280,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                     blobBuf.buffer = buf.buffer;
                     blobBuf.stream = buf.stream;
                     frameCaptured = writeJpegToBlob(dev, blobBuf, dev->temp_rgba, blobW, blobH);
-                } else if (captureRet == -EAGAIN) {
-                    if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-                    return -EAGAIN;
                 } else {
+                    /* 【2026-11-22 录像 -38】-EAGAIN 也不 return，原因同上。 */
                     ALOGE("Failed to capture frame for JPEG: %d", captureRet);
                 }
             }
@@ -2313,11 +2315,9 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 }
                 if (captureRet == 0) {
                     frameCaptured = true;
-                } else if (captureRet == -EAGAIN) {
-                    android::GraphicBufferMapper::get().unlock(handle);
-                    if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
-                    return -EAGAIN;
                 }
+                /* 【2026-11-22 录像 -38】captureRet == -EAGAIN 时不再 unlock 后
+                 * return -EAGAIN（致命错误映射问题），统一走尾部错误流程。 */
                 android::GraphicBufferMapper::get().unlock(handle);
             }
         } else {
