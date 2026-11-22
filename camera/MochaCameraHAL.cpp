@@ -195,76 +195,67 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
                             const camera3_stream_buffer_t& out,
                             const uint8_t* rgba, uint32_t w, uint32_t h) {
     if (!dev || !out.buffer || !out.stream || !rgba) return false;
-    /* 【2026-11-22 决定性实验】persist.mocha.cam.skipjpeg=1 时完全不碰 BLOB 缓冲，
-     * 只把它原样交回 framework。若此时 cameraserver 仍在 NvGrLock 崩溃，说明
-     * 崩溃与我们的写入无关，是 gralloc 对 BLOB 缓冲跨进程/跨用途 lock 的固有问题。 */
-    {
-        char skip[PROPERTY_VALUE_MAX] = {0};
-        property_get("persist.mocha.cam.skipjpeg", skip, "0");
-        if (atoi(skip) != 0) {
-            ALOGI("writeJpegToBlob: SKIP write (skipjpeg=1), handing buffer back untouched");
-            return true;
-        }
+
+    char skip[PROPERTY_VALUE_MAX] = {0};
+    property_get("persist.mocha.cam.skipjpeg", skip, "0");
+    if (atoi(skip) != 0) {
+        ALOGI("writeJpegToBlob: SKIP write (skipjpeg=1), handing buffer back untouched");
+        return true;
     }
+
     const uint32_t blobW = out.stream->width;
     const uint32_t blobH = out.stream->height;
-    /* 【2026-11-22 拍照崩溃真因】BLOB 缓冲的大小是 framework 按我们公布的
-     * ANDROID_JPEG_MAX_SIZE 整块分配的（实测始终 4149248 字节，与分辨率无关），
-     * 尾标必须写在 **这块内存的最后 8 字节**，framework 正是从
-     * bufferSize-8 处读它。以前按分辨率比例算容量（1440x1080 只有 3.18MB），
-     * 尾标落在缓冲中间 → framework 读到垃圾 jpeg_size，先是
-     * "Could not find start of JPEG marker"、后是 JpegProcessor 里 NvGrLock 崩。
-     * 所以这里直接用 kMaxJpegSize，不再做比例估算。 */
+    /* 【2026-11-22 BLOB 到底怎么锁】两个坑叠在一起，记清楚以后别再踩：
+     *
+     * 1) 缓冲大小：framework 按我们公布的 ANDROID_JPEG_MAX_SIZE **整块**分配
+     *    （本机 4 149 248 字节，与照片分辨率无关），尾标必须落在这块内存的最后
+     *    8 字节，framework 正是从 bufferSize-8 读 camera3_jpeg_blob。
+     * 2) 加锁几何：**绝不能**用 Rect(capacity, 1)。那样 gralloc 会按"4 百万像素
+     *    宽的一行"建影子映射，写完之后 unlock 把分配器状态搞坏，接下来任何一次
+     *    lock（cameraserver 的 JpegProcessor、或 App 读 Image）都会拿到垃圾 mutex：
+     *    NvGrLock 里 SEGV，或者 AcquireBufferLock timed out / LockState -1。
+     *
+     * 所以：按**图像形状**加锁，但把高度扩到刚好覆盖整块缓冲 —— 这样 JPEG 和
+     * 尾标都在同一个映射里，几何又是 gralloc 能正常处理的 2D 形状。
+     * 实测 8MP（图像 7.99MB > 缓冲 4.15MB，锁 3264x2448）与 1080p（1080 行扩到
+     * 2162 行）都正常。 */
+    char noTrailer[PROPERTY_VALUE_MAX] = {0};
+    property_get("persist.mocha.cam.notrailer", noTrailer, "1");
+    const bool writeTrailer = (atoi(noTrailer) == 0);
+
     const size_t blobCapacity = kMaxJpegSize;
     const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
-    {
-        const MochaAnbHead* anb = reinterpret_cast<const MochaAnbHead*>(*out.buffer);
-        const native_handle_t* nh = *out.buffer;
-        ALOGI("BLOB handle: anb w=%d h=%d stride=%d fmt=0x%x | nh ver=%d fds=%d ints=%d "
-              "ints[0..5]=%u %u %u %u %u %u (expect capacity %d)",
-              anb->width, anb->height, anb->stride, anb->format,
-              nh->version, nh->numFds, nh->numInts,
-              (unsigned)nh->data[0], (unsigned)nh->data[1], (unsigned)nh->data[2],
-              (unsigned)nh->data[3], (unsigned)nh->data[4], (unsigned)nh->data[5],
-              (int)blobCapacity);
+    uint32_t lockW = blobW, lockH = blobH;
+    if (writeTrailer && (uint64_t)lockW * lockH < blobCapacity) {
+        /* 尾标要写在缓冲末尾，映射必须覆盖到那里；把高度扩到够用即可
+         * （仍然是 2D 图像形状，不是 (capacity,1) 那种病态几何）。 */
+        lockH = (uint32_t)((blobCapacity + lockW - 1) / lockW);
     }
-    /* 【2026-11-22 实验 jsg】按 (capacity,1) 去 lock 会让这块 gralloc 按 4 字节/像素
-     * 算出一个 16MB 的影子缓冲，写 4MB 之后 unlock 的同步逻辑踩坏 gralloc 内部状态
-     * （紧接着 framework 一 lock 就在 NvGrLock 崩）。改成按**图像几何** lock，
-     * 只写图本身，不写尾标 —— framework 读不到尾标就会把整块缓冲交给 App，
-     * App 自己按 SOI/EOI 扫也能解出图。 */
-    char jsg[PROPERTY_VALUE_MAX] = {0};
-    property_get("persist.mocha.cam.jsg", jsg, "1");
-    const bool imageGeometry = atoi(jsg) != 0;
-    const android::Rect blobRect = imageGeometry
-            ? android::Rect((int)blobW, (int)blobH)
-            : android::Rect((int)blobCapacity, 1);
+    const android::Rect blobRect((int)lockW, (int)lockH);
+
     void* vaddr = nullptr;
     if (android::GraphicBufferMapper::get().lock(*out.buffer,
                 GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr) != 0 || !vaddr) {
-        ALOGE("writeJpegToBlob: BLOB buffer not lockable");
+        ALOGE("writeJpegToBlob: BLOB buffer not lockable (lock %ux%u)", lockW, lockH);
         return false;
     }
+
     if (!dev->jpeg_encoder) dev->jpeg_encoder = new mocha::JpegEncoder();
     size_t jpegSize = 0;
-    const size_t writeLimit = imageGeometry ? (size_t)blobW * blobH : payloadCapacity;
     int ret = dev->jpeg_encoder->encodeRGBA(rgba, (int)w, (int)h, 90,
-                                           (uint8_t*)vaddr, writeLimit, &jpegSize);
+                                           (uint8_t*)vaddr, payloadCapacity, &jpegSize);
     bool ok = false;
     if (ret == 0 && jpegSize > 0) {
-        if (imageGeometry) {
-            ALOGI("JPEG captured (image-geometry): %ux%u -> blob %ux%u, %zu bytes, hdr %02X%02X",
-                  w, h, blobW, blobH, jpegSize, ((uint8_t*)vaddr)[0], ((uint8_t*)vaddr)[1]);
-            android::GraphicBufferMapper::get().unlock(*out.buffer);
-            return true;
+        if (writeTrailer) {
+            camera3_jpeg_blob_t blob;
+            blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
+            blob.jpeg_size = (uint32_t)jpegSize;
+            memcpy((uint8_t*)vaddr + payloadCapacity, &blob, sizeof(blob));
         }
-        camera3_jpeg_blob_t blob;
-        blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
-        blob.jpeg_size = (uint32_t)jpegSize;
-        memcpy((uint8_t*)vaddr + payloadCapacity, &blob, sizeof(blob));
         uint8_t* jp = (uint8_t*)vaddr;
-        ALOGI("JPEG captured (fan-out): %ux%u -> blob %ux%u, %zu bytes, hdr %02X%02X",
-              w, h, blobW, blobH, jpegSize, jp[0], jp[1]);
+        ALOGI("JPEG captured: %ux%u -> blob %ux%u, %zu bytes, hdr %02X%02X, trailer %s",
+              w, h, blobW, blobH, jpegSize, jp[0], jp[1],
+              writeTrailer ? "yes" : "no");
         ok = true;
     } else {
         ALOGE("writeJpegToBlob: encode failed %d", ret);
@@ -416,10 +407,18 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
      * 也就是说它把传感器裁成 16:9 再用。我们原来按整块 4:3 报，Aperture 出来的
      * 取景框是 4:3，和 A12 的观感对不上（"画面比例"问题的由来）。
      * 这里 3280/16*9 = 1845，取整到 1845。 */
-    int32_t active_height = (cam.maxResolution == 3280) ? 1845 : 1104;
-    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, active_height}, 4);
+    /* 【2026-11-22 预览与拍照取景不一致】以前把有效阵列报成 16:9（3280x1845），
+     * 但我们所有采集模式都是传感器 4:3 的 1:1 中心裁切（1440x1080 / 2592x1944 /
+     * 3264x2448）。framework 按 16:9 的阵列去算 4:3 的裁切窗口，结果预览被裁成
+     * 中间一小块（看起来像被放大、纹理变成规则纹路），而拍照重建 pipeline 后
+     * 又按整帧出图 —— 两边取景对不上。改成把 4:3 有效区报上去。 */
+    int32_t active_width  = (cam.maxResolution == 3280) ? 3264 : 2624;
+    int32_t active_height = (cam.maxResolution == 3280) ? 2448 : 1956;
+    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE,
+                              (int32_t[]){0, 0, active_width, active_height}, 4);
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PIXEL_ARRAY_SIZE, (int32_t[]){sensor_width, sensor_height}, 2);
-    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE, (int32_t[]){0, 0, sensor_width, active_height}, 4);
+    add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE,
+                              (int32_t[]){0, 0, active_width, active_height}, 4);
 
     // Physical sensor size (required for FOV calculation)
     // 【2026-11-17 修正】原来两路写反了：后摄写 3.676x2.757（那其实是 OV5693
@@ -932,7 +931,8 @@ static int camera_device_initialize(const camera3_device_t *device, const camera
 /* 【2026-11-22】建立/重建采集 pipeline。
  * configureStreams 与高分辨率拍照共用：拍照瞬间切到 2592x1944、拍完再切回预览尺寸，
  * 这样预览能保持 30fps，而照片是真 5MP（不是放大出来的）。 */
-static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h) {
+static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
+                          int inheritExposure = 0, int inheritGain = 0) {
     if (dev->pipeline) {
         mocha::CameraPipeline* old = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         old->close();
@@ -953,6 +953,7 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h) {
     }
 
     mocha::PipelineConfig pipelineConfig;
+    memset(&pipelineConfig, 0, sizeof(pipelineConfig));   /* 新字段不能留随机值 */
     pipelineConfig.width = w;
     pipelineConfig.height = h;
     /* Bayer pattern must match the V4L2 format requested below:
@@ -990,6 +991,9 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h) {
      * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。 */
     pipelineConfig.targetLuma = 0.20f;
     pipelineConfig.digitalGain = 1.0f;
+    /* 高分辨率拍照重建 pipeline 时继承已经收敛的曝光/增益（见 PipelineConfig 注释）。 */
+    pipelineConfig.initialExposure = inheritExposure;
+    pipelineConfig.initialGain = inheritGain;
  
     // Override IMPLEMENTATION_DEFINED to RGBA_8888 (Tegra gralloc allocates
     // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
@@ -1409,15 +1413,15 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
         gAppliedCrop[0], gAppliedCrop[1], gAppliedCrop[2], gAppliedCrop[3]
     };
     if (cropRegion[2] <= 0 || cropRegion[3] <= 0) {
-        cropRegion[2] = (gActiveCameraId == 0) ? 3280 : 2624;
-        cropRegion[3] = (gActiveCameraId == 0) ? 1845 : 1104;
+        cropRegion[2] = (gActiveCameraId == 0) ? 3264 : 2624;
+        cropRegion[3] = (gActiveCameraId == 0) ? 2448 : 1956;
     }
     add_camera_metadata_entry(metadata, ANDROID_SCALER_CROP_REGION, cropRegion, 4);
 
     /* report the zoom ratio that matches the applied crop */
     {
         float reportedZoom = 1.0f;
-        int32_t fullW = (gActiveCameraId == 0) ? 3280 : 2624;
+        int32_t fullW = (gActiveCameraId == 0) ? 3264 : 2624;
         if (cropRegion[2] > 0 && cropRegion[2] < fullW)
             reportedZoom = (float)fullW / (float)cropRegion[2];
         add_camera_metadata_entry(metadata, ANDROID_CONTROL_ZOOM_RATIO, &reportedZoom, 1);
@@ -1786,8 +1790,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
          * onto pipeline pixels and let the ISP sampler do the crop. */
         if (dev->pipeline) {
             mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
-            const int32_t actW = (dev->camera_id == 0) ? 3280 : 2624;
-            const int32_t actH = (dev->camera_id == 0) ? 1845 : 1104;
+            const int32_t actW = (dev->camera_id == 0) ? 3264 : 2624;
+            const int32_t actH = (dev->camera_id == 0) ? 2448 : 1956;
             float zoomRatio = 1.0f;
             if (find_camera_metadata_entry(mutableSettings, ANDROID_CONTROL_ZOOM_RATIO, &entry) == 0 && entry.count > 0) {
                 zoomRatio = entry.data.f[0];
@@ -1959,9 +1963,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 if (a > best) { best = a; wantW = bs->width; wantH = bs->height; }
             }
             if (wantW && wantH) {
-                if (openPipelineAt(dev, wantW, wantH) == 0) {
+                const int keepExp = pipeline->getExposure();
+                const int keepGain = pipeline->getGain();
+                if (openPipelineAt(dev, wantW, wantH, keepExp, keepGain) == 0) {
                     restoreW = pipeW; restoreH = pipeH;
                     pipeW = wantW; pipeH = wantH;
+                    /* openPipelineAt 已经把旧对象 delete 了，必须重新取指针。 */
+                    pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
                     ALOGI("still capture: pipeline switched to %ux%u for the shot", pipeW, pipeH);
                 } else {
                     ALOGE("still capture: switch to %ux%u failed, upscaling instead",
@@ -2084,66 +2092,35 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             if (!dev->temp_rgba) {
                 ALOGE("Failed to allocate temp RGBA buffer");
             } else {
-                /* 单流拍照：采集尺寸不够 BLOB 大时先切上去，拍完切回。 */
+                /* 单流拍照（Aperture/CameraX 就是这种：BLOB 单独一个请求）：
+                 * 采集尺寸不够 BLOB 大时先切上去，丢几帧喂 3A，取帧，拍完切回。
+                 * 写 JPEG 走 writeJpegToBlob（图像几何 lock、不写尾标），与多流路径一致。 */
                 const uint32_t keepW = dev->pipeline_width, keepH = dev->pipeline_height;
-                const bool switched = (blobW * blobH > keepW * keepH) &&
-                        (openPipelineAt(dev, blobW, blobH) == 0);
-                int captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
-                        blobW, blobH);
+                bool switched = false;
+                if (blobW * blobH > keepW * keepH) {
+                    const int keepExp0 = pipeline->getExposure();
+                    const int keepGain0 = pipeline->getGain();
+                    if (openPipelineAt(dev, blobW, blobH, keepExp0, keepGain0) == 0) {
+                        switched = true;
+                        pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
+                        ALOGI("still capture: pipeline switched to %ux%u for the shot", blobW, blobH);
+                        for (int warm = 0; warm < 5; warm++)
+                            (void)pipeline->captureFrameRgba(dev->temp_rgba, blobW, blobH);
+                    } else {
+                        ALOGE("still capture: switch to %ux%u failed, upscaling", blobW, blobH);
+                    }
+                }
+                int captureRet = pipeline->captureFrameRgba(dev->temp_rgba, blobW, blobH);
                 if (switched) {
                     if (openPipelineAt(dev, keepW, keepH) != 0)
                         ALOGE("still capture: restore to %ux%u failed", keepW, keepH);
                 }
                 if (captureRet == 0) {
-                    /* BLOB 缓冲由 framework 按 (字节容量, 1) 分配，锁的时候必须
-                     * 用同样的尺寸，否则部分 gralloc 会按 1280x720 算出别的 stride。 */
-                    const size_t blobCapacity = kMaxJpegSize;
-                    const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
-                    const android::Rect blobRect((int)blobCapacity, 1);
-                    int ret = android::GraphicBufferMapper::get().lock(handle,
-                                   GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr);
-                    if (ret == 0 && vaddr) {
-                        /* Initialize JPEG encoder */
-                        if (!dev->jpeg_encoder) {
-                            dev->jpeg_encoder = new mocha::JpegEncoder();
-                        }
-                        /* Encode RGBA to JPEG at the BLOB resolution */
-                        size_t jpegSize = 0;
-                        ret = dev->jpeg_encoder->encodeRGBA(dev->temp_rgba,
-                                                              blobW, blobH,
-                                                              90, (uint8_t*)vaddr, payloadCapacity, &jpegSize);
-                        if (ret == 0 && jpegSize > 0) {
-                            /* 尾标必须写在缓冲最后 8 字节：framework 会从
-                             * getWidth()-sizeof(camera3_jpeg_blob_t) 处读它，
-                             * 再转成 AIDL 的 CameraBlob 头交给 App。 */
-                            camera3_jpeg_blob_t blob;
-                            blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
-                            blob.jpeg_size = (uint32_t)jpegSize;
-                            uint8_t* blobPtr = (uint8_t*)vaddr + payloadCapacity;
-                            memcpy(blobPtr, &blob, sizeof(blob));
-                            frameCaptured = true;
-                            ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d capacity=%zu -> %zu bytes",
-                                  dev->pipeline_width, dev->pipeline_height,
-                                  blobW, blobH, blobCapacity, jpegSize);
-                            /* 诊断：framework 报 "Could not find start of JPEG marker"
-                             * 时，用它判断是我们写错了位置还是它找错了偏移。 */
-                            {
-                                uint8_t* jp = (uint8_t*)vaddr;
-                                ALOGI("JPEG bytes[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X"
-                                      " (expect FFD8FF..)", jp[0], jp[1], jp[2], jp[3],
-                                      jp[4], jp[5], jp[6], jp[7]);
-                                ALOGI("JPEG tail[%zu-8..]: %02X %02X %02X %02X",
-                                      payloadCapacity,
-                                      jp[payloadCapacity], jp[payloadCapacity + 4],
-                                      jp[payloadCapacity + 5], jp[payloadCapacity + 6]);
-                            }
-                        } else {
-                            ALOGE("JPEG encode failed: %d", ret);
-                        }
-                        android::GraphicBufferMapper::get().unlock(handle);
-                    } else {
-                        ALOGE("Failed to lock BLOB buffer: %d", ret);
-                    }
+                    camera3_stream_buffer_t blobBuf;
+                    memset(&blobBuf, 0, sizeof(blobBuf));
+                    blobBuf.buffer = buf.buffer;
+                    blobBuf.stream = buf.stream;
+                    frameCaptured = writeJpegToBlob(dev, blobBuf, dev->temp_rgba, blobW, blobH);
                 } else if (captureRet == -EAGAIN) {
                     if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
                     return -EAGAIN;

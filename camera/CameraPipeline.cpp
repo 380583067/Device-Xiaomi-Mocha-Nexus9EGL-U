@@ -332,6 +332,8 @@ int CameraPipeline::startStreaming() {
     if (ioctl(mFd, VIDIOC_STREAMON, &type) < 0) return -errno;
 
     /* Set initial exposure/gain AFTER streaming starts (sensor must be powered) */
+    if (mConfig.initialExposure > 0) mCurrentExposure = mConfig.initialExposure;
+    if (mConfig.initialGain > 0) mCurrentGain = mConfig.initialGain;
     setExposure(mCurrentExposure);
     setGain(mCurrentGain);
     ALOGI("Initial exposure=%d gain=%d", mCurrentExposure, mCurrentGain);
@@ -381,8 +383,22 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     float avgLuma = (float)sum / count / 255.0f;
     float target = mConfig.targetLuma;
 
+    /* 【2026-11-22 闪烁】原来每帧都按 target/avg 直接乘上去，没有死区也没有步长
+     * 限制：曝光档一过冲就反向往回跳，画面肉眼可见地忽明忽暗（用户实测）。
+     * 现在改成"比例控制 + 死区"：
+     *   - 偏差在 ±12% 以内完全不动（挡掉量化噪声与档位抖动）；
+     *   - 每次只走 60% 的差距，且单帧最多 1.33×/0.75×，保证单调收敛不过冲。 */
+    if (avgLuma > target * 0.88f && avgLuma < target * 1.12f) {
+        return;
+    }
     float ratio = target / (avgLuma > 0.001f ? avgLuma : 0.001f);
-    ratio = (ratio < 0.25f) ? 0.25f : (ratio > 8.0f) ? 8.0f : ratio;
+    if (ratio > 1.0f) {
+        ratio = 1.0f + (ratio - 1.0f) * 0.6f;
+        if (ratio > 1.33f) ratio = 1.33f;
+    } else {
+        ratio = 1.0f - (1.0f - ratio) * 0.6f;
+        if (ratio < 0.75f) ratio = 0.75f;
+    }
 
     /* Sensor caps: imx179 allows exposure 1..2500 lines and gain 0..255
      * (v4l2_ctrl_new_std in imx179.c). The old caps (2000/120) saturated on
