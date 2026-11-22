@@ -161,11 +161,56 @@ struct mocha_camera_device_t {
     mocha::JpegEncoder* jpeg_encoder;
     uint8_t* temp_rgba;
     uint32_t temp_rgba_size;
+    /* 第二块临时缓冲：多流请求里 BLOB 的尺寸往往和 pipeline 不同，需要先把
+     * pipeline 分辨率的帧裁切缩放到 BLOB 尺寸再编码 JPEG。 */
+    uint8_t* temp_jpeg_rgba;
+    uint32_t temp_jpeg_size;
 
     uint8_t af_mode;
     uint8_t af_trigger;
     bool af_trigger_handled;
 };
+
+/* 把一幅 RGBA 编码成 JPEG 写进 BLOB 流缓冲（含末尾 8 字节 camera3_jpeg_blob 尾标）。
+ * 【2026-11-22】拍照真正的坑在这里：请求里同时有预览流和 JPEG 流时，旧代码只把
+ * "采集目标流"（RGBA 预览）写满，BLOB 那条被当成次要流跳过 —— framework 的
+ * Camera2-JpegProcessor 扫不到 SOI 标记（"Could not find start of JPEG marker"），
+ * App 最后把整块 4MB 空白缓冲当图片存了下来。现在 BLOB 统一在这里单独编码。 */
+static bool writeJpegToBlob(mocha_camera_device_t* dev,
+                            const camera3_stream_buffer_t& out,
+                            const uint8_t* rgba, uint32_t w, uint32_t h) {
+    if (!dev || !out.buffer || !out.stream || !rgba) return false;
+    const uint32_t blobW = out.stream->width;
+    const uint32_t blobH = out.stream->height;
+    const size_t blobCapacity = jpegBufferCapacity(blobW, blobH);
+    const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
+    const android::Rect blobRect((int)blobCapacity, 1);
+    void* vaddr = nullptr;
+    if (android::GraphicBufferMapper::get().lock(*out.buffer,
+                GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr) != 0 || !vaddr) {
+        ALOGE("writeJpegToBlob: BLOB buffer not lockable");
+        return false;
+    }
+    if (!dev->jpeg_encoder) dev->jpeg_encoder = new mocha::JpegEncoder();
+    size_t jpegSize = 0;
+    int ret = dev->jpeg_encoder->encodeRGBA(rgba, (int)w, (int)h, 90,
+                                           (uint8_t*)vaddr, payloadCapacity, &jpegSize);
+    bool ok = false;
+    if (ret == 0 && jpegSize > 0) {
+        camera3_jpeg_blob_t blob;
+        blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
+        blob.jpeg_size = (uint32_t)jpegSize;
+        memcpy((uint8_t*)vaddr + payloadCapacity, &blob, sizeof(blob));
+        uint8_t* jp = (uint8_t*)vaddr;
+        ALOGI("JPEG captured (fan-out): %ux%u -> blob %ux%u, %zu bytes, hdr %02X%02X",
+              w, h, blobW, blobH, jpegSize, jp[0], jp[1]);
+        ok = true;
+    } else {
+        ALOGE("writeJpegToBlob: encode failed %d", ret);
+    }
+    android::GraphicBufferMapper::get().unlock(*out.buffer);
+    return ok;
+}
 
 // Initialize static camera characteristics
 static camera_metadata_t* init_static_characteristics(int cameraId) {
@@ -985,6 +1030,20 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
     /* 每次 configure 前清空编码器流登记，避免上次会话的悬空指针。 */
     for (int k = 0; k < 4; k++) gEncoderStreams[k] = nullptr;
+    /* 【2026-11-22 拍照落盘】所有输出流都补 GRALLOC_USAGE_SW_WRITE_OFTEN：
+     * BLOB 缓冲是 HAL 用 CPU 直接写 JPEG 的，缺这个 usage 时 vendor gralloc
+     * 分配出来的映射不保证可写，写完之后 App 侧再 lock 会一直
+     * "AcquireBufferLock timed out ... LockState -1"（拍照存不下来、最后 ANR）。
+     * 参考 Dargons10 的 lineage-19.1 设备树，它对每条流都加了这一位。 */
+    for (uint32_t i = 0; i < config->num_streams; i++) {
+        camera3_stream_t *stream = config->streams[i];
+        if (stream->stream_type != CAMERA3_STREAM_OUTPUT) continue;
+        stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
+        /* Tegra gralloc 只对相机分配放行 flexible YUV，缺这位会 EINVAL。 */
+        if (stream->format == HAL_PIXEL_FORMAT_YCbCr_420_888) {
+            stream->usage |= GRALLOC_USAGE_HW_CAMERA_WRITE;
+        }
+    }
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type == CAMERA3_STREAM_OUTPUT &&
@@ -1769,7 +1828,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             }
         }
     }
-    if (dev->pipeline && dev->streams_configured && aspectMismatch) {
+    /* 带 BLOB 且不止一条输出流时也必须走这条路：否则 BLOB 会像以前那样被跳过
+     * （预览流被写满、JPEG 流一直是空白缓冲）。 */
+    const bool blobFanOut = hasBlobStream && request->num_output_buffers > 1;
+    if (dev->pipeline && dev->streams_configured && (aspectMismatch || blobFanOut)) {
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (pipeline->getState() == mocha::PIPELINE_OPENED) {
             ALOGI("process_capture_request: pipeline in OPENED state, re-starting streaming");
@@ -1798,7 +1860,26 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             for (uint32_t i = 0; i < request->num_output_buffers; i++) {
                 const camera3_stream_buffer_t& out = request->output_buffers[i];
                 const camera3_stream_t* s = out.stream;
-                if (!s || !out.buffer || s->format == HAL_PIXEL_FORMAT_BLOB) continue;
+                if (!s || !out.buffer) continue;
+                if (s->format == HAL_PIXEL_FORMAT_BLOB) {
+                    const uint32_t bw = s->width, bh = s->height;
+                    const uint32_t need = bw * bh * 4;
+                    if (!dev->temp_jpeg_rgba || dev->temp_jpeg_size < need) {
+                        if (dev->temp_jpeg_rgba) free(dev->temp_jpeg_rgba);
+                        dev->temp_jpeg_rgba = (uint8_t*)malloc(need);
+                        dev->temp_jpeg_size = need;
+                    }
+                    if (dev->temp_jpeg_rgba) {
+                        scaleRgbaNearest(dev->temp_rgba, (int)pipeW, (int)pipeH,
+                                         dev->temp_jpeg_rgba, (int)bw, (int)bh);
+                        if (!writeJpegToBlob(dev, out, dev->temp_jpeg_rgba, bw, bh))
+                            allOk = false;
+                    } else {
+                        ALOGE("multi-stream: no scratch buffer for JPEG");
+                        allOk = false;
+                    }
+                    continue;
+                }
                 if (s->format == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
                     s->format == HAL_PIXEL_FORMAT_YV12 || isEncoderStream(s)) {
                     if (!writeYuvFromRgba(&out, dev->temp_rgba, (int)pipeW, (int)pipeH))
@@ -1891,6 +1972,18 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                             ALOGI("JPEG captured: pipeline=%dx%d blob=%dx%d capacity=%zu -> %zu bytes",
                                   dev->pipeline_width, dev->pipeline_height,
                                   blobW, blobH, blobCapacity, jpegSize);
+                            /* 诊断：framework 报 "Could not find start of JPEG marker"
+                             * 时，用它判断是我们写错了位置还是它找错了偏移。 */
+                            {
+                                uint8_t* jp = (uint8_t*)vaddr;
+                                ALOGI("JPEG bytes[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X"
+                                      " (expect FFD8FF..)", jp[0], jp[1], jp[2], jp[3],
+                                      jp[4], jp[5], jp[6], jp[7]);
+                                ALOGI("JPEG tail[%zu-8..]: %02X %02X %02X %02X",
+                                      payloadCapacity,
+                                      jp[payloadCapacity], jp[payloadCapacity + 4],
+                                      jp[payloadCapacity + 5], jp[payloadCapacity + 6]);
+                            }
                         } else {
                             ALOGE("JPEG encode failed: %d", ret);
                         }
