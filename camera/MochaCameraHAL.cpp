@@ -1834,13 +1834,20 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
     if (frameFlushed) {
         ALOGW("Frame %u was flushed during capture, sending result with ERROR status", frameNum);
     } else if (!frameCaptured) {
-        ALOGW("Frame %u not captured, sending result with ERROR status", frameNum);
+        /* Recoverable failure: the first requests after STREAMON race the
+         * VI capture thread's lazy sensor start (power + init regs + s_stream
+         * takes ~150ms on the first DQBUF), and DQBUF fails immediately
+         * during that window. CAMERA3_MSG_ERROR_DEVICE is fatal - the
+         * framework tears the camera down and the app exits - so report a
+         * per-frame REQUEST error instead, which the framework simply
+         * drops and retries on the next request. */
+        ALOGW("Frame %u not captured, sending result with REQUEST error", frameNum);
         if (dev->callback_ops && dev->callback_ops->notify) {
             camera3_notify_msg_t notifyMsg;
             memset(&notifyMsg, 0, sizeof(notifyMsg));
             notifyMsg.type = CAMERA3_MSG_ERROR;
             notifyMsg.message.error.frame_number = request->frame_number;
-            notifyMsg.message.error.error_code = CAMERA3_MSG_ERROR_DEVICE;
+            notifyMsg.message.error.error_code = CAMERA3_MSG_ERROR_REQUEST;
             dev->callback_ops->notify(dev->callback_ops, &notifyMsg);
         }
     }
