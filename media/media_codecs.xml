@@ -186,6 +186,23 @@ Only the three quirks included above are recognized at this point:
         <MediaCodec name="c2.android.opus.decoder" update="true" rank="768" />
     </Decoders>
 
+    <!-- The Codec2 software VIDEO decoders are healthy (unlike the audio ones)
+         and handle 10-bit HEVC correctly, which OMX.google.hevc does not: its
+         SoftwareRenderer fails lockYCbCr with ENOSYS on 10-bit YUV and falls
+         back to an 8-bit YV12 layout, rendering near-black. Give them the top
+         rank so video prefers C2 over OMX.google (property sw-other rank 100)
+         and OMX.Nvidia (0x300). Audio stays OMX-first via the block above.
+         Decimal rank on purpose: the parser uses sscanf("%u"). -->
+    <Decoders>
+        <MediaCodec name="c2.android.avc.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.hevc.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.vp8.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.vp9.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.mpeg4.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.h263.decoder" update="true" rank="8" />
+        <MediaCodec name="c2.android.av1.decoder" update="true" rank="8" />
+    </Decoders>
+
     <Include href="media_codecs_google_audio.xml" />
     <Include href="media_codecs_google_video.xml" />
 </MediaCodecs>
