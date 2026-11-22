@@ -390,7 +390,13 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
      * 一块大黑边。这里补 1440x1080（4:3）—— 竖屏旋转后正好 3:4，铺满屏幕。
      * 采集仍然走 1920x1080 的 16:9 全幅，4:3 输出由 cropScaleRgba 做
      * 居中裁切（见 CameraPipeline.cpp），不拉伸、不变形。 */
-    int32_t configs[] = {
+    /* 【2026-11-22 分相机尺寸表】前后摄的传感器模式表不同：
+     *   后摄 IMX179（8MP）：720p/1440x1080(4:3)/1080p/1920x1440/5MP/8MP；
+     *   前摄 OV5693（5MP）：720p/1080p/5MP（驱动 ov5693_s_stream 现在会按
+     *   请求尺寸编程读出窗口，见 ov5693.c）。
+     * 前摄不公布它传感器没有的尺寸（3264x2448 / 1920x1440 / 1440x1080），
+     * 否则 App 选了就走进 VI 超时 → TPG。 */
+    static const int32_t rear_configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, CAMERA3_STREAM_OUTPUT,
@@ -401,18 +407,11 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
-        /* 【2026-11-22 高分辨率】传感器模式表里本来就有 1920x1440(2.8MP) 与
-         * 2592x1944(5MP)，之前只为 1080p 开了 BLOB。这里补上，让 App 能选。
-         * 5MP 走"拍照瞬间把 pipeline 切到 2592x1944、拍完切回"的方式（见
-         * process_capture_request），预览仍是 1440/1920 的快尺寸。 */
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, CAMERA3_STREAM_OUTPUT,
     };
-    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, configs, sizeof(configs)/sizeof(int32_t));
-
-    // Available min frame durations
-    int64_t durations[] = {
+    static const int64_t rear_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 33333333LL,
@@ -427,11 +426,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, 33333333LL,
     };
-    int ret = add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, durations, sizeof(durations)/sizeof(int64_t));
-    ALOGI("DEBUG: Added min frame durations, ret=%d", ret);
-
-    // Available stall durations (format, width, height, stall_ns)
-    int64_t stall_durations[] = {
+    static const int64_t rear_stall_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 0,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 0,
@@ -446,18 +441,12 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, 100000000LL,
     };
-    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, stall_durations, sizeof(stall_durations)/sizeof(int64_t));
-
-    // Available processed sizes
-    int32_t processed_sizes[] = {
+    static const int32_t rear_processed_sizes[] = {
         1280, 720,
         1440, 1080,
         1920, 1080,
     };
-    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES, processed_sizes, sizeof(processed_sizes)/sizeof(int32_t));
-
-    // Available JPEG sizes
-    int32_t jpeg_sizes[] = {
+    static const int32_t rear_jpeg_sizes[] = {
         1280, 720,
         1440, 1080,
         1920, 1080,
@@ -465,7 +454,69 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         2592, 1944,
         3264, 2448,
     };
-    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_JPEG_SIZES, jpeg_sizes, sizeof(jpeg_sizes)/sizeof(int32_t));
+
+    /* 前摄：只公布 OV5693 真正支持的尺寸。 */
+    static const int32_t front_configs[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, CAMERA3_STREAM_OUTPUT,
+    };
+    static const int64_t front_durations[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 33333333LL,
+    };
+    static const int64_t front_stall_durations[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
+        HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
+        HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 100000000LL,
+    };
+    static const int32_t front_processed_sizes[] = {
+        1280, 720,
+        1920, 1080,
+    };
+    static const int32_t front_jpeg_sizes[] = {
+        1280, 720,
+        1920, 1080,
+        2592, 1944,
+    };
+
+    const bool isFront = (cameraId == 1);
+    const int32_t* configs         = isFront ? front_configs         : rear_configs;
+    const int64_t* durations       = isFront ? front_durations       : rear_durations;
+    const int64_t* stall_durations = isFront ? front_stall_durations : rear_stall_durations;
+    const int32_t* processed_sizes = isFront ? front_processed_sizes : rear_processed_sizes;
+    const int32_t* jpeg_sizes      = isFront ? front_jpeg_sizes      : rear_jpeg_sizes;
+    const size_t nConfigs   = isFront ? sizeof(front_configs)/sizeof(int32_t)         : sizeof(rear_configs)/sizeof(int32_t);
+    const size_t nDurations = isFront ? sizeof(front_durations)/sizeof(int64_t)       : sizeof(rear_durations)/sizeof(int64_t);
+    const size_t nStall     = isFront ? sizeof(front_stall_durations)/sizeof(int64_t) : sizeof(rear_stall_durations)/sizeof(int64_t);
+    const size_t nProcessed = isFront ? sizeof(front_processed_sizes)/sizeof(int32_t) : sizeof(rear_processed_sizes)/sizeof(int32_t);
+    const size_t nJpeg      = isFront ? sizeof(front_jpeg_sizes)/sizeof(int32_t)      : sizeof(rear_jpeg_sizes)/sizeof(int32_t);
+
+    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+                              configs, nConfigs);
+
+    int ret = add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
+                              durations, nDurations);
+    ALOGI("DEBUG: Added min frame durations, ret=%d", ret);
+
+    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS,
+                              stall_durations, nStall);
+
+    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES,
+                              processed_sizes, nProcessed);
+
+    add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_JPEG_SIZES,
+                              jpeg_sizes, nJpeg);
 
     // Max digital zoom
     float max_digital_zoom = 4.0f;
@@ -1194,7 +1245,7 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      * uses 4 lanes (CSI-A) and does 1080p natively. Anything bigger is also
      * capped: 1080p is the sweet spot of the 1:1 readout at 30fps. */
     const uint32_t kMaxArea = (dev->camera_id == 0) ? (2592u * 1944u)
-                                                    : (1280u * 720u);
+                                                    : (2592u * 1944u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
     /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
@@ -1258,8 +1309,14 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type != CAMERA3_STREAM_OUTPUT) continue;
         stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
-        /* Tegra gralloc 只对相机分配放行 flexible YUV，缺这位会 EINVAL。 */
-        if (stream->format == HAL_PIXEL_FORMAT_YCbCr_420_888) {
+        /* Tegra gralloc 只对相机分配放行 flexible YUV，缺这位会 EINVAL。
+         * 【2026-11-22 录像 0 帧】编码器输入流被我们改成了 YV12，但只给
+         * YCbCr_420_888 加了 HW_CAMERA_WRITE —— YV12 的分配被 gralloc 拒绝，
+         * framework dequeue 一直 -EINVAL（Camera3-OutputStream: Stream 2:
+         * Can't dequeue next output buffer: Invalid argument），MediaRecorder
+         * 永远等不到视频关键帧。给 YV12 也加上。 */
+        if (stream->format == HAL_PIXEL_FORMAT_YCbCr_420_888 ||
+            stream->format == HAL_PIXEL_FORMAT_YV12) {
             stream->usage |= GRALLOC_USAGE_HW_CAMERA_WRITE;
         }
     }
@@ -1280,8 +1337,18 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
                  * 即 **vendor gralloc1 不支持 YCbCr_420_888 + HW_VIDEO_ENCODER** 这个组合，
                  * 编码器输入缓冲根本分配不出来。改用 YV12 —— 老 NVIDIA 相机/编码路径
                  * 一直支持的格式，我们的 fan-out 也有 YV12 铺平面的兜底分支。 */
-                stream->format = HAL_PIXEL_FORMAT_YV12;
+                /* 【2026-11-22】YV12 无论如何配 usage 都被 vendor gralloc 拒绝
+                 * （dequeue -22）。回到 YCbCr_420_888：11-18 失败的是
+                 * YCbCr + HW_VIDEO_ENCODER 组合，现在 HW_VIDEO_ENCODER 已剥掉，
+                 * 分配走的是 flexible YUV + 相机写路径（shim 有放行逻辑）。 */
+                stream->format = HAL_PIXEL_FORMAT_YCbCr_420_888;
                 stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
+                /* 【2026-11-22 录像 0 帧】YV12 + HW_VIDEO_ENCODER 的组合被 vendor
+                 * gralloc 拒绝（dequeue 一直 -EINVAL，MediaRecorder 等不到视频
+                 * 关键帧，连 OpenCamera/MediaRecorder 都 0 产出）。这个位只是
+                 * 分配建议——缓冲是 HAL 用 CPU 写、编码器用 GPU/硬件读，去掉它
+                 * 分配就能过。 */
+                stream->usage &= ~GRALLOC_USAGE_HW_VIDEO_ENCODER;
                 for (int k = 0; k < 4; k++) {
                     if (gEncoderStreams[k] == nullptr) {
                         gEncoderStreams[k] = stream;
@@ -2031,10 +2098,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             }
         }
     }
-    /* 带 BLOB 且不止一条输出流时也必须走这条路：否则 BLOB 会像以前那样被跳过
-     * （预览流被写满、JPEG 流一直是空白缓冲）。 */
-    const bool blobFanOut = hasBlobStream && request->num_output_buffers > 1;
-    if (dev->pipeline && dev->streams_configured && (aspectMismatch || blobFanOut)) {
+    /* 【2026-11-22 录像无关键帧】只要请求带不止一条输出流就必须走 fan-out：
+     * 录像会话是 预览(RGBA 4:3) + 编码流(YV12) + BLOB 三条流，同尺寸时宽高比
+     * 一致，之前收紧成"仅宽高比不一致才走"后，编码流在单流分支里被完全跳过
+     * → MediaRecorder 永远等不到视频关键帧（OpenCamera/Aperture 录像全都
+     * 0 产出）。aspectMismatch 现在只影响裁切行为（函数内部已各自处理）。 */
+    (void)aspectMismatch;
+    if (dev->pipeline && dev->streams_configured &&
+        request->num_output_buffers > 1) {
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (pipeline->getState() == mocha::PIPELINE_OPENED) {
             ALOGI("process_capture_request: pipeline in OPENED state, re-starting streaming");
