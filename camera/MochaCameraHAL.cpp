@@ -1753,8 +1753,23 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         const uint32_t area = s->width * s->height;
         if (area > maxNonBlobArea) maxNonBlobArea = area;
     }
-    /* 有 BLOB 的请求保持原路径（JPEG 编码在那边），避免影响已能出图的拍照。 */
-    if (dev->pipeline && dev->streams_configured && nonBlobStreams > 1 && !hasBlobStream) {
+    /* 只有各流宽高比不一致时才需要这条路径：那时候「先缩进预览、再放大到编码流」
+     * 会把画面拉变形。两路同比例（录像的常见情况）直接用零拷贝直写更省、
+     * 也不会碰 CameraX 的 GL 输出面（实测多流 SW 写入会诱发 libglcore 崩溃）。 */
+    bool aspectMismatch = false;
+    if (!hasBlobStream && nonBlobStreams > 1 && captureBuf->stream) {
+        const uint64_t refW = captureBuf->stream->width;
+        const uint64_t refH = captureBuf->stream->height;
+        for (uint32_t i = 0; i < request->num_output_buffers; i++) {
+            const camera3_stream_t* s = request->output_buffers[i].stream;
+            if (!s || s->format == HAL_PIXEL_FORMAT_BLOB) continue;
+            if ((uint64_t)s->width * refH != refW * (uint64_t)s->height) {
+                aspectMismatch = true;
+                break;
+            }
+        }
+    }
+    if (dev->pipeline && dev->streams_configured && aspectMismatch) {
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (pipeline->getState() == mocha::PIPELINE_OPENED) {
             ALOGI("process_capture_request: pipeline in OPENED state, re-starting streaming");
