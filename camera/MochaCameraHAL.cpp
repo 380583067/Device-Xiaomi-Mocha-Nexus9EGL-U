@@ -94,6 +94,11 @@ static camera_metadata_t* gCameraCharacteristics[2] = { nullptr, nullptr };
  * 的赋值处 camera_device_open）。默认 0 = 后摄。 */
 static int gActiveCameraId = 0;
 
+/* Digital zoom: the crop actually applied to the last frame, in
+ * active-array coordinates (what the framework reads back via
+ * ANDROID_SCALER_CROP_REGION). Full frame by default. */
+static int32_t gAppliedCrop[4] = {0, 0, 0, 0};
+
 /* 【2026-11-18 录像方案1】编码器输入流标记。
  *
  * 之前是把这条流的 format 改写成 YCbCr_420_888，让拷贝路径走 YUV；但那样
@@ -246,6 +251,11 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     float max_digital_zoom = 4.0f;
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, &max_digital_zoom, 1);
 
+    // Android 12 zoomRatio control (CameraX maps pinch-zoom onto this)
+    float zoom_ratio_range[] = { 1.0f, max_digital_zoom };
+    add_camera_metadata_entry(metadata, ANDROID_CONTROL_ZOOM_RATIO_RANGE,
+                              zoom_ratio_range, 2);
+
     // Request max pipeline depth (removed - not available in 8.1)
     
     // Flash available
@@ -316,6 +326,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         ANDROID_JPEG_QUALITY,
         ANDROID_LENS_FOCUS_DISTANCE,
         ANDROID_NOISE_REDUCTION_MODE,
+        ANDROID_CONTROL_ZOOM_RATIO,
         ANDROID_REQUEST_ID,
         ANDROID_SCALER_CROP_REGION,
         ANDROID_SENSOR_FRAME_DURATION,
@@ -334,6 +345,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         ANDROID_CONTROL_AWB_MODE,
         ANDROID_CONTROL_AWB_STATE,
         ANDROID_CONTROL_MODE,
+        ANDROID_CONTROL_ZOOM_RATIO,
         ANDROID_FLASH_MODE,
         ANDROID_JPEG_QUALITY,
         ANDROID_LENS_FOCUS_DISTANCE,
@@ -827,14 +839,40 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     // If we found RGBA/IMPLEMENTATION_DEFINED, use that as pipeline stream
     if (rgbaStream) pipelineStream = rgbaStream;
 
+    /* Pipeline resolution = the largest stream the framework asked for
+     * (preview, video encoder, JPEG BLOB, analysis). The imx179/ov5693
+     * kernels program a 1:1 centered crop window for whatever size is
+     * requested, so capturing at the highest resolution costs nothing
+     * extra and every output just downscales - this is what makes stills
+     * sharp instead of a 720p capture upscaled to 1080p. */
+    uint32_t pipeW = pipelineStream->width, pipeH = pipelineStream->height;
+    uint32_t pipeArea = pipeW * pipeH;
+    for (uint32_t i = 0; i < config->num_streams; i++) {
+        camera3_stream_t *s = config->streams[i];
+        if (s->stream_type != CAMERA3_STREAM_OUTPUT) continue;
+        uint32_t area = s->width * s->height;
+        if (area > pipeArea) { pipeArea = area; pipeW = s->width; pipeH = s->height; }
+    }
+    /* CSI link bandwidth caps, measured on hardware: the OV5693 streams over
+     * a SINGLE lane (CSI-E) - asking it for 1080p makes VI capture time out
+     * (-110) and the channel falls back to the TPG test pattern. The IMX179
+     * uses 4 lanes (CSI-A) and does 1080p natively. Anything bigger is also
+     * capped: 1080p is the sweet spot of the 1:1 readout at 30fps. */
+    const uint32_t kMaxArea = (dev->camera_id == 0) ? (1920u * 1080u)
+                                                    : (1280u * 720u);
+    if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
+        if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
+    ALOGI("Pipeline resolution: %ux%u (from %ux%u stream)",
+          pipeW, pipeH, pipelineStream->width, pipelineStream->height);
+
     // Early exit if same resolution - avoids costly STREAMOFF/STREAMON cycle
-    if (dev->last_config_width == pipelineStream->width &&
-        dev->last_config_height == pipelineStream->height &&
+    if (dev->last_config_width == pipeW &&
+        dev->last_config_height == pipeH &&
         dev->streams_configured && dev->pipeline) {
         mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (p->getState() == mocha::PIPELINE_STREAMING) {
             ALOGI("configureStreams: same %ux%u capture as last - no-op reinit",
-                  pipelineStream->width, pipelineStream->height);
+                  pipeW, pipeH);
             return 0;
         }
         // NOTE: removed PIPELINE_OPENED early exit - sensor can get into bad state,
@@ -887,12 +925,13 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     }
 
     mocha::PipelineConfig pipelineConfig;
-    pipelineConfig.width = pipelineStream->width;
-    pipelineConfig.height = pipelineStream->height;
-    /* DEBUG: Probando BGGR para IMX179 (commented code usaba BGGR(1,1) y daba colores).
-       El sensor podría ser BGGR pese a que la V4L2 driver dice SRGGB.
-       Usar identidad WB para ver línea base, luego ajustar. */
-    pipelineConfig.bayerPattern = 3;  // RGGB correcto
+    pipelineConfig.width = pipeW;
+    pipelineConfig.height = pipeH;
+    /* Bayer pattern must match the V4L2 format requested below:
+     * camera 0 (IMX179) uses SRGGB10 -> RGGB (pat 3); camera 1 (OV5693)
+     * uses SBGGR10 -> BGGR (pat 2). Sharing one value gave the front
+     * camera a strong green cast (G/B channels swapped). */
+    pipelineConfig.bayerPattern = (dev->camera_id == 0) ? 3 : 1;
     pipelineConfig.offset_x = 0;
     pipelineConfig.offset_y = 0;
     pipelineConfig.flipV = false;  // IMX179 mount normal; framework handles rotation
@@ -986,10 +1025,10 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
 
     dev->pipeline = pipeline;
     dev->output_stream = outputStream;
-    dev->pipeline_width = pipelineStream->width;
-    dev->pipeline_height = pipelineStream->height;
-    dev->last_config_width = pipelineStream->width;
-    dev->last_config_height = pipelineStream->height;
+    dev->pipeline_width = pipeW;
+    dev->pipeline_height = pipeH;
+    dev->last_config_width = pipeW;
+    dev->last_config_height = pipeH;
 
     dev->streams_configured = true;
     ALOGI("Streams configured successfully: pipeline=%dx%d preview=%dx%d BLOB=%s", 
@@ -1181,10 +1220,23 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
 
     /* ANDROID_SCALER_CROP_REGION - full active array (16:9, see init_static_characteristics) */
     /* 【2026-11-18】原来硬编码 3280x2464（4:3），前摄也照抄；现在跟随 16:9 有效阵列。 */
-    int32_t crop_w = (gActiveCameraId == 0) ? 3280 : 2624;
-    int32_t crop_h = (gActiveCameraId == 0) ? 1845 : 1104;
-    int32_t cropRegion[] = {0, 0, crop_w, crop_h};
+    int32_t cropRegion[4] = {
+        gAppliedCrop[0], gAppliedCrop[1], gAppliedCrop[2], gAppliedCrop[3]
+    };
+    if (cropRegion[2] <= 0 || cropRegion[3] <= 0) {
+        cropRegion[2] = (gActiveCameraId == 0) ? 3280 : 2624;
+        cropRegion[3] = (gActiveCameraId == 0) ? 1845 : 1104;
+    }
     add_camera_metadata_entry(metadata, ANDROID_SCALER_CROP_REGION, cropRegion, 4);
+
+    /* report the zoom ratio that matches the applied crop */
+    {
+        float reportedZoom = 1.0f;
+        int32_t fullW = (gActiveCameraId == 0) ? 3280 : 2624;
+        if (cropRegion[2] > 0 && cropRegion[2] < fullW)
+            reportedZoom = (float)fullW / (float)cropRegion[2];
+        add_camera_metadata_entry(metadata, ANDROID_CONTROL_ZOOM_RATIO, &reportedZoom, 1);
+    }
 
     /* ANDROID_SENSOR_EXPOSURE_TIME (ns) */
     int64_t expTimeNs = (int64_t)exposureVal * 1000LL;
@@ -1469,6 +1521,45 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             focusDist = entry.data.f[0];
         }
         ALOGI("AF request: mode=%d trigger=%d focusDist=%.2f", dev->af_mode, dev->af_trigger, focusDist);
+
+        /* Digital zoom: honour both the classic SCALER_CROP_REGION and the
+         * Android 12 CONTROL_ZOOM_RATIO. The active array is 16:9
+         * (3280x1845 rear / 2624x1104 front); map the effective window
+         * onto pipeline pixels and let the ISP sampler do the crop. */
+        if (dev->pipeline) {
+            mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
+            const int32_t actW = (dev->camera_id == 0) ? 3280 : 2624;
+            const int32_t actH = (dev->camera_id == 0) ? 1845 : 1104;
+            float zoomRatio = 1.0f;
+            if (find_camera_metadata_entry(mutableSettings, ANDROID_CONTROL_ZOOM_RATIO, &entry) == 0 && entry.count > 0) {
+                zoomRatio = entry.data.f[0];
+                if (zoomRatio < 1.0f) zoomRatio = 1.0f;
+                if (zoomRatio > 4.0f) zoomRatio = 4.0f;
+            }
+            int32_t cx = 0, cy = 0, cw = actW, ch = actH;
+            if (zoomRatio > 1.0f) {
+                cw = (int32_t)(actW / zoomRatio) & ~1;
+                ch = (int32_t)(actH / zoomRatio) & ~1;
+                cx = (actW - cw) / 2 & ~1;
+                cy = (actH - ch) / 2 & ~1;
+            } else if (find_camera_metadata_entry(mutableSettings, ANDROID_SCALER_CROP_REGION, &entry) == 0 && entry.count >= 4) {
+                cx = entry.data.i32[0]; cy = entry.data.i32[1];
+                cw = entry.data.i32[2]; ch = entry.data.i32[3];
+                if (cw <= 0 || ch <= 0 || cx < 0 || cy < 0) { cx = 0; cy = 0; cw = actW; ch = actH; }
+                if (cw > actW) cw = actW;
+                if (ch > actH) ch = actH;
+                if (cx + cw > actW) cx = actW - cw;
+                if (cy + ch > actH) cy = actH - ch;
+            }
+            /* active-array pixels -> pipeline pixels */
+            int px = (int)((int64_t)cx * dev->pipeline_width / actW);
+            int py = (int)((int64_t)cy * dev->pipeline_height / actH);
+            int pw2 = (int)((int64_t)cw * dev->pipeline_width / actW);
+            int ph2 = (int)((int64_t)ch * dev->pipeline_height / actH);
+            p->setCrop(px, py, pw2, ph2);
+            gAppliedCrop[0] = cx; gAppliedCrop[1] = cy;
+            gAppliedCrop[2] = cw; gAppliedCrop[3] = ch;
+        }
     }
 
     // 【2026-11-17 修正】前摄 OV5693 定焦、没有 VCM，这里只让后摄走 AF 流程。
@@ -1581,7 +1672,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             if (!dev->temp_rgba) {
                 ALOGE("Failed to allocate temp RGBA buffer");
             } else {
-                int captureRet = pipeline->captureFrame(dev->temp_rgba, HAL_PIXEL_FORMAT_RGBA_8888);
+                int captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
+                        dev->pipeline_width, dev->pipeline_height);
                 if (captureRet == 0) {
                     /* BLOB 缓冲由 framework 按 (字节容量, 1) 分配，锁的时候必须
                      * 用同样的尺寸，否则部分 gralloc 会按 1280x720 算出别的 stride。 */
@@ -1629,14 +1721,34 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                     ALOGE("Failed to capture frame for JPEG: %d", captureRet);
                 }
             }
-        } else if (buf.stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) {
+        } else if (buf.stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
+                   buf.stream->format == HAL_PIXEL_FORMAT_YV12) {
             struct android_ycbcr ycbcr;
             memset(&ycbcr, 0, sizeof(ycbcr));
             const android::Rect yuvRect((int)buf.stream->width, (int)buf.stream->height);
             int ret = android::GraphicBufferMapper::get().lockYCbCr(handle,
                                GRALLOC_USAGE_SW_WRITE_OFTEN, yuvRect, &ycbcr);
             if (ret == 0 && ycbcr.y) {
-                int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(ycbcr.y), buf.stream->format);
+                /* Render at the pipeline resolution (with the zoom crop
+                 * applied), then convert/scale into the YUV planes. Same
+                 * conversion the encoder fan-out always used. */
+                uint32_t rgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
+                if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
+                    if (dev->temp_rgba) free(dev->temp_rgba);
+                    dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
+                    dev->temp_rgba_size = rgbaSize;
+                }
+                int captureRet = -ENOMEM;
+                if (dev->temp_rgba) {
+                    captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
+                            dev->pipeline_width, dev->pipeline_height);
+                    if (captureRet == 0) {
+                        rgbaToYuv420Scaled(dev->temp_rgba,
+                                           (int)dev->pipeline_width, (int)dev->pipeline_height,
+                                           (int)buf.stream->width, (int)buf.stream->height,
+                                           &ycbcr);
+                    }
+                }
                 if (captureRet == 0) {
                     frameCaptured = true;
                 } else if (captureRet == -EAGAIN) {
@@ -1651,7 +1763,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             const android::Rect rect((int)buf.stream->width, (int)buf.stream->height);
             int ret = android::GraphicBufferMapper::get().lock(handle, usage, rect, &vaddr);
             if (ret == 0 && vaddr) {
-                int captureRet = pipeline->captureFrame(static_cast<uint8_t*>(vaddr), buf.stream->format);
+                int captureRet = pipeline->captureFrameRgba(static_cast<uint8_t*>(vaddr),
+                        buf.stream->width, buf.stream->height);
                 if (captureRet == 0) {
                     frameCaptured = true;
                 } else if (captureRet == -EAGAIN) {

@@ -25,6 +25,9 @@ CameraPipeline::CameraPipeline()
       mState(PIPELINE_CLOSED),
       mRgbBuffer(nullptr),
       mRgbBufferSize(0),
+      mRgbaFull(nullptr),
+      mRgbaFullSize(0),
+      mCropX(0), mCropY(0), mCropW(0), mCropH(0),
       mStreaming(false),
       mBufferCount(0),
       mCurrentBuffer(0),
@@ -108,6 +111,11 @@ int CameraPipeline::close() {
         mRgbBuffer = nullptr;
         mRgbBufferSize = 0;
     }
+    if (mRgbaFull) {
+        delete[] mRgbaFull;
+        mRgbaFull = nullptr;
+        mRgbaFullSize = 0;
+    }
 
     if (mFd >= 0) {
         ::close(mFd);
@@ -189,6 +197,7 @@ int CameraPipeline::configure(const PipelineConfig& config) {
     }
 
     mConfig = config;
+    mDigitalGain = config.digitalGain;
 
     if (mFd < 0) {
         return -ENODEV;
@@ -286,6 +295,11 @@ int CameraPipeline::configure(const PipelineConfig& config) {
         }
         mRgbBufferSize = config.width * config.height * 3;
         mRgbBuffer = new uint8_t[mRgbBufferSize];
+        mRgbaFullSize = config.width * config.height * 4;
+        mRgbaFull = new uint8_t[mRgbaFullSize];
+        /* full frame by default */
+        mCropX = 0; mCropY = 0;
+        mCropW = config.width; mCropH = config.height;
     }
 
     mHasAwbInit = false;
@@ -370,6 +384,13 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     float ratio = target / (avgLuma > 0.001f ? avgLuma : 0.001f);
     ratio = (ratio < 0.25f) ? 0.25f : (ratio > 8.0f) ? 8.0f : ratio;
 
+    /* Sensor caps: imx179 allows exposure 1..2500 lines and gain 0..255
+     * (v4l2_ctrl_new_std in imx179.c). The old caps (2000/120) saturated on
+     * ordinary indoor scenes and left the frame badly underexposed even
+     * though the sensor still had headroom. */
+    const int kExpMax = 2500;
+    const int kGainMax = 180;
+
     int newExp = (int)(mCurrentExposure * ratio);
     int newGain = mCurrentGain;
 
@@ -381,12 +402,13 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
         /* If gain is high, increase exposure instead */
         newExp = (int)(newExp * (newGain / 100.0f));
         newGain = 100;
-        if (newExp > 2000) newExp = 2000;
+        if (newExp > kExpMax) newExp = kExpMax;
     }
     if (newExp < 10) {
         newExp = 10;
     }
-    if (newGain > 120) newGain = 120;
+    if (newExp > kExpMax) newExp = kExpMax;
+    if (newGain > kGainMax) newGain = kGainMax;
     if (newGain < 1) newGain = 1;
 
     if (newExp != mCurrentExposure || newGain != mCurrentGain) {
@@ -394,6 +416,33 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
         if (newExp != mCurrentExposure) setExposure(newExp);
         ALOGI("AE: luma=%.2f target=%.2f exp=%d(%d) gain=%d(%d)",
               avgLuma, target, newExp, mCurrentExposure, newGain, mCurrentGain);
+    }
+
+    /* Sensor saturated? Push the remaining brightness through software gain.
+     * The prefer-exposure branch caps exposure at 2000 lines, so saturation
+     * means exp==2000 && gain==kGainMax. Ramp mDigitalGain up when luma is
+     * still well below target; back off as soon as luma recovers. Baseline
+     * stays at config.digitalGain (1.5) to avoid permanent noise
+     * amplification in well-lit scenes. */
+    if (mCurrentExposure >= 2000 && mCurrentGain >= kGainMax) {
+        float dg = mDigitalGain;
+        if (avgLuma < target * 0.8f) {
+            float need = target / (avgLuma > 0.05f ? avgLuma : 0.05f);
+            if (need > 2.0f) need = 2.0f;  /* ramp, don't overshoot */
+            dg = dg * need;
+        } else if (avgLuma > target * 1.1f) {
+            dg = dg * 0.8f;
+        }
+        if (dg < mConfig.digitalGain) dg = mConfig.digitalGain;
+        if (dg > 4.0f) dg = 4.0f;
+        if (dg > mDigitalGain * 1.05f || dg < mDigitalGain * 0.95f) {
+            ALOGI("AE saturation: luma=%.2f digitalGain %.2f -> %.2f",
+                  avgLuma, mDigitalGain, dg);
+            mDigitalGain = dg;
+        }
+    } else if (mDigitalGain > mConfig.digitalGain * 1.05f) {
+        /* Exposure headroom returned (scene brightened) - restore baseline */
+        mDigitalGain = mConfig.digitalGain;
     }
 }
 
@@ -466,9 +515,9 @@ static void flipVertical(uint8_t* buf, int width, int height, int bpp) {
     delete[] tmp;
 }
 
-int CameraPipeline::captureFrame(uint8_t* outputBuffer, uint32_t outputFormat) {
+int CameraPipeline::captureFrameInternal(uint8_t* rgbaOutput) {
     if (mState != PIPELINE_STREAMING) return -EINVAL;
-    if (!outputBuffer) return -EINVAL;
+    if (!rgbaOutput) return -EINVAL;
 
     struct pollfd pfd;
     pfd.fd = mFd;
@@ -532,15 +581,145 @@ int CameraPipeline::captureFrame(uint8_t* outputBuffer, uint32_t outputFormat) {
             }
             sDumpCount--;
         }
-        ret = processBayerToYuv(frameBuffer, outputBuffer, outputFormat);
+        ret = processBayerToYuv(frameBuffer, rgbaOutput, HAL_PIXEL_FORMAT_RGBA_8888);
     } else {
-        memcpy(outputBuffer, frameBuffer, frameSize);
+        memcpy(rgbaOutput, frameBuffer, frameSize);
         ret = 0;
     }
 
     if (ioctl(mFd, VIDIOC_QBUF, &buf) < 0) return -errno;
 
     return ret;
+}
+
+int CameraPipeline::captureFrame(uint8_t* outputBuffer, uint32_t outputFormat) {
+    /* Legacy API: RGBA at pipeline resolution, or YUV written directly by
+     * processBayerToYuv when dims match (recording/scan pipelines are
+     * configured at the encoder/analysis resolution). */
+    if (outputFormat == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
+        outputFormat == HAL_PIXEL_FORMAT_YV12) {
+        return captureFrameDirect(outputBuffer, outputFormat);
+    }
+    return captureFrameInternal(outputBuffer);
+}
+
+int CameraPipeline::captureFrameDirect(uint8_t* outputBuffer, uint32_t outputFormat) {
+    if (mState != PIPELINE_STREAMING) return -EINVAL;
+    if (!outputBuffer) return -EINVAL;
+
+    struct pollfd pfd;
+    pfd.fd = mFd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int poll_timeout_ms = 300;
+    int max_retries = 6;
+    int retry_count = 0;
+    int pollRet = 0;
+
+    do {
+        pfd.revents = 0;
+        pollRet = poll(&pfd, 1, poll_timeout_ms);
+        if (pollRet < 0) return -errno;
+        if (pollRet == 0) {
+            retry_count++;
+            if (retry_count >= max_retries) return -EAGAIN;
+            continue;
+        }
+        if (!(pfd.revents & POLLIN)) return -EAGAIN;
+        break;
+    } while (retry_count < max_retries);
+
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    int ret = ioctl(mFd, VIDIOC_DQBUF, &buf);
+    if (ret < 0) {
+        if (errno == EAGAIN) return -EAGAIN;
+        return -errno;
+    }
+
+    if (buf.index >= mBufferCount) return -EINVAL;
+
+    uint8_t* frameBuffer = (uint8_t*)mBuffers[buf.index].start;
+    uint32_t frameSize = buf.bytesused;
+
+    ret = processBayerToYuv(frameBuffer, outputBuffer, outputFormat);
+
+    if (ioctl(mFd, VIDIOC_QBUF, &buf) < 0) return -errno;
+
+    return ret;
+}
+
+/* Nearest-neighbour crop+scale from a full-frame RGBA source. The crop
+ * window (cx,cy,cw,ch) is expressed in source pixels; digital zoom is just
+ * a smaller window scaled up to the output size. */
+static void cropScaleRgba(const uint8_t* src, int sw, int sh,
+                          uint8_t* dst, int dw, int dh,
+                          int cx, int cy, int cw, int ch) {
+    for (int y = 0; y < dh; y++) {
+        int sy = cy + (int)((int64_t)y * ch / dh);
+        if (sy >= sh) sy = sh - 1;
+        const uint32_t* srow = reinterpret_cast<const uint32_t*>(
+                src + (size_t)sy * sw * 4);
+        uint32_t* drow = reinterpret_cast<uint32_t*>(
+                dst + (size_t)y * dw * 4);
+        for (int x = 0; x < dw; x++) {
+            int sx = cx + (int)((int64_t)x * cw / dw);
+            if (sx >= sw) sx = sw - 1;
+            drow[x] = srow[sx];
+        }
+    }
+}
+
+void CameraPipeline::setCrop(int x, int y, int w, int h) {
+    if (mState == PIPELINE_CLOSED) return;
+    if (w <= 0 || h <= 0) return;
+    int W = mConfig.width, H = mConfig.height;
+    /* keep the window inside the frame, even offsets and even size so the
+     * Bayer phase of the sampled region stays consistent */
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w > W) w = W;
+    if (h > H) h = H;
+    if (x + w > W) x = W - w;
+    if (y + h > H) y = H - h;
+    x &= ~1; y &= ~1; w &= ~1; h &= ~1;
+    if (w < 32) w = 32;
+    if (h < 32) h = 32;
+    mCropX = x; mCropY = y; mCropW = w; mCropH = h;
+}
+
+void CameraPipeline::getCrop(int* x, int* y, int* w, int* h) const {
+    if (x) *x = mCropX;
+    if (y) *y = mCropY;
+    if (w) *w = mCropW;
+    if (h) *h = mCropH;
+}
+
+int CameraPipeline::captureFrameRgba(uint8_t* outputBuffer,
+                                     uint32_t outW, uint32_t outH) {
+    if (mState != PIPELINE_STREAMING) return -EINVAL;
+    if (!outputBuffer || outW == 0 || outH == 0) return -EINVAL;
+
+    const bool fullFrame = (mCropW == (int)mConfig.width &&
+                            mCropH == (int)mConfig.height &&
+                            outW == mConfig.width && outH == mConfig.height);
+    if (fullFrame) {
+        /* fast path: straight into the caller's buffer */
+        return processBayerToYuv(
+                nullptr /* set below */, outputBuffer, HAL_PIXEL_FORMAT_RGBA_8888)
+                    == 0 ? captureFrameInternal(outputBuffer) : -1;
+    }
+    /* general path: full-frame RGBA, then crop+scale */
+    int ret = captureFrameInternal(mRgbaFull);
+    if (ret != 0) return ret;
+    cropScaleRgba(mRgbaFull, mConfig.width, mConfig.height,
+                  outputBuffer, (int)outW, (int)outH,
+                  mCropX, mCropY, mCropW, mCropH);
+    return 0;
 }
 
 int CameraPipeline::processBayerToYuv(const uint8_t* bayerData, uint8_t* output, uint32_t outputFormat) {
@@ -556,9 +735,9 @@ int CameraPipeline::processBayerToYuv(const uint8_t* bayerData, uint8_t* output,
     if (mConfig.enableAWB)
         doAutoWhiteBalance(mRgbBuffer);
 
-    float rG = (mConfig.enableAWB ? mAwbGains[0] : mConfig.wbGain[0]) * mConfig.digitalGain;
-    float gG = (mConfig.enableAWB ? mAwbGains[1] : mConfig.wbGain[1]) * mConfig.digitalGain;
-    float bG = (mConfig.enableAWB ? mAwbGains[2] : mConfig.wbGain[2]) * mConfig.digitalGain;
+    float rG = (mConfig.enableAWB ? mAwbGains[0] : mConfig.wbGain[0]) * mDigitalGain;
+    float gG = (mConfig.enableAWB ? mAwbGains[1] : mConfig.wbGain[1]) * mDigitalGain;
+    float bG = (mConfig.enableAWB ? mAwbGains[2] : mConfig.wbGain[2]) * mDigitalGain;
 
     if (outputFormat == HAL_PIXEL_FORMAT_YCBCR_420_888) {
         /* For YUV: apply WB gains in-place first, then gamma, then convert */

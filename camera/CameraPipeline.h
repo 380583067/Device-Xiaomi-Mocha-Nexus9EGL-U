@@ -57,6 +57,15 @@ public:
     int stopStreaming();
 
     int captureFrame(uint8_t* outputBuffer, uint32_t outputFormat);
+    /* Capture at the pipeline resolution, then crop (digital zoom) and
+     * scale into an RGBA output buffer of arbitrary size. When outW/outH
+     * match the pipeline config and no crop is set this is a plain
+     * RGB->RGBA conversion, same as captureFrame(RGBA). */
+    int captureFrameRgba(uint8_t* outputBuffer, uint32_t outW, uint32_t outH);
+    /* Digital zoom: crop window in pipeline-pixel coordinates (even-aligned,
+     * clamped). Pass the full frame to disable. */
+    void setCrop(int x, int y, int w, int h);
+    void getCrop(int* x, int* y, int* w, int* h) const;
 
     PipelineState getState() const { return mState; }
 
@@ -74,6 +83,10 @@ public:
 private:
     int initFocuser();
     void deinitFocuser();
+    /* DQBUF one frame, run the ISP, write RGBA at the pipeline resolution */
+    int captureFrameInternal(uint8_t* rgbaOutput);
+    /* Legacy direct path: YUV written at pipeline resolution (dims must match) */
+    int captureFrameDirect(uint8_t* outputBuffer, uint32_t outputFormat);
     int captureForAf();       // Capture a frame during AF sweep, returns sobel energy
     int sobelEnergy(const uint8_t* rgb, int w, int h) const;
     int sobelEnergyNw(const uint8_t* rgb, int w, int h) const; // 8px-wide NEON-style (C reference)
@@ -99,11 +112,15 @@ private:
 
     uint8_t* mRgbBuffer;
     uint32_t mRgbBufferSize;
+    uint8_t* mRgbaFull;       /* RGBA at pipeline resolution (full frame) */
+    uint32_t mRgbaFullSize;
+    int mCropX, mCropY, mCropW, mCropH;
 
     int mCurrentExposure;
     int mCurrentGain;
     float mAwbGains[4];
     bool mHasAwbInit;
+    float mDigitalGain;  // live copy of config.digitalGain, AE may boost it
     uint8_t mGammaLut[256];
     float mLastGamma;
 
