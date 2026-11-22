@@ -184,6 +184,14 @@ Only the three quirks included above are recognized at this point:
         <MediaCodec name="c2.android.aac.decoder" update="true" rank="768" />
         <MediaCodec name="c2.android.flac.decoder" update="true" rank="768" />
         <MediaCodec name="c2.android.opus.decoder" update="true" rank="768" />
+        <!-- 【2026-11-22 音乐僵死】这个漏了：FLACExtractor 对 .flac 直接吐
+         * audio/raw PCM，NuPlayer 于是选 c2.android.raw.decoder（trait rank
+         * 8，dumpsys media.player 可见），它同样"吃下音轨、永不吐帧"——
+         * NPDecoder 的 looper 消息永远处理不完，mediaserver 里的 NuPlayer
+         * 从此僵死，之后所有 MediaPlayer 播放（音乐/视频/铃声）全部只有
+         * 状态推进没有声音。降到 768 让 OMX.google.raw.decoder（rank 0x10）
+         * 接管 audio/raw，与前几个条目同一原因、同一症状。 -->
+        <MediaCodec name="c2.android.raw.decoder" update="true" rank="768" />
     </Decoders>
 
     <!-- The Codec2 software VIDEO decoders are healthy (unlike the audio ones)
