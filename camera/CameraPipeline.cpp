@@ -659,6 +659,19 @@ int CameraPipeline::captureFrameDirect(uint8_t* outputBuffer, uint32_t outputFor
 static void cropScaleRgba(const uint8_t* src, int sw, int sh,
                           uint8_t* dst, int dw, int dh,
                           int cx, int cy, int cw, int ch) {
+    /* 【2026-11-22 预览全屏】裁切窗口的宽高比与输出不一致时，先按输出比例
+     * 把窗口居中收紧，再做最近邻缩放。这样 16:9 采集 -> 4:3 预览是"居中
+     * 裁掉左右"，而不是把画面横向压扁；窗口本来就同比例时（录像/拍照）
+     * 这段什么也不改，行为与之前完全一致。 */
+    if (cw > 0 && ch > 0 && dw > 0 && dh > 0) {
+        if ((int64_t)cw * dh > (int64_t)ch * dw) {
+            int nw = (int)((int64_t)ch * dw / dh) & ~1;
+            if (nw > 0 && nw <= cw) { cx += (cw - nw) / 2; cw = nw; }
+        } else if ((int64_t)cw * dh < (int64_t)ch * dw) {
+            int nh = (int)((int64_t)cw * dh / dw) & ~1;
+            if (nh > 0 && nh <= ch) { cy += (ch - nh) / 2; ch = nh; }
+        }
+    }
     for (int y = 0; y < dh; y++) {
         int sy = cy + (int)((int64_t)y * ch / dh);
         if (sy >= sh) sy = sh - 1;
@@ -708,10 +721,10 @@ int CameraPipeline::captureFrameRgba(uint8_t* outputBuffer,
                             mCropH == (int)mConfig.height &&
                             outW == mConfig.width && outH == mConfig.height);
     if (fullFrame) {
-        /* fast path: straight into the caller's buffer */
-        return processBayerToYuv(
-                nullptr /* set below */, outputBuffer, HAL_PIXEL_FORMAT_RGBA_8888)
-                    == 0 ? captureFrameInternal(outputBuffer) : -1;
+        /* 【2026-11-22】这里原来先调了一次 processBayerToYuv(nullptr, ...)
+         * 再捕帧：空指针进 demosaic，纯属白跑一趟还往输出缓冲写垃圾。整幅
+         * 直接走 captureFrameInternal（它自己会做 demosaic/WB/gamma/翻转）。 */
+        return captureFrameInternal(outputBuffer);
     }
     /* general path: full-frame RGBA, then crop+scale */
     int ret = captureFrameInternal(mRgbaFull);

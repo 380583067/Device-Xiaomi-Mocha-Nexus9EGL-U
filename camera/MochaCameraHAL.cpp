@@ -200,23 +200,36 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // 拍照永远存不下来。这里按 A12 收敛尺寸，同时把 4:3 换成 16:9 —— 传感器
     // 实际只输出 720p，多出来的尺寸本来就是最近邻放大出来的。
     // 采集端（IMPL_DEF/YCbCr/YV12）只保留 1280x720：那是 V4L2 真正能出的尺寸。
+    /* 【2026-11-22 预览全屏】面板是 1536x2048（3:4），而传感器只出 16:9，
+     * 所以 1280x720/1920x1080 的预览旋转到竖屏后是 9:16 的窄条，左右各留
+     * 一块大黑边。这里补 1440x1080（4:3）—— 竖屏旋转后正好 3:4，铺满屏幕。
+     * 采集仍然走 1920x1080 的 16:9 全幅，4:3 输出由 cropScaleRgba 做
+     * 居中裁切（见 CameraPipeline.cpp），不拉伸、不变形。 */
     int32_t configs[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, configs, sizeof(configs)/sizeof(int32_t));
 
     // Available min frame durations
     int64_t durations[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 33333333LL,
+        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
     };
     int ret = add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, durations, sizeof(durations)/sizeof(int64_t));
@@ -224,11 +237,15 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
 
     // Available stall durations (format, width, height, stall_ns)
     int64_t stall_durations[] = {
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 0,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 0,
+        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, 0,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, stall_durations, sizeof(stall_durations)/sizeof(int64_t));
@@ -236,6 +253,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available processed sizes
     int32_t processed_sizes[] = {
         1280, 720,
+        1440, 1080,
         1920, 1080,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES, processed_sizes, sizeof(processed_sizes)/sizeof(int32_t));
@@ -243,6 +261,7 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     // Available JPEG sizes
     int32_t jpeg_sizes[] = {
         1280, 720,
+        1440, 1080,
         1920, 1080,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_JPEG_SIZES, jpeg_sizes, sizeof(jpeg_sizes)/sizeof(int32_t));
@@ -862,6 +881,9 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
                                                     : (1280u * 720u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
+    /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
+     * 4:3 预览（1440x1080）就按 1440x1080 采集：传感器给的是居中 1:1 裁切，
+     * 输出端不用再缩放，既省一次大图缩放也更锐。 */
     ALOGI("Pipeline resolution: %ux%u (from %ux%u stream)",
           pipeW, pipeH, pipelineStream->width, pipelineStream->height);
 
@@ -1272,13 +1294,27 @@ static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
                              uint8_t* dst, int dstW, int dstH) {
     if (!src || !dst || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
 
+    /* 【2026-11-22】宽高比不同时按目标比例居中裁切再缩放（不拉伸）。
+     * 例如 16:9 采集 -> 4:3 预览只裁掉左右；同比例时裁切窗口就是整幅。 */
+    int cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+    if ((int64_t)srcW * dstH > (int64_t)srcH * dstW) {
+        cropW = (int)((int64_t)srcH * dstW / dstH) & ~1;
+        if (cropW < 2) cropW = srcW & ~1;
+        cropX = (srcW - cropW) / 2;
+    } else if ((int64_t)srcW * dstH < (int64_t)srcH * dstW) {
+        cropH = (int)((int64_t)srcW * dstH / dstW) & ~1;
+        if (cropH < 2) cropH = srcH & ~1;
+        cropY = (srcH - cropH) / 2;
+    }
+
     /* 列映射：dstX -> srcX，避免每像素做除法 */
     std::vector<int> xmap(dstW);
     for (int x = 0; x < dstW; x++)
-        xmap[x] = (int)((int64_t)x * srcW / dstW);
+        xmap[x] = cropX + (int)((int64_t)x * cropW / dstW);
 
     for (int y = 0; y < dstH; y++) {
-        int srcY = (int)((int64_t)y * srcH / dstH);
+        int srcY = cropY + (int)((int64_t)y * cropH / dstH);
+        if (srcY >= srcH) srcY = srcH - 1;
         const uint32_t* srow = reinterpret_cast<const uint32_t*>(
                 src + (size_t)srcY * srcW * 4);
         uint32_t* drow = reinterpret_cast<uint32_t*>(
@@ -1299,6 +1335,19 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     const int w = dstW, h = dstH;
 
+    /* 【2026-11-22】与 scaleRgbaNearest 一致：宽高比不同时居中裁切，
+     * 保证编码流的画面不被拉宽/压扁。 */
+    int cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+    if ((int64_t)srcW * dstH > (int64_t)srcH * dstW) {
+        cropW = (int)((int64_t)srcH * dstW / dstH) & ~1;
+        if (cropW < 2) cropW = srcW & ~1;
+        cropX = (srcW - cropW) / 2;
+    } else if ((int64_t)srcW * dstH < (int64_t)srcH * dstW) {
+        cropH = (int)((int64_t)srcW * dstH / dstW) & ~1;
+        if (cropH < 2) cropH = srcH & ~1;
+        cropY = (srcH - cropH) / 2;
+    }
+
     uint8_t* yPlane = static_cast<uint8_t*>(out->y);
     uint8_t* uPlane = static_cast<uint8_t*>(out->cb);
     uint8_t* vPlane = static_cast<uint8_t*>(out->cr);
@@ -1307,10 +1356,13 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
     const size_t cStep = out->chroma_step ? out->chroma_step : 1;
 
     for (int y = 0; y < h; y++) {
-        const uint8_t* row = rgba + (size_t)((int64_t)y * srcH / h) * srcW * 4;
+        int sy = cropY + (int)((int64_t)y * cropH / h);
+        if (sy >= srcH) sy = srcH - 1;
+        const uint8_t* row = rgba + (size_t)sy * srcW * 4;
         uint8_t* yRow = yPlane + (size_t)y * yStride;
         for (int x = 0; x < w; x++) {
-            int sx = (int)((int64_t)x * srcW / w);
+            int sx = cropX + (int)((int64_t)x * cropW / w);
+            if (sx >= srcW) sx = srcW - 1;
             int r = row[sx * 4 + 0];
             int g = row[sx * 4 + 1];
             int b = row[sx * 4 + 2];
@@ -1320,16 +1372,20 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
     }
 
     for (int y = 0; y < h; y += 2) {
-        int sy0 = (int)((int64_t)y * srcH / h);
-        int sy1 = (int)((int64_t)(y + 1 < h ? y + 1 : y) * srcH / h);
+        int sy0 = cropY + (int)((int64_t)y * cropH / h);
+        int sy1 = cropY + (int)((int64_t)(y + 1 < h ? y + 1 : y) * cropH / h);
+        if (sy0 >= srcH) sy0 = srcH - 1;
+        if (sy1 >= srcH) sy1 = srcH - 1;
         const uint8_t* row0 = rgba + (size_t)sy0 * srcW * 4;
         const uint8_t* row1 = rgba + (size_t)sy1 * srcW * 4;
         uint8_t* uRow = uPlane + (size_t)(y / 2) * cStride;
         uint8_t* vRow = vPlane + (size_t)(y / 2) * cStride;
         for (int x = 0; x < w; x += 2) {
             int x1 = (x + 1 < w) ? x + 1 : x;
-            int sx0 = (int)((int64_t)x * srcW / w);
-            int sx1 = (int)((int64_t)x1 * srcW / w);
+            int sx0 = cropX + (int)((int64_t)x * cropW / w);
+            int sx1 = cropX + (int)((int64_t)x1 * cropW / w);
+            if (sx0 >= srcW) sx0 = srcW - 1;
+            if (sx1 >= srcW) sx1 = srcW - 1;
             int r = (row0[sx0 * 4 + 0] + row0[sx1 * 4 + 0] + row1[sx0 * 4 + 0] + row1[sx1 * 4 + 0]) >> 2;
             int g = (row0[sx0 * 4 + 1] + row0[sx1 * 4 + 1] + row1[sx0 * 4 + 1] + row1[sx1 * 4 + 1]) >> 2;
             int b = (row0[sx0 * 4 + 2] + row0[sx1 * 4 + 2] + row1[sx0 * 4 + 2] + row1[sx1 * 4 + 2]) >> 2;
@@ -1341,6 +1397,45 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
             vRow[(x / 2) * cStep] = (uint8_t)v;
         }
     }
+}
+
+/* 把整幅 RGBA 写进一条 YUV 输出流：优先用 gralloc 给出的真实平面布局
+ * （lockYCbCr），不支持时退化成 lock() + 假定 YV12（Y + V + U）。
+ * 【2026-11-22】多流同一帧要写多条流时复用这段。 */
+static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
+                             const uint8_t* rgba, int sw, int sh) {
+    if (!dst || !dst->buffer || !dst->stream || !rgba) return false;
+    const android::Rect dstRect((int)dst->stream->width, (int)dst->stream->height);
+    struct android_ycbcr ycbcr;
+    memset(&ycbcr, 0, sizeof(ycbcr));
+    int ret = android::GraphicBufferMapper::get().lockYCbCr(*dst->buffer,
+                GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &ycbcr);
+    if (ret == 0 && ycbcr.y) {
+        rgbaToYuv420Scaled(rgba, sw, sh,
+                           (int)dst->stream->width, (int)dst->stream->height, &ycbcr);
+        android::GraphicBufferMapper::get().unlock(*dst->buffer);
+        return true;
+    }
+    void* vaddr = nullptr;
+    int lockRet = android::GraphicBufferMapper::get().lock(*dst->buffer,
+                GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &vaddr);
+    if (lockRet != 0 || !vaddr) {
+        ALOGE("writeYuvFromRgba: buffer not lockable: lockYCbCr=%d lock=%d", ret, lockRet);
+        return false;
+    }
+    const int w = (int)dst->stream->width;
+    const int h = (int)dst->stream->height;
+    const size_t ySize = (size_t)w * h;
+    memset(&ycbcr, 0, sizeof(ycbcr));
+    ycbcr.ystride = (size_t)w;
+    ycbcr.cstride = (size_t)w / 2;
+    ycbcr.chroma_step = 1;
+    ycbcr.y = static_cast<uint8_t*>(vaddr);
+    ycbcr.cr = static_cast<uint8_t*>(vaddr) + ySize;
+    ycbcr.cb = static_cast<uint8_t*>(vaddr) + ySize + ySize / 4;
+    rgbaToYuv420Scaled(rgba, sw, sh, w, h, &ycbcr);
+    android::GraphicBufferMapper::get().unlock(*dst->buffer);
+    return true;
 }
 
 static void copyFrameBetweenBuffers(
@@ -1642,8 +1737,78 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
  
     bool frameCaptured = false;
 
-    // Capture frame from pipeline
-    if (dev->pipeline && dev->streams_configured) {
+    /* 【2026-11-22 预览全屏】多流（预览 + 编码 / 预览 + 照片 YUV）时，先按
+     * pipeline 分辨率捕一帧到临时 RGBA，再按每条流自己的宽高比裁切缩放写入。
+     * 原因：4:3 预览是 16:9 采集的中心裁切；若先把画面缩进预览、再拿它去放大
+     * 填 16:9 的编码流，画面会被横向拉宽（变形）。各流独立裁切才正确，顺带让
+     * 照片/录像拿到真正的 1080p，而不是 720p 预览再放大。
+     * 单流（纯预览 / 纯拍照 BLOB）仍走下面的零拷贝直写路径。 */
+    uint32_t nonBlobStreams = 0, maxNonBlobArea = 0;
+    bool hasBlobStream = false;
+    for (uint32_t i = 0; i < request->num_output_buffers; i++) {
+        const camera3_stream_t* s = request->output_buffers[i].stream;
+        if (!s) continue;
+        if (s->format == HAL_PIXEL_FORMAT_BLOB) { hasBlobStream = true; continue; }
+        nonBlobStreams++;
+        const uint32_t area = s->width * s->height;
+        if (area > maxNonBlobArea) maxNonBlobArea = area;
+    }
+    /* 有 BLOB 的请求保持原路径（JPEG 编码在那边），避免影响已能出图的拍照。 */
+    if (dev->pipeline && dev->streams_configured && nonBlobStreams > 1 && !hasBlobStream) {
+        mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
+        if (pipeline->getState() == mocha::PIPELINE_OPENED) {
+            ALOGI("process_capture_request: pipeline in OPENED state, re-starting streaming");
+            if (pipeline->startStreaming() != 0) {
+                ALOGE("Auto-restart streaming failed");
+                if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
+                return -ENODEV;
+            }
+        }
+        const uint32_t pipeW = dev->pipeline_width, pipeH = dev->pipeline_height;
+        const uint32_t rgbaSize = pipeW * pipeH * 4;
+        if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
+            if (dev->temp_rgba) free(dev->temp_rgba);
+            dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
+            dev->temp_rgba_size = rgbaSize;
+        }
+        int captureRet = -ENOMEM;
+        if (dev->temp_rgba)
+            captureRet = pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
+        if (captureRet == -EAGAIN) {
+            if (dev->inflight_tracker) dev->inflight_tracker->remove(frameNum);
+            return -EAGAIN;
+        }
+        if (captureRet == 0) {
+            bool allOk = true;
+            for (uint32_t i = 0; i < request->num_output_buffers; i++) {
+                const camera3_stream_buffer_t& out = request->output_buffers[i];
+                const camera3_stream_t* s = out.stream;
+                if (!s || !out.buffer || s->format == HAL_PIXEL_FORMAT_BLOB) continue;
+                if (s->format == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
+                    s->format == HAL_PIXEL_FORMAT_YV12 || isEncoderStream(s)) {
+                    if (!writeYuvFromRgba(&out, dev->temp_rgba, (int)pipeW, (int)pipeH))
+                        allOk = false;
+                } else {
+                    void* vaddr = nullptr;
+                    const android::Rect rect((int)s->width, (int)s->height);
+                    if (android::GraphicBufferMapper::get().lock(*out.buffer,
+                            GRALLOC_USAGE_SW_WRITE_OFTEN, rect, &vaddr) == 0 && vaddr) {
+                        scaleRgbaNearest(dev->temp_rgba, (int)pipeW, (int)pipeH,
+                                         static_cast<uint8_t*>(vaddr),
+                                         (int)s->width, (int)s->height);
+                        android::GraphicBufferMapper::get().unlock(*out.buffer);
+                    } else {
+                        ALOGE("multi-stream: preview buffer not lockable");
+                        allOk = false;
+                    }
+                }
+            }
+            frameCaptured = allOk;
+        } else {
+            ALOGE("multi-stream capture failed: %d", captureRet);
+        }
+    } else if (dev->pipeline && dev->streams_configured) {
+    // Capture frame from pipeline（单流零拷贝直写路径）
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
 
         // Auto-restart pipeline if it was stopped by flush()
@@ -1662,8 +1827,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
 
         /* BLOB format = JPEG still capture */
         if (buf.stream->format == HAL_PIXEL_FORMAT_BLOB) {
-            /* Allocate temp RGBA buffer at pipeline resolution */
-            uint32_t rgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
+            /* 【2026-11-22】照片按 BLOB 流的尺寸出：JPEG 的宽高必须等于流声明的
+             * 宽高，否则 framework/App 会丢掉这张图（实测 4:3 照片流 + 16:9
+             * 编码 -> 一行 "JPEG captured" 但 DCIM 里没有文件）。
+             * captureFrameRgba 自带裁切缩放，直接按 BLOB 尺寸捕一帧即可，
+             * 4:3 照片就是 16:9 采集的居中裁切，和预览取景一致。 */
+            const uint32_t blobW = buf.stream->width;
+            const uint32_t blobH = buf.stream->height;
+            const uint32_t rgbaSize = blobW * blobH * 4;
             if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
                 if (dev->temp_rgba) free(dev->temp_rgba);
                 dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
@@ -1673,12 +1844,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 ALOGE("Failed to allocate temp RGBA buffer");
             } else {
                 int captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
-                        dev->pipeline_width, dev->pipeline_height);
+                        blobW, blobH);
                 if (captureRet == 0) {
                     /* BLOB 缓冲由 framework 按 (字节容量, 1) 分配，锁的时候必须
                      * 用同样的尺寸，否则部分 gralloc 会按 1280x720 算出别的 stride。 */
-                    uint32_t blobW = buf.stream->width;
-                    uint32_t blobH = buf.stream->height;
                     const size_t blobCapacity = jpegBufferCapacity(blobW, blobH);
                     const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
                     const android::Rect blobRect((int)blobCapacity, 1);
@@ -1689,10 +1858,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                         if (!dev->jpeg_encoder) {
                             dev->jpeg_encoder = new mocha::JpegEncoder();
                         }
-                        /* Encode RGBA to JPEG at pipeline resolution into blob buffer */
+                        /* Encode RGBA to JPEG at the BLOB resolution */
                         size_t jpegSize = 0;
                         ret = dev->jpeg_encoder->encodeRGBA(dev->temp_rgba,
-                                                              dev->pipeline_width, dev->pipeline_height,
+                                                              blobW, blobH,
                                                               90, (uint8_t*)vaddr, payloadCapacity, &jpegSize);
                         if (ret == 0 && jpegSize > 0) {
                             /* 尾标必须写在缓冲最后 8 字节：framework 会从
