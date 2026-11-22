@@ -388,6 +388,11 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
      * (v4l2_ctrl_new_std in imx179.c). The old caps (2000/120) saturated on
      * ordinary indoor scenes and left the frame badly underexposed even
      * though the sensor still had headroom. */
+    /* 【2026-11-22】驱动侧 imx179 允许 exposure 1..2500、gain 0..255。之前把
+     * gain 卡在 180，暗场只能靠软件增益硬抬（实测抬到 3.91× 再加 AWB 的 2.18×，
+     * 画面被洗成一片白）。真实传感器增益优先。 */
+    /* 实测把 gain 上限放到 255 会让画面反而全黑（驱动寄存器不是线性映射，
+     * 0x40 才是 1x）。180 是这台机器上验证过的最大可用值。 */
     const int kExpMax = 2500;
     const int kGainMax = 180;
 
@@ -395,9 +400,9 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     int newGain = mCurrentGain;
 
     /* Prefer longer exposure over higher gain to reduce noise */
-    if (newExp > 2000) {
-        newGain = (int)(mCurrentGain * (newExp / 2000.0f));
-        newExp = 2000;
+    if (newExp > 2500) {
+        newGain = (int)(mCurrentGain * (newExp / 2500.0f));
+        newExp = 2500;
     } else if (newGain > 100 && newExp < 2000) {
         /* If gain is high, increase exposure instead */
         newExp = (int)(newExp * (newGain / 100.0f));
@@ -424,17 +429,19 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
      * still well below target; back off as soon as luma recovers. Baseline
      * stays at config.digitalGain (1.5) to avoid permanent noise
      * amplification in well-lit scenes. */
-    if (mCurrentExposure >= 2000 && mCurrentGain >= kGainMax) {
+    if (mCurrentExposure >= 2500 && mCurrentGain >= kGainMax) {
         float dg = mDigitalGain;
         if (avgLuma < target * 0.8f) {
+            /* 【2026-11-22】这里原来按 need 无限向上抬（实测到 3.91×），把画面洗白、
+             * 噪点也放大。软件增益只用来补一点点，天花板 1.5×。 */
             float need = target / (avgLuma > 0.05f ? avgLuma : 0.05f);
-            if (need > 2.0f) need = 2.0f;  /* ramp, don't overshoot */
+            if (need > 1.25f) need = 1.25f;
             dg = dg * need;
         } else if (avgLuma > target * 1.1f) {
             dg = dg * 0.8f;
         }
         if (dg < mConfig.digitalGain) dg = mConfig.digitalGain;
-        if (dg > 4.0f) dg = 4.0f;
+        if (dg > 1.5f) dg = 1.5f;
         if (dg > mDigitalGain * 1.05f || dg < mDigitalGain * 0.95f) {
             ALOGI("AE saturation: luma=%.2f digitalGain %.2f -> %.2f",
                   avgLuma, mDigitalGain, dg);

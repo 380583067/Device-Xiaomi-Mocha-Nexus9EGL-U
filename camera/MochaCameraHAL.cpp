@@ -1023,8 +1023,12 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      // Auto Exposure y Auto White Balance
      pipelineConfig.enableAE = true;
      pipelineConfig.enableAWB = true;  // corrige tinte verdoso
-    pipelineConfig.targetLuma = 0.55f;
-    pipelineConfig.digitalGain = 1.5f;  // modest boost; 6.0f caused clipping + noise
+    /* 【2026-11-22 过曝】AE 是在 gamma 之前的线性域测亮度，0.55 相当于把画面推到
+     * 接近饱和（实测白窗帘场景 57% 像素贴到 255、均值 231/255）。线性域中灰约
+     * 0.18~0.22，取 0.20。软件增益同时从 1.5 收回 1.0：那是早先为了压暗场加的，
+     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。 */
+    pipelineConfig.targetLuma = 0.20f;
+    pipelineConfig.digitalGain = 1.0f;
  
     // Override IMPLEMENTATION_DEFINED to RGBA_8888 (Tegra gralloc allocates
     // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
