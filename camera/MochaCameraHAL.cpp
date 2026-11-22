@@ -455,39 +455,33 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         3264, 2448,
     };
 
-    /* 前摄：只公布 OV5693 真正支持的尺寸。 */
+    /* 前摄：720p 是 OV5693 驱动唯一验证过的输出（初始化寄存器对 2624x1476
+     * 读出区做了 2x 缩放，未公开的缩放/binning 寄存器不能动 —— 2026-11-22
+     * 试图按 IMX179 方式编程 1:1 窗口导致连 720p 都 VI 超时，已回退）。
+     * 只公布 720p，App 选更大尺寸会回落到这里而不是走进 VI 超时。 */
     static const int32_t front_configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, CAMERA3_STREAM_OUTPUT,
     };
     static const int64_t front_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
-        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 33333333LL,
     };
     static const int64_t front_stall_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
-        HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
-        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 100000000LL,
     };
     static const int32_t front_processed_sizes[] = {
         1280, 720,
-        1920, 1080,
     };
     static const int32_t front_jpeg_sizes[] = {
         1280, 720,
-        1920, 1080,
-        2592, 1944,
     };
 
     const bool isFront = (cameraId == 1);
@@ -1245,7 +1239,7 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      * uses 4 lanes (CSI-A) and does 1080p natively. Anything bigger is also
      * capped: 1080p is the sweet spot of the 1:1 readout at 30fps. */
     const uint32_t kMaxArea = (dev->camera_id == 0) ? (2592u * 1944u)
-                                                    : (2592u * 1944u);
+                                                    : (1280u * 720u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
     /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
