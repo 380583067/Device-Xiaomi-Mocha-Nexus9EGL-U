@@ -26,7 +26,7 @@ LOCAL_SRC_FILES := \
     isp/ColorConvNEON.cpp
 
 LOCAL_SHARED_LIBRARIES := \
-    libhardware liblog libcamera_metadata libutils libjpeg libdl libc++ libui
+    libhardware liblog libcamera_metadata libutils libjpeg libdl libc++ libui libcutils
 
 LOCAL_STATIC_LIBRARIES := libbase
 

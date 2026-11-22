@@ -176,15 +176,69 @@ struct mocha_camera_device_t {
  * "采集目标流"（RGBA 预览）写满，BLOB 那条被当成次要流跳过 —— framework 的
  * Camera2-JpegProcessor 扫不到 SOI 标记（"Could not find start of JPEG marker"），
  * App 最后把整块 4MB 空白缓冲当图片存了下来。现在 BLOB 统一在这里单独编码。 */
+
+/* 【2026-11-22 诊断】gralloc0 的 private_handle_t 把 ANativeWindowBuffer 放在结构开头，
+ * framework 也是靠 anb->width 取 BLOB 缓冲的字节容量（Camera2Client 的 imgBuffer.width
+ * 就是这么来的）。这里只读几个字段，用来确认我们该按多大去 lock、尾标该写在哪。 */
+struct MochaAnbHead {
+    int32_t magic;
+    int32_t version;
+    void*   reserved[4];
+    void*   incRef;
+    void*   decRef;
+    int32_t width;
+    int32_t height;
+    int32_t stride;
+    int32_t format;
+};
 static bool writeJpegToBlob(mocha_camera_device_t* dev,
                             const camera3_stream_buffer_t& out,
                             const uint8_t* rgba, uint32_t w, uint32_t h) {
     if (!dev || !out.buffer || !out.stream || !rgba) return false;
+    /* 【2026-11-22 决定性实验】persist.mocha.cam.skipjpeg=1 时完全不碰 BLOB 缓冲，
+     * 只把它原样交回 framework。若此时 cameraserver 仍在 NvGrLock 崩溃，说明
+     * 崩溃与我们的写入无关，是 gralloc 对 BLOB 缓冲跨进程/跨用途 lock 的固有问题。 */
+    {
+        char skip[PROPERTY_VALUE_MAX] = {0};
+        property_get("persist.mocha.cam.skipjpeg", skip, "0");
+        if (atoi(skip) != 0) {
+            ALOGI("writeJpegToBlob: SKIP write (skipjpeg=1), handing buffer back untouched");
+            return true;
+        }
+    }
     const uint32_t blobW = out.stream->width;
     const uint32_t blobH = out.stream->height;
-    const size_t blobCapacity = jpegBufferCapacity(blobW, blobH);
+    /* 【2026-11-22 拍照崩溃真因】BLOB 缓冲的大小是 framework 按我们公布的
+     * ANDROID_JPEG_MAX_SIZE 整块分配的（实测始终 4149248 字节，与分辨率无关），
+     * 尾标必须写在 **这块内存的最后 8 字节**，framework 正是从
+     * bufferSize-8 处读它。以前按分辨率比例算容量（1440x1080 只有 3.18MB），
+     * 尾标落在缓冲中间 → framework 读到垃圾 jpeg_size，先是
+     * "Could not find start of JPEG marker"、后是 JpegProcessor 里 NvGrLock 崩。
+     * 所以这里直接用 kMaxJpegSize，不再做比例估算。 */
+    const size_t blobCapacity = kMaxJpegSize;
     const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
-    const android::Rect blobRect((int)blobCapacity, 1);
+    {
+        const MochaAnbHead* anb = reinterpret_cast<const MochaAnbHead*>(*out.buffer);
+        const native_handle_t* nh = *out.buffer;
+        ALOGI("BLOB handle: anb w=%d h=%d stride=%d fmt=0x%x | nh ver=%d fds=%d ints=%d "
+              "ints[0..5]=%u %u %u %u %u %u (expect capacity %d)",
+              anb->width, anb->height, anb->stride, anb->format,
+              nh->version, nh->numFds, nh->numInts,
+              (unsigned)nh->data[0], (unsigned)nh->data[1], (unsigned)nh->data[2],
+              (unsigned)nh->data[3], (unsigned)nh->data[4], (unsigned)nh->data[5],
+              (int)blobCapacity);
+    }
+    /* 【2026-11-22 实验 jsg】按 (capacity,1) 去 lock 会让这块 gralloc 按 4 字节/像素
+     * 算出一个 16MB 的影子缓冲，写 4MB 之后 unlock 的同步逻辑踩坏 gralloc 内部状态
+     * （紧接着 framework 一 lock 就在 NvGrLock 崩）。改成按**图像几何** lock，
+     * 只写图本身，不写尾标 —— framework 读不到尾标就会把整块缓冲交给 App，
+     * App 自己按 SOI/EOI 扫也能解出图。 */
+    char jsg[PROPERTY_VALUE_MAX] = {0};
+    property_get("persist.mocha.cam.jsg", jsg, "1");
+    const bool imageGeometry = atoi(jsg) != 0;
+    const android::Rect blobRect = imageGeometry
+            ? android::Rect((int)blobW, (int)blobH)
+            : android::Rect((int)blobCapacity, 1);
     void* vaddr = nullptr;
     if (android::GraphicBufferMapper::get().lock(*out.buffer,
                 GRALLOC_USAGE_SW_WRITE_OFTEN, blobRect, &vaddr) != 0 || !vaddr) {
@@ -193,10 +247,17 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
     }
     if (!dev->jpeg_encoder) dev->jpeg_encoder = new mocha::JpegEncoder();
     size_t jpegSize = 0;
+    const size_t writeLimit = imageGeometry ? (size_t)blobW * blobH : payloadCapacity;
     int ret = dev->jpeg_encoder->encodeRGBA(rgba, (int)w, (int)h, 90,
-                                           (uint8_t*)vaddr, payloadCapacity, &jpegSize);
+                                           (uint8_t*)vaddr, writeLimit, &jpegSize);
     bool ok = false;
     if (ret == 0 && jpegSize > 0) {
+        if (imageGeometry) {
+            ALOGI("JPEG captured (image-geometry): %ux%u -> blob %ux%u, %zu bytes, hdr %02X%02X",
+                  w, h, blobW, blobH, jpegSize, ((uint8_t*)vaddr)[0], ((uint8_t*)vaddr)[1]);
+            android::GraphicBufferMapper::get().unlock(*out.buffer);
+            return true;
+        }
         camera3_jpeg_blob_t blob;
         blob.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
         blob.jpeg_size = (uint32_t)jpegSize;
@@ -261,6 +322,13 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
+        /* 【2026-11-22 高分辨率】传感器模式表里本来就有 1920x1440(2.8MP) 与
+         * 2592x1944(5MP)，之前只为 1080p 开了 BLOB。这里补上，让 App 能选。
+         * 5MP 走"拍照瞬间把 pipeline 切到 2592x1944、拍完切回"的方式（见
+         * process_capture_request），预览仍是 1440/1920 的快尺寸。 */
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, CAMERA3_STREAM_OUTPUT,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, configs, sizeof(configs)/sizeof(int32_t));
 
@@ -276,6 +344,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 33333333LL,
+        HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, 33333333LL,
     };
     int ret = add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, durations, sizeof(durations)/sizeof(int64_t));
     ALOGI("DEBUG: Added min frame durations, ret=%d", ret);
@@ -292,6 +363,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 100000000LL,
+        HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, 100000000LL,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_STALL_DURATIONS, stall_durations, sizeof(stall_durations)/sizeof(int64_t));
 
@@ -308,6 +382,9 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         1280, 720,
         1440, 1080,
         1920, 1080,
+        1920, 1440,
+        2592, 1944,
+        3264, 2448,
     };
     add_camera_metadata_entry(metadata, ANDROID_SCALER_AVAILABLE_JPEG_SIZES, jpeg_sizes, sizeof(jpeg_sizes)/sizeof(int32_t));
 
@@ -852,6 +929,97 @@ static int camera_device_initialize(const camera3_device_t *device, const camera
     return 0;
 }
 
+/* 【2026-11-22】建立/重建采集 pipeline。
+ * configureStreams 与高分辨率拍照共用：拍照瞬间切到 2592x1944、拍完再切回预览尺寸，
+ * 这样预览能保持 30fps，而照片是真 5MP（不是放大出来的）。 */
+static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h) {
+    if (dev->pipeline) {
+        mocha::CameraPipeline* old = static_cast<mocha::CameraPipeline*>(dev->pipeline);
+        old->close();
+        delete old;
+        dev->pipeline = nullptr;
+    }
+
+    mocha::CameraPipeline* pipeline = new mocha::CameraPipeline();
+    if (!pipeline) {
+        ALOGE("openPipelineAt: out of memory");
+        return -ENOMEM;
+    }
+    int ret = pipeline->open(dev->camera_id);
+    if (ret != 0) {
+        ALOGE("openPipelineAt: pipeline->open failed: %d", ret);
+        delete pipeline;
+        return -ENODEV;
+    }
+
+    mocha::PipelineConfig pipelineConfig;
+    pipelineConfig.width = w;
+    pipelineConfig.height = h;
+    /* Bayer pattern must match the V4L2 format requested below:
+     * camera 0 (IMX179) uses SRGGB10 -> RGGB (pat 3); camera 1 (OV5693)
+     * uses SBGGR10 -> BGGR (pat 2). Sharing one value gave the front
+     * camera a strong green cast (G/B channels swapped). */
+    pipelineConfig.bayerPattern = (dev->camera_id == 0) ? 3 : 1;
+    pipelineConfig.offset_x = 0;
+    pipelineConfig.offset_y = 0;
+    pipelineConfig.flipV = false;  // IMX179 mount normal; framework handles rotation
+
+    pipelineConfig.enableISP = true;
+
+     /* 【画面全黑修复 2026-11-16】blackLevel 单位是 raw10_to_8bit 输出的
+      * 8-bit 刻度（代码里 v>>2 之后才减）。IMX179 10-bit 黑电平典型 64
+      * （10-bit 域），换算到 8-bit 是 64/4=16。上一轮误把 10-bit 的 64
+      * 直接填进来，而夜间画面均值 239(10-bit)=59(8-bit)<64，被饱和减法
+      * 钳到 0，整幅预览全黑（AE luma=0.00）。改为 16。 */
+     pipelineConfig.blackLevel = 16;
+     pipelineConfig.wbGain[0] = 1.0f;  // R gain
+     pipelineConfig.wbGain[1] = 1.0f;  // G gain
+     pipelineConfig.wbGain[2] = 1.0f;  // B gain
+     pipelineConfig.wbGain[3] = 1.0f;
+     pipelineConfig.ccm[0] = 1.0f; pipelineConfig.ccm[1] = 0.0f; pipelineConfig.ccm[2] = 0.0f;
+     pipelineConfig.ccm[3] = 0.0f; pipelineConfig.ccm[4] = 1.0f; pipelineConfig.ccm[5] = 0.0f;
+     pipelineConfig.ccm[6] = 0.0f; pipelineConfig.ccm[7] = 0.0f; pipelineConfig.ccm[8] = 1.0f;
+     pipelineConfig.gamma = 0.55f;
+
+     // Auto Exposure y Auto White Balance
+     pipelineConfig.enableAE = true;
+     pipelineConfig.enableAWB = true;  // corrige tinte verdoso
+    /* 【2026-11-22 过曝】AE 是在 gamma 之前的线性域测亮度，0.55 相当于把画面推到
+     * 接近饱和（实测白窗帘场景 57% 像素贴到 255、均值 231/255）。线性域中灰约
+     * 0.18~0.22，取 0.20。软件增益同时从 1.5 收回 1.0：那是早先为了压暗场加的，
+     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。 */
+    pipelineConfig.targetLuma = 0.20f;
+    pipelineConfig.digitalGain = 1.0f;
+ 
+    // Override IMPLEMENTATION_DEFINED to RGBA_8888 (Tegra gralloc allocates
+    // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
+    pipelineConfig.pixelFormat =
+            (dev->camera_id == 0) ? V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SBGGR10;
+
+    ret = pipeline->configure(pipelineConfig);
+    if (ret != 0) {
+        ALOGE("openPipelineAt: configure(%ux%u) failed: %d", w, h, ret);
+        pipeline->close();
+        delete pipeline;
+        return ret;
+    }
+    ret = pipeline->startStreaming();
+    if (ret != 0) {
+        ALOGE("openPipelineAt: startStreaming(%ux%u) failed: %d", w, h, ret);
+        pipeline->close();
+        delete pipeline;
+        return ret;
+    }
+
+    dev->pipeline = pipeline;
+    dev->pipeline_width = w;
+    dev->pipeline_height = h;
+    dev->last_config_width = w;
+    dev->last_config_height = h;
+    ALOGI("openPipelineAt: streaming at %ux%u", w, h);
+    return 0;
+}
+
 static int camera_device_configure_streams(const camera3_device_t *device, camera3_stream_configuration_t *config) {
     ALOGI("camera_device_configure_streams: num_streams=%d", config ? config->num_streams : -1);
 
@@ -914,6 +1082,10 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *s = config->streams[i];
         if (s->stream_type != CAMERA3_STREAM_OUTPUT) continue;
+        /* 【2026-11-22 高分辨率拍照】BLOB 不参与采集尺寸的竞争：照片流常常是
+         * 2592x1944，若让它顶起 pipeline，预览会掉到 7fps。拍照瞬间由
+         * process_capture_request 临时切上去、拍完切回来。 */
+        if (s->format == HAL_PIXEL_FORMAT_BLOB) continue;
         uint32_t area = s->width * s->height;
         if (area > pipeArea) { pipeArea = area; pipeW = s->width; pipeH = s->height; }
     }
@@ -922,13 +1094,25 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      * (-110) and the channel falls back to the TPG test pattern. The IMX179
      * uses 4 lanes (CSI-A) and does 1080p natively. Anything bigger is also
      * capped: 1080p is the sweet spot of the 1:1 readout at 30fps. */
-    const uint32_t kMaxArea = (dev->camera_id == 0) ? (1920u * 1080u)
+    const uint32_t kMaxArea = (dev->camera_id == 0) ? (2592u * 1944u)
                                                     : (1280u * 720u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
     /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
      * 4:3 预览（1440x1080）就按 1440x1080 采集：传感器给的是居中 1:1 裁切，
      * 输出端不用再缩放，既省一次大图缩放也更锐。 */
+    /* 【2026-11-22】调试用：persist.mocha.cam.pipew/pipeh 可以把采集尺寸钉在
+     * 指定值，用来单独验证某个传感器模式能不能稳定出帧，不用改代码重编。 */
+    {
+        char pw[PROPERTY_VALUE_MAX] = {0}, ph[PROPERTY_VALUE_MAX] = {0};
+        property_get("persist.mocha.cam.pipew", pw, "0");
+        property_get("persist.mocha.cam.pipeh", ph, "0");
+        int ow = atoi(pw), oh = atoi(ph);
+        if (ow > 0 && oh > 0) {
+            ALOGI("Pipeline resolution overridden by property: %dx%d", ow, oh);
+            pipeW = (uint32_t)ow; pipeH = (uint32_t)oh;
+        }
+    }
     ALOGI("Pipeline resolution: %ux%u (from %ux%u stream)",
           pipeW, pipeH, pipelineStream->width, pipelineStream->height);
 
@@ -964,74 +1148,6 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
         }
     }
 
-    // Close previous pipeline if exists
-    if (dev->pipeline) {
-        ALOGI("Closing previous pipeline for reconfiguration");
-        mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
-        pipeline->close();
-        delete pipeline;
-        dev->pipeline = nullptr;
-    }
-
-    mocha::CameraPipeline* pipeline = new mocha::CameraPipeline();
-    if (!pipeline) {
-        ALOGE("Failed to create pipeline");
-        return -ENOMEM;
-    }
-
-    int ret = pipeline->open(dev->camera_id);
-    if (ret != 0) {
-        ALOGE("Failed to open pipeline: %d (V4L2 device may not be available)", ret);
-        delete pipeline;
-        pipeline = nullptr;
-    }
-
-    if (!pipeline) {
-        ALOGE("configureStreams: cannot proceed without pipeline");
-        return -ENODEV;
-    }
-
-    mocha::PipelineConfig pipelineConfig;
-    pipelineConfig.width = pipeW;
-    pipelineConfig.height = pipeH;
-    /* Bayer pattern must match the V4L2 format requested below:
-     * camera 0 (IMX179) uses SRGGB10 -> RGGB (pat 3); camera 1 (OV5693)
-     * uses SBGGR10 -> BGGR (pat 2). Sharing one value gave the front
-     * camera a strong green cast (G/B channels swapped). */
-    pipelineConfig.bayerPattern = (dev->camera_id == 0) ? 3 : 1;
-    pipelineConfig.offset_x = 0;
-    pipelineConfig.offset_y = 0;
-    pipelineConfig.flipV = false;  // IMX179 mount normal; framework handles rotation
-
-    pipelineConfig.enableISP = true;
-
-     /* 【画面全黑修复 2026-11-16】blackLevel 单位是 raw10_to_8bit 输出的
-      * 8-bit 刻度（代码里 v>>2 之后才减）。IMX179 10-bit 黑电平典型 64
-      * （10-bit 域），换算到 8-bit 是 64/4=16。上一轮误把 10-bit 的 64
-      * 直接填进来，而夜间画面均值 239(10-bit)=59(8-bit)<64，被饱和减法
-      * 钳到 0，整幅预览全黑（AE luma=0.00）。改为 16。 */
-     pipelineConfig.blackLevel = 16;
-     pipelineConfig.wbGain[0] = 1.0f;  // R gain
-     pipelineConfig.wbGain[1] = 1.0f;  // G gain
-     pipelineConfig.wbGain[2] = 1.0f;  // B gain
-     pipelineConfig.wbGain[3] = 1.0f;
-     pipelineConfig.ccm[0] = 1.0f; pipelineConfig.ccm[1] = 0.0f; pipelineConfig.ccm[2] = 0.0f;
-     pipelineConfig.ccm[3] = 0.0f; pipelineConfig.ccm[4] = 1.0f; pipelineConfig.ccm[5] = 0.0f;
-     pipelineConfig.ccm[6] = 0.0f; pipelineConfig.ccm[7] = 0.0f; pipelineConfig.ccm[8] = 1.0f;
-     pipelineConfig.gamma = 0.55f;
-
-     // Auto Exposure y Auto White Balance
-     pipelineConfig.enableAE = true;
-     pipelineConfig.enableAWB = true;  // corrige tinte verdoso
-    /* 【2026-11-22 过曝】AE 是在 gamma 之前的线性域测亮度，0.55 相当于把画面推到
-     * 接近饱和（实测白窗帘场景 57% 像素贴到 255、均值 231/255）。线性域中灰约
-     * 0.18~0.22，取 0.20。软件增益同时从 1.5 收回 1.0：那是早先为了压暗场加的，
-     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。 */
-    pipelineConfig.targetLuma = 0.20f;
-    pipelineConfig.digitalGain = 1.0f;
- 
-    // Override IMPLEMENTATION_DEFINED to RGBA_8888 (Tegra gralloc allocates
-    // RGBA for non-YUV formats). Keep YCbCr_420_888 and BLOB as-is.
     /* 每次 configure 前清空编码器流登记，避免上次会话的悬空指针。 */
     for (int k = 0; k < 4; k++) gEncoderStreams[k] = nullptr;
     /* 【2026-11-22 拍照落盘】所有输出流都补 GRALLOC_USAGE_SW_WRITE_OFTEN：
@@ -1086,29 +1202,13 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
             }
         }
     }
-    uint32_t v4l2Format = (dev->camera_id == 0) ? V4L2_PIX_FMT_SRGGB10 : V4L2_PIX_FMT_SBGGR10;
-
-    pipelineConfig.pixelFormat = v4l2Format;
-
-    ret = pipeline->configure(pipelineConfig);
+    /* pipeline 的建立/配置收敛到 openPipelineAt()（高分辨率拍照也复用它）。 */
+    int ret = openPipelineAt(dev, pipeW, pipeH);
     if (ret != 0) {
-        ALOGE("Failed to configure pipeline: %d", ret);
-        pipeline->close();
-        delete pipeline;
-        dev->pipeline = nullptr;
+        ALOGE("configureStreams: openPipelineAt(%ux%u) failed: %d", pipeW, pipeH, ret);
         return ret;
     }
 
-    ret = pipeline->startStreaming();
-    if (ret != 0) {
-        ALOGE("Failed to start streaming: %d", ret);
-        pipeline->close();
-        delete pipeline;
-        dev->pipeline = nullptr;
-        return ret;
-    }
-
-    dev->pipeline = pipeline;
     dev->output_stream = outputStream;
     dev->pipeline_width = pipeW;
     dev->pipeline_height = pipeH;
@@ -1845,12 +1945,47 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 return -ENODEV;
             }
         }
-        const uint32_t pipeW = dev->pipeline_width, pipeH = dev->pipeline_height;
+        uint32_t pipeW = dev->pipeline_width, pipeH = dev->pipeline_height;
+        /* 【2026-11-22 高分辨率拍照】照片流比采集尺寸大时，临时把采集切到照片
+         * 尺寸，拍完立刻切回：预览仍是 30fps 的快尺寸，照片是真 5MP
+         * （而不是把 1080p 放大出来的假高分辨率）。 */
+        uint32_t restoreW = 0, restoreH = 0;
+        if (hasBlobStream) {
+            uint32_t wantW = 0, wantH = 0, best = pipeW * pipeH;
+            for (uint32_t i = 0; i < request->num_output_buffers; i++) {
+                const camera3_stream_t* bs = request->output_buffers[i].stream;
+                if (!bs || bs->format != HAL_PIXEL_FORMAT_BLOB) continue;
+                const uint32_t a = bs->width * bs->height;
+                if (a > best) { best = a; wantW = bs->width; wantH = bs->height; }
+            }
+            if (wantW && wantH) {
+                if (openPipelineAt(dev, wantW, wantH) == 0) {
+                    restoreW = pipeW; restoreH = pipeH;
+                    pipeW = wantW; pipeH = wantH;
+                    ALOGI("still capture: pipeline switched to %ux%u for the shot", pipeW, pipeH);
+                } else {
+                    ALOGE("still capture: switch to %ux%u failed, upscaling instead",
+                          wantW, wantH);
+                }
+            }
+        }
         const uint32_t rgbaSize = pipeW * pipeH * 4;
         if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
             if (dev->temp_rgba) free(dev->temp_rgba);
             dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
             dev->temp_rgba_size = rgbaSize;
+        }
+        /* 【2026-11-22】刚切过传感器模式时 AE/AWB 是从默认值重新收敛的，
+         * 直接取帧会得到偏暗、偏绿的图（8MP 实测）。先丢几帧喂给 3A 再正式取。 */
+        if (restoreW && dev->temp_rgba) {
+            for (int warm = 0; warm < 5; warm++)
+                (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
+        }
+        /* 【2026-11-22】刚切过传感器模式时 AE/AWB 是从默认值重新收敛的，
+         * 直接取帧会得到偏暗、偏绿的图（8MP 实测）。先丢几帧喂给 3A 再正式取。 */
+        if (restoreW && dev->temp_rgba) {
+            for (int warm = 0; warm < 5; warm++)
+                (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
         }
         int captureRet = -ENOMEM;
         if (dev->temp_rgba)
@@ -1907,6 +2042,12 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         } else {
             ALOGE("multi-stream capture failed: %d", captureRet);
         }
+        if (restoreW && restoreH) {
+            if (openPipelineAt(dev, restoreW, restoreH) != 0)
+                ALOGE("still capture: restore to %ux%u failed", restoreW, restoreH);
+            else
+                ALOGI("still capture: pipeline restored to %ux%u", restoreW, restoreH);
+        }
     } else if (dev->pipeline && dev->streams_configured) {
     // Capture frame from pipeline（单流零拷贝直写路径）
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
@@ -1943,12 +2084,20 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             if (!dev->temp_rgba) {
                 ALOGE("Failed to allocate temp RGBA buffer");
             } else {
+                /* 单流拍照：采集尺寸不够 BLOB 大时先切上去，拍完切回。 */
+                const uint32_t keepW = dev->pipeline_width, keepH = dev->pipeline_height;
+                const bool switched = (blobW * blobH > keepW * keepH) &&
+                        (openPipelineAt(dev, blobW, blobH) == 0);
                 int captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
                         blobW, blobH);
+                if (switched) {
+                    if (openPipelineAt(dev, keepW, keepH) != 0)
+                        ALOGE("still capture: restore to %ux%u failed", keepW, keepH);
+                }
                 if (captureRet == 0) {
                     /* BLOB 缓冲由 framework 按 (字节容量, 1) 分配，锁的时候必须
                      * 用同样的尺寸，否则部分 gralloc 会按 1280x720 算出别的 stride。 */
-                    const size_t blobCapacity = jpegBufferCapacity(blobW, blobH);
+                    const size_t blobCapacity = kMaxJpegSize;
                     const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
                     const android::Rect blobRect((int)blobCapacity, 1);
                     int ret = android::GraphicBufferMapper::get().lock(handle,
