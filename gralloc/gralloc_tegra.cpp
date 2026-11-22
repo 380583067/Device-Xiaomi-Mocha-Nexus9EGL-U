@@ -224,11 +224,20 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
               usage, result, (result == 0 && stride != NULL) ? *stride : -1);
     }
 
-    if (result != -EINVAL || format != HAL_PIXEL_FORMAT_YCbCr_420_888) {
+    /* 【2026-11-22 录像 0 帧】编码器流（YCbCr_420_888，HAL 已剥掉
+     * HW_VIDEO_ENCODER）在分配时也被 EINVAL 拒绝。这类拒绝 vendor 的口味是
+     * "要一个软件读位"——给 YV12/YCbCr 都放宽：只要还没有 SW 读位就补一个
+     * SW_READ_RARELY 再试一次（SW_WRITE 已在的用法同样能补）。 */
+    if (result != -EINVAL) {
         return result;
     }
 
-    if (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK)) {
+    if (format != HAL_PIXEL_FORMAT_YCbCr_420_888 &&
+        format != HAL_PIXEL_FORMAT_YV12) {
+        return result;
+    }
+
+    if (usage & GRALLOC_USAGE_SW_READ_MASK) {
         return result;
     }
 
