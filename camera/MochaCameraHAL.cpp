@@ -294,6 +294,8 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
     if (w <= 0 || h <= 0) return false;
 
     /* 快路径：stride 与宽度一致且不需要缩放时，直接写进 surface */
+    /* 慢路径的 src 不允许为空（快路径条件不满足时必须直接失败，
+     * 否则会把未初始化缓冲当画面写出去 —— 实测就是满屏规则条纹）。 */
     if (pipeline && !src && (int)srcW == w && (int)srcH == h) {
         void* vaddr = nullptr;
         const android::Rect rect(w, h);
@@ -317,6 +319,10 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
         dev->temp_out_size = need;
     }
     if (!dev->temp_out) return false;
+    if (!src) {
+        ALOGE("writeRgbaToSurface: no source frame for %dx%d", w, h);
+        return false;
+    }
     /* 裁切/缩放（数字变焦也走这里）到紧凑的 w*h*4 */
     scaleRgbaNearest(src, (int)srcW, (int)srcH, dev->temp_out, w, h);
 
@@ -397,45 +403,41 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
      * 前摄不公布它传感器没有的尺寸（3264x2448 / 1920x1440 / 1440x1080），
      * 否则 App 选了就走进 VI 超时 → TPG。 */
     static const int32_t rear_configs[] = {
-        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, CAMERA3_STREAM_OUTPUT,
+        /* 【2026-11-22 复原 4:3 预览】1440x1080 窗口的画面出规则波浪条纹
+         * （720p/5MP/8MP 都干净，唯独这个尺寸坏），且用户确认 720p 才正常。
+         * 按用户要求先把 4:3 预览复原：预览回到 16:9（1280x720/1920x1080），
+         * 全屏观感由 Aperture 的 fillCenter 居中裁切实现。1440x1080 的损坏
+         * 原因待查（VI 撕裂或 ISP stride），查清前不对外公布。 */
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
-        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, CAMERA3_STREAM_OUTPUT,
     };
     static const int64_t rear_durations[] = {
-        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 33333333LL,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 33333333LL,
-        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
-        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                  3264, 2448, 33333333LL,
     };
     static const int64_t rear_stall_durations[] = {
-        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1440, 1080, 0,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
-        HAL_PIXEL_FORMAT_YCbCr_420_888,          1440, 1080, 0,
+        HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,         1920, 1080, 0,
-        HAL_PIXEL_FORMAT_YV12,                   1440, 1080, 0,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
-        HAL_PIXEL_FORMAT_BLOB,                  1440, 1080, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1080, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  1920, 1440, 100000000LL,
         HAL_PIXEL_FORMAT_BLOB,                  2592, 1944, 100000000LL,
@@ -443,12 +445,10 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     };
     static const int32_t rear_processed_sizes[] = {
         1280, 720,
-        1440, 1080,
         1920, 1080,
     };
     static const int32_t rear_jpeg_sizes[] = {
         1280, 720,
-        1440, 1080,
         1920, 1080,
         1920, 1440,
         2592, 1944,
