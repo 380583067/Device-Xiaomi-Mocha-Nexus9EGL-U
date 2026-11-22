@@ -1,5 +1,36 @@
+From 07e7e7aee7ae5fa80ca67b9e6379f0aa097db444 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:38:45 +0800
+Subject: [PATCH 2/4] codec2: legacy gralloc support (mocha/Tegra K1)
+
+tegra's gralloc0 is the old single-buffer style: no lockYCbCr, picky
+about usage bits, and no HW_TEXTURE for raw YUV. Three problems broke
+c2.android.* video on this device, fixed here in C2AllocatorGralloc:
+
+- PopulatePlaneLayout: when lockYCbCr fails (-ENOSYS), fall back to a
+  plain lock() and describe the planes ourselves. YV12 is planar
+  (Y/V/U), not interleaved UV: describing it as NV12 made the decoder
+  write chroma in the wrong order, so playback showed swapped colors.
+  Other 420 formats keep the interleaved layout. The lock() in that
+  fallback passes SW bits only; HW_* bits make gralloc return -ENOSYS
+  as well.
+- Add GRALLOC_USAGE_HW_TEXTURE to CPU-writable YUV allocations only.
+  Without it SurfaceFlinger blacklists the layer (buffer is not gpu
+  readable) and never shows a frame; adding it to BLOB buffers (CSD)
+  makes gralloc refuse lock() and codec start() fails with
+  CodecException. debug.mocha.c2extra_usage overrides the bits at
+  runtime for experiments (default: HW_TEXTURE).
+- Skip the lockYCbCr attempt for mapped output blocks when tegra
+  gralloc cannot serve it (follow-up to the plane layout fallback).
+
+Verified on mocha: c2.android.avc.decoder decodes 720p H.264 at the
+clip's full rate with correct colors.
+---
+ media/codec2/vndk/C2AllocatorGralloc.cpp | 254 +++++++++++++++++++++--
+ 1 file changed, 239 insertions(+), 15 deletions(-)
+
 diff --git a/media/codec2/vndk/C2AllocatorGralloc.cpp b/media/codec2/vndk/C2AllocatorGralloc.cpp
-index 971b5a5..7fe77e2 100644
+index 971b5a512b..7fe77e222e 100644
 --- a/media/codec2/vndk/C2AllocatorGralloc.cpp
 +++ b/media/codec2/vndk/C2AllocatorGralloc.cpp
 @@ -18,7 +18,10 @@
