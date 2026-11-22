@@ -922,19 +922,13 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      * (-110) and the channel falls back to the TPG test pattern. The IMX179
      * uses 4 lanes (CSI-A) and does 1080p natively. Anything bigger is also
      * capped: 1080p is the sweet spot of the 1:1 readout at 30fps. */
-    /* 【2026-11-22 录像花屏/TPG】采集分辨率封顶 1440x1080（后摄）/ 1280x720（前摄），
-     * 而不是"取最大流"。两个实测依据：
-     *   1) 1920x1080 采集要 114ms/帧（≈9fps），1440x1080 只要 31ms（≈32fps）——
-     *      传感器的 1:1 读出在 1440 宽更顺；
-     *   2) 从 1440 切到 1920 重新配置时，VI 会
-     *      `VI capture failed ch0: -110, falling back to TPG`，整个会话变成棋盘格
-     *      测试图（录像模式必然触发，因为 App 那条 1080p 编码流把 pipeline 拉大）。
-     * 固定成一档就不会再有大图切换，1080p 输出由 cropScaleRgba 放大得到。 */
-    if (dev->camera_id == 0) {
-        if (pipeW * pipeH > 1440u * 1080u) { pipeW = 1440; pipeH = 1080; }
-    } else {
-        if (pipeW * pipeH > 1280u * 720u) { pipeW = 1280; pipeH = 720; }
-    }
+    const uint32_t kMaxArea = (dev->camera_id == 0) ? (1920u * 1080u)
+                                                    : (1280u * 720u);
+    if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
+        if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
+    /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
+     * 4:3 预览（1440x1080）就按 1440x1080 采集：传感器给的是居中 1:1 裁切，
+     * 输出端不用再缩放，既省一次大图缩放也更锐。 */
     ALOGI("Pipeline resolution: %ux%u (from %ux%u stream)",
           pipeW, pipeH, pipelineStream->width, pipelineStream->height);
 
