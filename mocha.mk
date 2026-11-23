@@ -52,12 +52,10 @@ PRODUCT_COPY_FILES += \
 PRODUCT_PACKAGES += \
     vndservicemanager
 
-# 【2026-11-23】预置 OpenCamera（主力测试相机）与 KernelSU 管理器（内核
-# 已带 KSU v3.3.1）。模块定义在 vendor/xiaomi/mocha/proprietary/Android.mk：
-# PRESIGNED + 关闭 dexpreopt，保证 APK 原始签名原样进系统。
-PRODUCT_PACKAGES += \
-    OpenCamera \
-    KernelSU
+# 【2026-11-23】OpenCamera 与 KernelSU 管理器不预置，开机后手动安装
+# （原始签名 APK 与构建系统预置管线冲突：重签名坏 KSU 校验、PRESIGNED
+# 被剥 v2、do-not-alter 又卡压缩 dex 检查，见 vendor proprietary/Android.mk
+# 注释）。APK 存于 vendor/xiaomi/mocha/proprietary/app/。
 
 PRODUCT_PACKAGES += \
     android.hardware.audio.service \
