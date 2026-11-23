@@ -198,8 +198,14 @@ copy; the commits pushed to GitHub carry the English wording. If the tree shows
 those files as modified while `git diff` only touches comments, that is expected
 - `git checkout -- <file>` restores the committed English version.
 
-The same convention covers this series: the patch files themselves are committed
-with English comments, and the device tree sources they touch follow it too.
+One deliberate exception: the comment text inside the patch files in this
+directory stays in Chinese. A patch is a byte-exact diff against a source tree,
+so its added lines have to match what `install.sh` puts there - and those source
+trees (frameworks/av, frameworks/base, ...) are the local working copies that
+keep the Chinese notes. Translating a patch body would either stop it from
+applying or force the same translation into the third-party tree, which is the
+opposite of keeping the notes local. Translate the tree first, regenerate the
+patch from `git diff`, and both can change together.
 
 Removed entries and why
 -----------------------
