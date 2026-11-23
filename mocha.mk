@@ -52,6 +52,11 @@ PRODUCT_COPY_FILES += \
 PRODUCT_PACKAGES += \
     vndservicemanager
 
+# 【2026-11-23】预置 OpenCamera：发出去给别人测试的 ROM 必须自带主力测试
+# 相机（模块名在 vendor/xiaomi/mocha/proprietary/Android.mk 里定义）。
+PRODUCT_PACKAGES += \
+    OpenCamera
+
 PRODUCT_PACKAGES += \
     android.hardware.audio.service \
     android.hardware.audio@7.1-impl \
