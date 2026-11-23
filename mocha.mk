@@ -53,12 +53,11 @@ PRODUCT_PACKAGES += \
     vndservicemanager
 
 # 【2026-11-23】预置 OpenCamera（主力测试相机）与 KernelSU 管理器（内核
-# 已带 KSU v3.3.1）。用 PRODUCT_COPY_FILES 逐字节复制，保留 APK 原始签名：
-# 预置模块的重签名会破坏 KSU 内核对管理器的签名校验（platform），或丢失
-# v2 签名导致 PackageManager 扫描失败（PRESIGNED）。模块定义已删。
-PRODUCT_COPY_FILES += \
-    vendor/xiaomi/mocha/proprietary/app/net.sourceforge.opencamera/net.sourceforge.opencamera.apk:$(TARGET_COPY_OUT_PRODUCT)/app/OpenCamera/OpenCamera.apk \
-    vendor/xiaomi/mocha/proprietary/app/kernelsu/KernelSU.apk:$(TARGET_COPY_OUT_PRODUCT)/app/KernelSU/KernelSU.apk
+# 已带 KSU v3.3.1）。模块定义在 vendor/xiaomi/mocha/proprietary/Android.mk：
+# PRESIGNED + 关闭 dexpreopt，保证 APK 原始签名原样进系统。
+PRODUCT_PACKAGES += \
+    OpenCamera \
+    KernelSU
 
 PRODUCT_PACKAGES += \
     android.hardware.audio.service \
