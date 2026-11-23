@@ -108,7 +108,8 @@ camera (hardware/interfaces, frameworks/av/0005)
 media (frameworks/av)
   0001  NvMM-era display/decode compatibility for the legacy stack
   0002  Codec2: make c2.android.* software video decode work on the legacy
-        Tegra gralloc0 (this is what lets `debug.stagefright.ccodec=2` work):
+        Tegra gralloc0 (this is what makes any c2.android.* software video
+        decode possible, whatever `debug.stagefright.ccodec` is set to):
         - add GRALLOC_USAGE_HW_TEXTURE only for CPU_WRITE + YUV allocations,
           so SurfaceFlinger can sample the decoder output while BLOB/CSD
           buffers stay untouched (HW_TEXTURE on those makes gralloc lock()

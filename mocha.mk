@@ -356,26 +356,22 @@ PRODUCT_COPY_FILES += \
 # Enable nvidia framework enhancements if available
 -include vendor/lineage/product/nvidia.mk
 
-# Software decoding: Codec2 (c2.android.*) by default, OMX only as fallback.
-#   debug.stagefright.ccodec values (frameworks/av/media/codec2/sfplugin/
-#   Codec2InfoBuilder.cpp): 0=disable C2 entirely; 1=prefer c2.android.* audio only;
-#   2=all c2.android.* available and first, other .avc.decoder/.avc.encoder usable
-#   but last; 3=c2.android.* first, others default; 4=everything default.
-#   Unset, this tree defaults to 4, and the OMX default rank 0x100 beats
-#   c2.android.*'s 0x200, so OMX.google.*.avc.decoder is picked. Use 2: C2 for
-#   software decoding with OMX still available as a last resort.
-#   Prerequisite: the frameworks/av legacy-gralloc patches for C2AllocatorGralloc
-#   (lock() fallback when lockYCbCr is missing, YV12 as Y/V/U planes, HW_TEXTURE for
-#   CPU_WRITE+YUV). Without them C2 software decode fails start() or swaps red/green.
-#   Measured 720p at 29.3-29.5 fps, on par with OMX and colour-identical per frame.
-#   c2-poolmask: bitmask of allowed C2 platform block pools/allocators (bit16 ION,
-#   bit17 GRALLOC, bit18 BUFFERQUEUE, bit19 BLOB). 0x80000 (BLOB only) was wrong: with
-#   BUFFERQUEUE off the decoder output blocks skip the BQ pool and land in
-#   BASIC_GRAPHIC without a bqId, so OutputBufferQueue can only use attachBuffer, and
-#   under BLAST the producer never connected - attach failed every frame with
-#   INVALID_OPERATION(-38) and playback had sound but no picture. 0xF0000 =
-#   ION|GRALLOC|BUFFERQUEUE|BLOB enables everything, the output pool selects
-#   BUFFERQUEUE (allocatorID 18) and the picture is back (measured 2026-11-22).
+# ccodec value (see frameworks/av/media/codec2/sfplugin/Codec2InfoBuilder.cpp):
+# 0=disable C2 entirely, 1=only c2.android.* audio is preferred, 2=all c2.android.*
+# first with the others last, 3=c2.android.* first and the rest default, 4=every
+# component keeps its own rank. This tree uses 4 and orders the components with the
+# rank properties below; the reasoning and the full history are in that block.
+#
+# c2-poolmask must include BUFFERQUEUE: 0xF0000 = ION|GRALLOC|BUFFERQUEUE|BLOB.
+# BLOB-only (0x80000) left the decoder output blocks without a bqId, so under BLAST
+# attachBuffer failed every frame with INVALID_OPERATION(-38) and playback had sound
+# but no picture - it also wedged mediaserver's NPDecoder, taking every MediaPlayer
+# down with it.
+#
+# Prerequisite: the frameworks/av legacy-gralloc patches for C2AllocatorGralloc
+# (lock() fallback when lockYCbCr is missing, YV12 as Y/V/U planes, HW_TEXTURE only
+# for CPU_WRITE+YUV). Without them C2 software decode fails start() or swaps red and
+# green. Measured 720p at 29.3-29.5 fps, colour-identical per frame.
 # OMX first, Codec2 second, and every implementation kept registered.
 #
 # ccodec=4 means each component keeps its own rank. The ranking that follows is
