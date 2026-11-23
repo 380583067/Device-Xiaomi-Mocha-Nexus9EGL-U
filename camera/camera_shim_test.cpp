@@ -1,23 +1,27 @@
 /*
- * camera_shim_test —— 相机 blob 加载链路诊断工具
+ * camera_shim_test - diagnostic for the camera blob load chain
  * ============================================================================
- * 用途：在**不重新刷 system 镜像**的前提下，验证 camera.vendor.tegra.so 的
- *       dlopen 依赖链是否已经补齐。
+ * Purpose: verify that camera.vendor.tegra.so's dlopen dependency chain is
+ *          complete **without flashing a new system image**.
  *
- * 背景：正常情况下 shim 是由 linker 内置的 LD_SHIM_LIBS 表在 blob 之前注入的，
- *       但那张表编译进了 /system/bin/linker，改它必须刷 system 镜像。为了先确认
- *       "符号到底齐没齐"，这里手工按同样的顺序 dlopen 一遍：
- *         1. libmocha_camera_shim.so        （ABI 转发）
- *         2. libcameraservice_mocha.so      （SONAME = libcameraservice.so 的空 stub）
- *         3. /system/lib/hw/camera.vendor.tegra.so
+ * Background: normally the shim is injected by the LD_SHIM_LIBS table built into
+ *          the linker before the blob loads, but that table lives inside
+ *          /system/bin/linker and changing it means flashing system. To check "are
+ *          the symbols all there" first, this tool repeats the same order by hand:
+ *            1. libmocha_camera_shim.so        (ABI forwarding)
+ *            2. libcameraservice_mocha.so      (empty stub, SONAME libcameraservice.so)
+ *            3. /system/lib/hw/camera.vendor.tegra.so
  *
- * 用法：
+ * Usage:
  *   adb push camera_shim_test /data/local/tmp/ && adb shell /data/local/tmp/camera_shim_test
  *
- * 各步预期：
- *   1/2 必须 OK —— 不 OK 就是 shim 自己编坏了（比如多了不该有的 DT_NEEDED）。
- *   3   OK      —— 说明 345 个未定义符号全部可解析，可以放心刷整包。
- *   3   失败    —— 看 dlerror() 里点名的符号，回到 mocha_camera_shim.cpp 里补。
+ * Expected results:
+ *          1/2 must be OK - otherwise the shim itself is broken (an unexpected
+ *              DT_NEEDED, for example).
+ *          3   OK      - all 345 undefined symbols resolve, the full image is safe
+ *                        to flash.
+ *          3   fails   - look at the symbol dlerror() names and add it to
+ *                        mocha_camera_shim.cpp.
  */
 
 #include <dlfcn.h>
@@ -25,7 +29,7 @@
 #include <string.h>
 
 static int try_dlopen(const char* tag, const char* name, int flags) {
-    // 清掉上一次的错误状态，否则 dlerror() 可能返回陈旧内容
+    // Clear the previous error state, otherwise dlerror() may return stale text
     (void)dlerror();
     void* h = dlopen(name, flags);
     if (h == NULL) {
@@ -39,7 +43,7 @@ static int try_dlopen(const char* tag, const char* name, int flags) {
 int main(void) {
     int rc = 0;
 
-    // 顺序与 linker 注入 shim 的顺序一致：shim 在 blob 的 DT_NEEDED 之前。
+    // Same order as the linker's shim injection: the shim comes before the blob's DT_NEEDED.
     if (try_dlopen("libmocha_camera_shim", "libmocha_camera_shim.so",
                    RTLD_NOW | RTLD_GLOBAL) != 0) {
         rc = 1;

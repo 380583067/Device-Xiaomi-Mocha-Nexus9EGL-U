@@ -36,9 +36,10 @@ struct PipelineConfig {
     bool enableAWB;
     float targetLuma;
     float digitalGain;  // software brightness boost (multiplicative on RGB)
-    /* 【2026-11-22】重建 pipeline（高分辨率拍照）时把上一路已经收敛的曝光/增益
-     * 带过来：新实例默认从 800/60 起步，靠丢几帧预热在暗场里根本收敛不到，
-     * 8MP 照片因此发暗。0 表示沿用默认值。 */
+    /* [2026-11-22] When the pipeline is rebuilt for a high-resolution still, carry
+     * over the exposure/gain the previous instance already converged on: a fresh
+     * instance starts at 800/60 and cannot converge in a dark scene from a few warm-up
+     * frames, which made 8 MP photos dark. 0 means "use the defaults". */
     int initialExposure;
     int initialGain;
 };

@@ -15,13 +15,13 @@
 #include <hardware/gralloc.h>
 #include <utils/threads.h>
 #include <utils/Vector.h>
-/* 【拍照保存修复 2026-11-17】设备 gralloc 是 mapper@2.1（HIDL passthrough），
- * App(Aperture/CameraX) 通过 gralloc2.1 的 GraphicBufferMapper 锁 buffer，而
- * NVIDIA gralloc 的跨进程锁（共享内存 LockState + pthread mutex）要求所有进程
- * 用同一套接口锁/解锁。本 HAL 之前用 gralloc0 的 gralloc_module_t->lock()，
- * 与 App 的 gralloc2.1 锁语义不一致，导致 HAL 写 JPEG 后共享 LockState 残留
- * 为 -1，App 侧 AcquireBufferLock 永远超时（拍照卡死、无法保存）。改用
- * GraphicBufferMapper（走 mapper@2.1，与 App 一致）后锁状态正确配对。 */
+/* [still-capture fix 2026-11-17] The device gralloc is mapper@2.1 (HIDL
+ * passthrough): apps lock buffers through the gralloc2.1 GraphicBufferMapper
+ * while this HAL used gralloc0's gralloc_module_t->lock(). NVIDIA gralloc's
+ * cross-process lock (shared LockState + pthread mutex) requires every process
+ * to use the same interface, so the mismatch left the shared LockState at -1
+ * after the HAL wrote a JPEG and the app's AcquireBufferLock always timed out
+ * (capture hung, nothing was saved). GraphicBufferMapper matches the app. */
 #include <ui/GraphicBufferMapper.h>
 #include <ui/Rect.h>
 #include <system/graphics.h>
@@ -43,27 +43,30 @@ using namespace android;
 // ---------------------------------------------------------------------------
 // JPEG (BLOB) output buffer layout
 // ---------------------------------------------------------------------------
-// 【2026-11-19 拍照文件被 4MB 零填充】framework 为 BLOB 流分配的缓冲，
-// 其“宽”就等于字节容量、“高”为 1（Camera3Device::getJpegBufferSize()
-// 算容量，Camera3OutputStream::setBufferSizeLocked() 用
-// native_window_set_buffers_dimensions(mMaxSize, 1) 分配）。缓冲回收时
-// Camera3OutputStream::fixUpHidlJpegBlobHeader() 只在【缓冲最后 8 字节】
-// 里找 camera3_jpeg_blob_t 尾标；找不到就报 "jpeg blob id 0 is not correct"
-// 并回退用 ANDROID_JPEG_MAX_SIZE 当图像长度，于是照片被 4MB 零填充。
-// 以前我们把尾标写在 blobW*blobH*2 处（1280x720 只有 1.8MB），位置偏前，
-// 所以永远命中不了。这里按照 framework 的公式复算容量：
+// [2026-11-19 the saved JPEG was zero-filled to 4 MB] The framework sizes the
+// BLOB buffer with width == byte capacity and height == 1 (getJpegBufferSize()
+// computes the capacity and setBufferSizeLocked() allocates it through
+// native_window_set_buffers_dimensions(mMaxSize, 1)). On recycle,
+// fixUpHidlJpegBlobHeader() looks for the camera3_jpeg_blob_t trailer in the
+// LAST 8 BYTES of the buffer; when it is missing it logs
+// "jpeg blob id 0 is not correct" and falls back to ANDROID_JPEG_MAX_SIZE, so
+// the photo is zero-filled to 4 MB. We used to write the trailer at
+// blobW*blobH*2 (only 1.8 MB for 1280x720), nowhere near the end, so it never
+// matched. Recompute the capacity with the framework formula:
 //   capacity(w,h) = scale * (maxSize - kMin) + kMin
 //   scale         = (w * h) / (maxJpegW * maxJpegH)
-// 其中 kMin = 256KiB + sizeof(CameraBlob)，maxJpeg* 是本 HAL 对外声明的
-// 最大 BLOB 分辨率（见 ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS）。
-// 三处数值必须与静态元数据保持一致，否则尾标又会错位。
+// where kMin = 256 KiB + sizeof(CameraBlob) and maxJpeg* is the largest BLOB
+// resolution this HAL advertises (see
+// ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS). All three values must stay in
+// sync with the static metadata or the trailer lands in the wrong place.
 static constexpr int32_t kMaxJpegSize = 4149248;
 static constexpr size_t kMinJpegBufferSize = 256 * 1024 + 8;
 static constexpr uint32_t kMaxJpegWidth = 1920;
 static constexpr uint32_t kMaxJpegHeight = 1080;
 
-// 按 framework 的算法复算 BLOB 缓冲容量（字节）。注意必须整体做一次
-// float 求值再截断，不能先截断乘积——否则会和 framework 差几个字节。
+// Recompute the BLOB capacity in bytes with the framework algorithm. Evaluate
+// the whole expression in float and truncate once; truncating the product first
+// would be a few bytes off from the framework.
 static size_t jpegBufferCapacity(uint32_t width, uint32_t height) {
     const float scale = static_cast<float>(width * height) /
                         static_cast<float>(kMaxJpegWidth * kMaxJpegHeight);
@@ -77,9 +80,10 @@ extern camera_module_t HMI;
 namespace mocha {
 
 // Camera configurations
-// 【2026-11-17】补上前摄 ov5693：内核侧已 probe 成功并绑定到 channel 1
-//（tegra-vi-1 -> /dev/video1），CameraPipeline 也已按 cameraId 选 video0/video1，
-// 此前只是 kCameras 里没登记，导致 getNumberOfCameras() 只返回 1。
+// [2026-11-17] Register the front ov5693: the kernel probes it and binds it to
+// channel 1 (tegra-vi-1 -> /dev/video1) and CameraPipeline already picks
+// video0/video1 by camera id, but kCameras never listed it, so
+// getNumberOfCameras() returned only one entry.
 const MochaCameraInfo MochaCameraHAL::kCameras[] = {
     { 0, "IMX179", CAMERA_FACING_BACK, 90, 3280, false },
     { 1, "OV5693", CAMERA_FACING_FRONT, 270, 2624, false },
@@ -90,8 +94,9 @@ const int MochaCameraHAL::kNumCameras = sizeof(MochaCameraHAL::kCameras) / sizeo
 // Static camera characteristics cache
 static camera_metadata_t* gCameraCharacteristics[2] = { nullptr, nullptr };
 
-/* 当前打开的相机 id，供 build_result_metadata() 拼 crop region 用（见 gActiveCameraId
- * 的赋值处 camera_device_open）。默认 0 = 后摄。 */
+/* Currently open camera id, used by build_result_metadata() to build the crop
+ * region (see where gActiveCameraId is assigned in camera_device_open). 0 is the
+ * back camera. */
 static int gActiveCameraId = 0;
 
 /* Digital zoom: the crop actually applied to the last frame, in
@@ -99,13 +104,14 @@ static int gActiveCameraId = 0;
  * ANDROID_SCALER_CROP_REGION). Full frame by default. */
 static int32_t gAppliedCrop[4] = {0, 0, 0, 0};
 
-/* 【2026-11-18 录像方案1】编码器输入流标记。
+/* [2026-11-18 recording plan 1] Marker for the encoder input stream.
  *
- * 之前是把这条流的 format 改写成 YCbCr_420_888，让拷贝路径走 YUV；但那样
- * framework 要和 ACodec 建好的 BufferQueue 对齐时谈不拢，一取缓冲就
- * `Stream 2: Can't dequeue next output buffer: -22`。
- * 现在改成：**格式保持 IMPLEMENTATION_DEFINED 不动**（让 gralloc 自己决定
- * 布局），只在这里记下指针，拷贝时用 isEncoderStream() 判断走 YUV 写入。 */
+ * We used to rewrite that stream's format to YCbCr_420_888 so the copy path would
+ * go through YUV, but then the framework and the BufferQueue ACodec had already
+ * built disagreed and every dequeue returned
+ * `Stream 2: Can't dequeue next output buffer: -22`.
+ * Now the format stays IMPLEMENTATION_DEFINED (gralloc picks the layout) and only
+ * the pointer is recorded here, with isEncoderStream() choosing the YUV write path. */
 static camera3_stream_t* gEncoderStreams[4] = { nullptr, nullptr, nullptr, nullptr };
 
 static bool isEncoderStream(const camera3_stream_t* s) {
@@ -161,11 +167,12 @@ struct mocha_camera_device_t {
     mocha::JpegEncoder* jpeg_encoder;
     uint8_t* temp_rgba;
     uint32_t temp_rgba_size;
-    /* 第二块临时缓冲：多流请求里 BLOB 的尺寸往往和 pipeline 不同，需要先把
-     * pipeline 分辨率的帧裁切缩放到 BLOB 尺寸再编码 JPEG。 */
+    /* Second scratch buffer: in a multi-stream request the BLOB size usually differs
+     * from the pipeline size, so the pipeline frame must be cropped and scaled to the
+     * BLOB size before the JPEG encoder runs. */
     uint8_t* temp_jpeg_rgba;
     uint32_t temp_jpeg_size;
-    /* 预览写出用的紧凑中间缓冲（按真实 stride 逐行拷进 surface） */
+    /* Compact intermediate buffer for the preview write-out (copied into the surface row by row with the real stride) */
     uint8_t* temp_out;
     uint32_t temp_out_size;
 
@@ -174,15 +181,18 @@ struct mocha_camera_device_t {
     bool af_trigger_handled;
 };
 
-/* 把一幅 RGBA 编码成 JPEG 写进 BLOB 流缓冲（含末尾 8 字节 camera3_jpeg_blob 尾标）。
- * 【2026-11-22】拍照真正的坑在这里：请求里同时有预览流和 JPEG 流时，旧代码只把
- * "采集目标流"（RGBA 预览）写满，BLOB 那条被当成次要流跳过 —— framework 的
- * Camera2-JpegProcessor 扫不到 SOI 标记（"Could not find start of JPEG marker"），
- * App 最后把整块 4MB 空白缓冲当图片存了下来。现在 BLOB 统一在这里单独编码。 */
+/* Encode one RGBA frame as a JPEG inside the BLOB stream buffer, with the 8-byte
+ * camera3_jpeg_blob trailer at the end.
+ * [2026-11-22] This is where still capture really broke: when a request carried both
+ * a preview and a JPEG stream, the old code filled only the "capture target" (the
+ * RGBA preview) and skipped the BLOB as secondary, so Camera2-JpegProcessor found no
+ * SOI marker ("Could not find start of JPEG marker") and the app saved the blank 4 MB
+ * buffer as the picture. The BLOB is now always encoded separately here. */
 
-/* 【2026-11-22 诊断】gralloc0 的 private_handle_t 把 ANativeWindowBuffer 放在结构开头，
- * framework 也是靠 anb->width 取 BLOB 缓冲的字节容量（Camera2Client 的 imgBuffer.width
- * 就是这么来的）。这里只读几个字段，用来确认我们该按多大去 lock、尾标该写在哪。 */
+/* [2026-11-22 diagnostic] gralloc0's private_handle_t puts ANativeWindowBuffer first
+ * in the struct and the framework reads the BLOB capacity from anb->width (where
+ * Camera2Client's imgBuffer.width comes from). These few fields confirm how much to
+ * lock and where the trailer has to go. */
 struct MochaAnbHead {
     int32_t magic;
     int32_t version;
@@ -208,20 +218,20 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
 
     const uint32_t blobW = out.stream->width;
     const uint32_t blobH = out.stream->height;
-    /* 【2026-11-22 BLOB 到底怎么锁】两个坑叠在一起，记清楚以后别再踩：
-     *
-     * 1) 缓冲大小：framework 按我们公布的 ANDROID_JPEG_MAX_SIZE **整块**分配
-     *    （本机 4 149 248 字节，与照片分辨率无关），尾标必须落在这块内存的最后
-     *    8 字节，framework 正是从 bufferSize-8 读 camera3_jpeg_blob。
-     * 2) 加锁几何：**绝不能**用 Rect(capacity, 1)。那样 gralloc 会按"4 百万像素
-     *    宽的一行"建影子映射，写完之后 unlock 把分配器状态搞坏，接下来任何一次
-     *    lock（cameraserver 的 JpegProcessor、或 App 读 Image）都会拿到垃圾 mutex：
-     *    NvGrLock 里 SEGV，或者 AcquireBufferLock timed out / LockState -1。
-     *
-     * 所以：按**图像形状**加锁，但把高度扩到刚好覆盖整块缓冲 —— 这样 JPEG 和
-     * 尾标都在同一个映射里，几何又是 gralloc 能正常处理的 2D 形状。
-     * 实测 8MP（图像 7.99MB > 缓冲 4.15MB，锁 3264x2448）与 1080p（1080 行扩到
-     * 2162 行）都正常。 */
+    /* [2026-11-22 how the BLOB must be locked] Two traps stacked, remember both:
+     * 1) Buffer size: the framework allocates the whole ANDROID_JPEG_MAX_SIZE we
+     *    advertise (4,149,248 bytes here, independent of the photo resolution) and
+     *    the trailer must sit in the last 8 bytes, because the framework reads
+     *    camera3_jpeg_blob from bufferSize-8.
+     * 2) Lock geometry: NEVER Rect(capacity, 1). gralloc would build a shadow mapping
+     *    of "one 4-megapixel row" and unlock corrupts the allocator, so every later
+     *    lock (cameraserver's JpegProcessor, or the app reading the Image) gets a
+     *    garbage mutex: SEGV in NvGrLock, or AcquireBufferLock timed out /
+     *    LockState -1.
+     * So lock by IMAGE geometry but extend the height to cover the whole buffer: the
+     * JPEG and the trailer then share one mapping and the geometry is a 2D shape
+     * gralloc handles. Verified at 8 MP (image 7.99 MB > 4.15 MB buffer, locked
+     * 3264x2448) and 1080p (1080 rows extended to 2162). */
     char noTrailer[PROPERTY_VALUE_MAX] = {0};
     property_get("persist.mocha.cam.notrailer", noTrailer, "1");
     const bool writeTrailer = (atoi(noTrailer) == 0);
@@ -230,8 +240,9 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
     const size_t payloadCapacity = blobCapacity - sizeof(camera3_jpeg_blob_t);
     uint32_t lockW = blobW, lockH = blobH;
     if (writeTrailer && (uint64_t)lockW * lockH < blobCapacity) {
-        /* 尾标要写在缓冲末尾，映射必须覆盖到那里；把高度扩到够用即可
-         * （仍然是 2D 图像形状，不是 (capacity,1) 那种病态几何）。 */
+        /* The trailer goes at the end of the buffer so the mapping must reach there;
+         * extending the height is enough (still a 2D image shape, not the pathological
+         * (capacity,1) geometry). */
         lockH = (uint32_t)((blobCapacity + lockW - 1) / lockW);
     }
     const android::Rect blobRect((int)lockW, (int)lockH);
@@ -270,20 +281,23 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
 static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
                             uint8_t* dst, int dstW, int dstH);
 
-/* 【2026-11-22 预览条纹】gralloc 的 stride 不一定等于宽度（这块分配器会给对齐后的
- * 行距，例如 1440 宽的缓冲 stride 可能是 1472/1536）。我们原来是按 width 紧凑写进去
- * 的，于是每行错开 (stride-width) 像素，累积成规则条纹/斜纹 —— 用户看到的
- * "预览画面不正常" 就是这个。这里先捕到紧凑缓冲，再按真实 stride 逐行拷贝。 */
+/* [2026-11-22 preview stripes] gralloc's stride is not always the width (this
+ * allocator returns an aligned pitch, e.g. a 1440-wide buffer may be 1472 or 1536).
+ * We wrote tightly by width, so each row shifted by (stride-width) pixels and the
+ * error accumulated into regular stripes - that was the "preview looks wrong" the
+ * user saw. Capture into a packed buffer first, then copy row by row with the real
+ * stride. */
 static int surfaceStride(buffer_handle_t handle, int w) {
     if (!handle) return w;
     const MochaAnbHead* anb = reinterpret_cast<const MochaAnbHead*>(handle);
     const int stride = anb->stride;
-    if (stride < w || stride > w + 4096) return w;   /* 结构对不上就退化成紧凑写 */
+    if (stride < w || stride > w + 4096) return w;   /* fall back to a packed write if the layout is unexpected */
     return stride;
 }
 
-/* srcPacked 为空时表示"直接让 pipeline 把画面捕到 surface 上"（stride==width 的快路径，
- * 省掉一次 1.5MP 的中间拷贝，实测能从 65ms/帧回到 31ms/帧）。 */
+/* A null srcPacked means "let the pipeline capture straight into the surface" (the
+ * stride==width fast path: saves one 1.5 MP copy, 65 ms -> 31 ms per frame in
+ * testing). */
 static bool writeRgbaToSurface(mocha_camera_device_t* dev,
                               const camera3_stream_buffer_t& out,
                               const uint8_t* src, uint32_t srcW, uint32_t srcH,
@@ -293,9 +307,10 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
     const int h = (int)out.stream->height;
     if (w <= 0 || h <= 0) return false;
 
-    /* 快路径：stride 与宽度一致且不需要缩放时，直接写进 surface */
-    /* 慢路径的 src 不允许为空（快路径条件不满足时必须直接失败，
-     * 否则会把未初始化缓冲当画面写出去 —— 实测就是满屏规则条纹）。 */
+    /* Fast path: stride equals width and no scaling is needed, write the surface directly */
+    /* src must not be null on the slow path: if the fast path conditions are not
+     * met we have to fail instead of writing an uninitialised buffer out as the
+     * picture (in testing that gave full-screen regular stripes). */
     if (pipeline && !src && (int)srcW == w && (int)srcH == h) {
         void* vaddr = nullptr;
         const android::Rect rect(w, h);
@@ -309,7 +324,7 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
         }
         android::GraphicBufferMapper::get().unlock(*out.buffer);
         if (stride == w) return ret == 0;
-        /* stride 不一致：退回去走慢路径（下面会重新 lock 并按行写） */
+        /* stride mismatch: fall back to the slow path (lock again and write row by row below) */
     }
 
     const uint32_t need = (uint32_t)w * h * 4;
@@ -323,7 +338,7 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
         ALOGE("writeRgbaToSurface: no source frame for %dx%d", w, h);
         return false;
     }
-    /* 裁切/缩放（数字变焦也走这里）到紧凑的 w*h*4 */
+    /* Crop/scale (digital zoom too) into a packed w*h*4 */
     scaleRgbaNearest(src, (int)srcW, (int)srcH, dev->temp_out, w, h);
 
     void* vaddr = nullptr;
@@ -339,8 +354,8 @@ static bool writeRgbaToSurface(mocha_camera_device_t* dev,
         static int lastW = -1, lastStride = -1;
         if (w != lastW || stride != lastStride) {
             lastW = w; lastStride = stride;
-            ALOGI("preview surface: %dx%d stride=%d (紧凑写=%s)", w, h, stride,
-                  stride == w ? "是" : "否");
+            ALOGI("preview surface: %dx%d stride=%d (packed write=%s)", w, h, stride,
+                  stride == w ? "yes" : "no");
         }
     }
     if (stride == w) {
@@ -383,31 +398,33 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_ORIENTATION, &orientation, 1);
 
     // Available stream configurations
-    // 【2026-11-18 对齐 A12】A12 那台（能正常拍照/录像）对外只报两种尺寸：
-    // 1920x1080 与 1280x720，格式只有 BLOB / IMPLEMENTATION_DEFINED / YCbCr_420_888，
-    // 而且**没有任何大于 1080p 的 BLOB**（它的 jpeg.maxSize 就是 1920*1080*2）。
-    // 我们之前报了 3280x2464 的 8MP BLOB，Aperture 每次都挑它，于是走进
-    // NVIDIA 老 gralloc 的 8MP BLOB 加锁路径（AcquireBufferLock ... LockState -1），
-    // 拍照永远存不下来。这里按 A12 收敛尺寸，同时把 4:3 换成 16:9 —— 传感器
-    // 实际只输出 720p，多出来的尺寸本来就是最近邻放大出来的。
-    // 采集端（IMPL_DEF/YCbCr/YV12）只保留 1280x720：那是 V4L2 真正能出的尺寸。
-    /* 【2026-11-22 预览全屏】面板是 1536x2048（3:4），而传感器只出 16:9，
-     * 所以 1280x720/1920x1080 的预览旋转到竖屏后是 9:16 的窄条，左右各留
-     * 一块大黑边。这里补 1440x1080（4:3）—— 竖屏旋转后正好 3:4，铺满屏幕。
-     * 采集仍然走 1920x1080 的 16:9 全幅，4:3 输出由 cropScaleRgba 做
-     * 居中裁切（见 CameraPipeline.cpp），不拉伸、不变形。 */
-    /* 【2026-11-22 分相机尺寸表】前后摄的传感器模式表不同：
-     *   后摄 IMX179（8MP）：720p/1440x1080(4:3)/1080p/1920x1440/5MP/8MP；
-     *   前摄 OV5693（5MP）：720p/1080p/5MP（驱动 ov5693_s_stream 现在会按
-     *   请求尺寸编程读出窗口，见 ov5693.c）。
-     * 前摄不公布它传感器没有的尺寸（3264x2448 / 1920x1440 / 1440x1080），
-     * 否则 App 选了就走进 VI 超时 → TPG。 */
+    // [2026-11-18 match A12] That A12 unit (capture and recording work there)
+    // advertises only 1920x1080 and 1280x720, only BLOB / IMPLEMENTATION_DEFINED /
+    // YCbCr_420_888, and no BLOB above 1080p (jpeg.maxSize is 1920*1080*2). We
+    // advertised an 8 MP 3280x2464 BLOB, Aperture always picked it and went into the
+    // legacy NVIDIA gralloc 8 MP BLOB lock path (AcquireBufferLock ... LockState -1),
+    // so photos never saved. Converge on the A12 sizes and switch 4:3 to 16:9: the
+    // sensor only outputs 720p and the extra sizes were nearest-neighbour upscales.
+    // Capture side (IMPL_DEF/YCbCr/YV12) keeps 1280x720, the size V4L2 really outputs.
+    /* [2026-11-22 full-screen preview] The panel is 1536x2048 (3:4) but the sensor
+     * only outputs 16:9, so a rotated 1280x720/1920x1080 preview is a narrow 9:16
+     * strip with a big black band on each side. Add 1440x1080 (4:3): exactly 3:4 when
+     * rotated, it fills the screen. Capture still runs the full 16:9 1920x1080 and
+     * cropScaleRgba() centre-crops to 4:3 (see CameraPipeline.cpp), so nothing is
+     * stretched or distorted. */
+    /* [2026-11-22 per-camera size table] The two sensors have different mode tables:
+     *   back IMX179 (8 MP): 720p/1440x1080(4:3)/1080p/1920x1440/5MP/8MP;
+     *   front OV5693 (5 MP): 720p/1080p/5MP (ov5693_s_stream now programs the readout
+     *   window for the requested size, see ov5693.c).
+     * The front camera does not advertise sizes its sensor lacks (3264x2448 /
+     * 1920x1440 / 1440x1080); picking one led to a VI timeout and TPG. */
     static const int32_t rear_configs[] = {
-        /* 【2026-11-22 复原 4:3 预览】1440x1080 窗口的画面出规则波浪条纹
-         * （720p/5MP/8MP 都干净，唯独这个尺寸坏），且用户确认 720p 才正常。
-         * 按用户要求先把 4:3 预览复原：预览回到 16:9（1280x720/1920x1080），
-         * 全屏观感由 Aperture 的 fillCenter 居中裁切实现。1440x1080 的损坏
-         * 原因待查（VI 撕裂或 ISP stride），查清前不对外公布。 */
+        /* [2026-11-22 restore the 4:3 preview] The 1440x1080 window shows regular
+         * wavy stripes (720p/5MP/8MP are clean, only this size is bad) and the user
+         * confirmed 720p is the only correct one. Restoring 4:3 as requested: preview
+         * goes back to 16:9 (1280x720/1920x1080) and the full-screen look comes from
+         * Aperture's fillCenter crop. The 1440x1080 corruption is still unexplained
+         * (VI tearing or ISP stride); do not advertise it until that is understood. */
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1920, 1080, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
@@ -455,10 +472,11 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
         3264, 2448,
     };
 
-    /* 前摄：720p 是 OV5693 驱动唯一验证过的输出（初始化寄存器对 2624x1476
-     * 读出区做了 2x 缩放，未公开的缩放/binning 寄存器不能动 —— 2026-11-22
-     * 试图按 IMX179 方式编程 1:1 窗口导致连 720p 都 VI 超时，已回退）。
-     * 只公布 720p，App 选更大尺寸会回落到这里而不是走进 VI 超时。 */
+    /* Front camera: 720p is the only output the OV5693 driver is verified for (the
+     * init registers 2x-scale a 2624x1476 readout area and the undocumented
+     * scaling/binning registers must not be touched - programming a 1:1 window the
+     * IMX179 way on 2026-11-22 made even 720p hit a VI timeout and was reverted).
+     * Advertise 720p only; a larger request falls back here instead of a VI timeout. */
     static const int32_t front_configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
@@ -528,23 +546,24 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_FLASH_INFO_AVAILABLE, &flash_available, 1);
 
     // Sensor info
-    // 【2026-11-17 修正】前摄 pixelArray 由 2592x1944 改为 2624x1956。
-    // 依据：Android 12 参考机（Shield 图形栈那台）实测
-    //   android.sensor.info.pixelArraySize = 2624x1956（OV5693）
-    // 之前按 2592x1944 上报，导致 4:3 之外的宽高比对不上，Aperture 选尺寸时
-    // 会出现找不到匹配项、回落奇怪分辨率的情况。
+    // [2026-11-17 fix] Front pixelArray corrected from 2592x1944 to 2624x1956.
+    // Measured on the Android 12 reference unit (the one with the Shield graphics
+    // stack): android.sensor.info.pixelArraySize = 2624x1956 (OV5693).
+    // Reporting 2592x1944 broke every aspect ratio except 4:3, so Aperture failed to
+    // match a size and fell back to odd resolutions.
     int32_t sensor_width = cam.maxResolution;
     int32_t sensor_height = (cam.maxResolution == 3280) ? 2464 : 1956;
-    /* 【2026-11-18 对齐 A12】有效阵列改成 16:9。A12 的 activeArraySize 是
-     * [20 320 3240 1823]（约 3260x1823，1.79:1），pixelArray 仍是 3280x2464，
-     * 也就是说它把传感器裁成 16:9 再用。我们原来按整块 4:3 报，Aperture 出来的
-     * 取景框是 4:3，和 A12 的观感对不上（"画面比例"问题的由来）。
-     * 这里 3280/16*9 = 1845，取整到 1845。 */
-    /* 【2026-11-22 预览与拍照取景不一致】以前把有效阵列报成 16:9（3280x1845），
-     * 但我们所有采集模式都是传感器 4:3 的 1:1 中心裁切（1440x1080 / 2592x1944 /
-     * 3264x2448）。framework 按 16:9 的阵列去算 4:3 的裁切窗口，结果预览被裁成
-     * 中间一小块（看起来像被放大、纹理变成规则纹路），而拍照重建 pipeline 后
-     * 又按整帧出图 —— 两边取景对不上。改成把 4:3 有效区报上去。 */
+    /* [2026-11-18 match A12] The active array becomes 16:9. A12 reports
+     * [20 320 3240 1823] (about 3260x1823, 1.79:1) while pixelArray is still
+     * 3280x2464, i.e. it crops the sensor to 16:9. We reported the full 4:3 block, so
+     * Aperture's viewfinder came out 4:3 and did not look like A12 (that was the
+     * "aspect ratio" complaint). 3280/16*9 = 1845, rounded to 1845. */
+    /* [2026-11-22 preview and capture disagreed] The active array used to be reported
+     * as 16:9 (3280x1845), but every capture mode is a 1:1 centre crop of the sensor's
+     * 4:3 frame (1440x1080 / 2592x1944 / 3264x2448). The framework computed a 4:3 crop
+     * window from a 16:9 array, so the preview ended up as a small magnified centre
+     * patch (with regular texture patterns) while stills rebuilt the pipeline and came
+     * out full-frame. Report the 4:3 active area. */
     int32_t active_width  = (cam.maxResolution == 3280) ? 3264 : 2624;
     int32_t active_height = (cam.maxResolution == 3280) ? 2448 : 1956;
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_INFO_ACTIVE_ARRAY_SIZE,
@@ -554,12 +573,13 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
                               (int32_t[]){0, 0, active_width, active_height}, 4);
 
     // Physical sensor size (required for FOV calculation)
-    // 【2026-11-17 修正】原来两路写反了：后摄写 3.676x2.757（那其实是 OV5693
-    // 的量级），前摄写 2.8x2.1。按 Android 12 参考机实测值改回：
-    //   IMX179（后）: 4.5920 x 3.4496 mm  (1/3.2", 1.4um)
-    //   OV5693（前）: 3.6736 x 2.7384 mm
-    // 物理尺寸直接参与 FOV / 等效焦距换算，写反会让取景视野和"隐藏参数"里的
-    // 参数对不上。
+    // [2026-11-17 fix] The two entries were swapped: the back camera had 3.676x2.757
+    // (that is OV5693 territory) and the front had 2.8x2.1. Corrected to the values
+    // measured on the Android 12 reference unit:
+    //   IMX179 (back): 4.5920 x 3.4496 mm  (1/3.2", 1.4 um)
+    //   OV5693 (front): 3.6736 x 2.7384 mm
+    // The physical size feeds the FOV / equivalent focal length calculation, so a swap
+    // makes the viewfinder disagree with the "hidden parameters" readout.
     float phys_size[2];
     if (cameraId == 0) {
         phys_size[0] = 4.5920f;
@@ -646,11 +666,11 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_CONTROL_AE_AVAILABLE_MODES, ae_modes, sizeof(ae_modes)/sizeof(uint8_t));
 
     // Available AF modes (required by deriveCameraCharacteristicsKeys)
-    // 【2026-11-17 修正】前摄 OV5693 是定焦（没有 VCM，AD5823 只挂在后摄
-    // channel 0 上），原来两路都上报 AF，导致"隐藏参数"里前摄显示成
-    // "1-Front:5MP f/2.8, AF"，且 Aperture 会给前摄发 AF 请求、HAL 空跑扫描。
-    // 按 Android 12 参考机实测：后摄 afAvailableModes = {OFF, AUTO, CONTINUOUS_PICTURE}，
-    // 前摄只有 {OFF}。
+    // [2026-11-17 fix] The front OV5693 is fixed focus (no VCM, the AD5823 only sits
+    // on back channel 0), yet both cameras reported AF, so the front camera showed up
+    // as "1-Front:5MP f/2.8, AF" and Aperture sent AF requests that made the HAL sweep
+    // for nothing. Measured on the Android 12 reference: the back camera reports
+    // afAvailableModes = {OFF, AUTO, CONTINUOUS_PICTURE}, the front one only {OFF}.
     if (cameraId == 0) {
         uint8_t af_modes[] = {
             ANDROID_CONTROL_AF_MODE_OFF,
@@ -773,8 +793,8 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_MAX_ANALOG_SENSITIVITY, &max_analog_sensitivity, 1);
 
     // JPEG max size (required)
-    // 【2026-11-18 对齐 A12】A12 的 jpeg.maxSize 是 4149248（约 1920x1080x2），
-    // 我们原来按 8MP 报 16163840，framework 会据此给 BLOB 分配超大缓冲。
+    // [2026-11-18 match A12] A12's jpeg.maxSize is 4149248 (about 1920x1080x2); we
+    // reported 16163840 for 8 MP and the framework allocated a huge BLOB.
     int32_t jpeg_max_size = kMaxJpegSize;
     add_camera_metadata_entry(metadata, ANDROID_JPEG_MAX_SIZE, &jpeg_max_size, 1);
 
@@ -832,16 +852,17 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_SENSOR_AVAILABLE_TEST_PATTERN_MODES, test_pattern_modes, sizeof(test_pattern_modes)/sizeof(uint8_t));
 
     // Lens focal length (required by buildFastInfo)
-    // 【2026-11-17 修正】原来两路都写 3.5mm（占位值）。按 Android 12 参考机实测：
-    // 后摄 IMX179 = 3.36mm，前摄 OV5693 = 2.1mm。焦距参与 FOV 计算，
-    // 写错会让"隐藏参数"里显示的镜头信息和实际不符。
+    // [2026-11-17 fix] Both cameras used to report a placeholder 3.5 mm. Measured on
+    // the Android 12 reference: back IMX179 = 3.36 mm, front OV5693 = 2.1 mm. Focal
+    // length feeds the FOV calculation, so a wrong value makes the lens data in
+    // "hidden parameters" disagree with reality.
     float focal_lengths[1];
     focal_lengths[0] = (cameraId == 0) ? 3.36f : 2.10f;
     add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS, focal_lengths, 1);
 
     // Lens aperture (required by some framework paths)
-    // 【2026-11-17 修正】原来写 2.8（占位值）。两颗模组实际都是 f/2.0，
-    // Android 12 参考机实测 availableApertures = {2.0}，这里对齐。
+    // [2026-11-17 fix] Used to be a placeholder 2.8. Both modules are actually f/2.0 as
+    // measured on the Android 12 reference (availableApertures = {2.0}).
     float apertures[] = { 2.0f };
     add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_APERTURES, apertures, sizeof(apertures)/sizeof(float));
 
@@ -1068,9 +1089,10 @@ static int camera_device_initialize(const camera3_device_t *device, const camera
     return 0;
 }
 
-/* 【2026-11-22】建立/重建采集 pipeline。
- * configureStreams 与高分辨率拍照共用：拍照瞬间切到 2592x1944、拍完再切回预览尺寸，
- * 这样预览能保持 30fps，而照片是真 5MP（不是放大出来的）。 */
+/* [2026-11-22] Create or rebuild the capture pipeline.
+ * configureStreams and high-resolution capture share it: capture briefly switches to
+ * 2592x1944 and switches back to the preview size afterwards, so the preview keeps
+ * 30 fps while the photo is a real 5 MP frame instead of an upscale. */
 static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
                           int inheritExposure = 0, int inheritGain = 0) {
     if (dev->pipeline) {
@@ -1093,7 +1115,7 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
     }
 
     mocha::PipelineConfig pipelineConfig;
-    memset(&pipelineConfig, 0, sizeof(pipelineConfig));   /* 新字段不能留随机值 */
+    memset(&pipelineConfig, 0, sizeof(pipelineConfig));   /* new fields must not hold garbage */
     pipelineConfig.width = w;
     pipelineConfig.height = h;
     /* Bayer pattern must match the V4L2 format requested below:
@@ -1107,11 +1129,12 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
 
     pipelineConfig.enableISP = true;
 
-     /* 【画面全黑修复 2026-11-16】blackLevel 单位是 raw10_to_8bit 输出的
-      * 8-bit 刻度（代码里 v>>2 之后才减）。IMX179 10-bit 黑电平典型 64
-      * （10-bit 域），换算到 8-bit 是 64/4=16。上一轮误把 10-bit 的 64
-      * 直接填进来，而夜间画面均值 239(10-bit)=59(8-bit)<64，被饱和减法
-      * 钳到 0，整幅预览全黑（AE luma=0.00）。改为 16。 */
+     /* [black screen fix 2026-11-16] blackLevel is in the 8-bit scale of the
+      * raw10_to_8bit output (the code subtracts after v>>2). IMX179's 10-bit black
+      * level is typically 64 in the 10-bit domain, which is 64/4=16 in 8-bit. The
+      * previous round put the 10-bit 64 here, and since a night frame averages 239
+      * (10-bit) = 59 (8-bit) < 64, the saturating subtraction clamped everything to 0
+      * and the whole preview went black (AE luma=0.00). Use 16. */
      pipelineConfig.blackLevel = 16;
      pipelineConfig.wbGain[0] = 1.0f;  // R gain
      pipelineConfig.wbGain[1] = 1.0f;  // G gain
@@ -1125,16 +1148,19 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
      // Auto Exposure y Auto White Balance
      pipelineConfig.enableAE = true;
      pipelineConfig.enableAWB = true;  // corrige tinte verdoso
-    /* 【2026-11-22 过曝】AE 是在 gamma 之前的线性域测亮度，0.55 相当于把画面推到
-     * 接近饱和（实测白窗帘场景 57% 像素贴到 255、均值 231/255）。线性域中灰约
-     * 0.18~0.22，取 0.20。软件增益同时从 1.5 收回 1.0：那是早先为了压暗场加的，
-     * 现在传感器有 2500 行曝光余量，再乘 1.5 只会把亮部洗白。
-     * 【2026-11-22 前摄偏暗】0.20 是按后摄 IMX179（原生灵敏度）定的。前摄
-     * OV5693 在同样目标下明显偏暗（用户实测"非常暗黑"），提到 0.32：
-     * 线性域 0.32 过 gamma(0.55) 后约 60/255，暗场可用又不至于把亮部推饱和。 */
+    /* [2026-11-22 overexposure] AE measures luma in the linear domain before gamma,
+     * so 0.55 pushes the picture close to saturation (white curtains measured 57% of
+     * pixels at 255, mean 231/255). Mid-grey in linear is about 0.18-0.22, so use
+     * 0.20. Software gain also drops from 1.5 back to 1.0: that was added to brighten
+     * dark scenes, but the sensor now has 2500 lines of exposure headroom and
+     * multiplying by 1.5 only washes out the highlights.
+     * [2026-11-22 front camera too dark] 0.20 was tuned for the back IMX179 native
+     * sensitivity. The front OV5693 is clearly darker at the same target (the user
+     * called it "very dark"), so raise it to 0.32: 0.32 in linear becomes about 60/255
+     * after gamma(0.55), usable in the dark without clipping the highlights. */
     pipelineConfig.targetLuma = (dev->camera_id == 1) ? 0.32f : 0.20f;
     pipelineConfig.digitalGain = 1.0f;
-    /* 高分辨率拍照重建 pipeline 时继承已经收敛的曝光/增益（见 PipelineConfig 注释）。 */
+    /* Rebuilding the pipeline for a high-resolution still inherits the converged exposure/gain (see the PipelineConfig comment). */
     pipelineConfig.initialExposure = inheritExposure;
     pipelineConfig.initialGain = inheritGain;
  
@@ -1229,9 +1255,10 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *s = config->streams[i];
         if (s->stream_type != CAMERA3_STREAM_OUTPUT) continue;
-        /* 【2026-11-22 高分辨率拍照】BLOB 不参与采集尺寸的竞争：照片流常常是
-         * 2592x1944，若让它顶起 pipeline，预览会掉到 7fps。拍照瞬间由
-         * process_capture_request 临时切上去、拍完切回来。 */
+        /* [2026-11-22 high-resolution capture] The BLOB does not compete for the capture
+         * size: a photo stream is often 2592x1944 and letting it drive the pipeline
+         * drops the preview to 7 fps. process_capture_request switches to it briefly
+         * and switches back after the shot. */
         if (s->format == HAL_PIXEL_FORMAT_BLOB) continue;
         uint32_t area = s->width * s->height;
         if (area > pipeArea) { pipeArea = area; pipeW = s->width; pipeH = s->height; }
@@ -1245,11 +1272,12 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
                                                     : (1280u * 720u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
-    /* 【2026-11-22】采集分辨率 = 最大的输出流，只受 kMaxArea 封顶。
-     * 4:3 预览（1440x1080）就按 1440x1080 采集：传感器给的是居中 1:1 裁切，
-     * 输出端不用再缩放，既省一次大图缩放也更锐。 */
-    /* 【2026-11-22】调试用：persist.mocha.cam.pipew/pipeh 可以把采集尺寸钉在
-     * 指定值，用来单独验证某个传感器模式能不能稳定出帧，不用改代码重编。 */
+    /* [2026-11-22] Capture resolution follows the largest output stream, capped only
+     * by kMaxArea. A 4:3 preview (1440x1080) is therefore captured at 1440x1080: the
+     * sensor already delivers a centred 1:1 crop, so the output side need not rescale,
+     * which saves one large rescale and looks sharper. */
+    /* [2026-11-22] Debug aid: persist.mocha.cam.pipew/pipeh pin the capture size so a
+     * sensor mode can be validated for stable frames without a rebuild. */
     {
         char pw[PROPERTY_VALUE_MAX] = {0}, ph[PROPERTY_VALUE_MAX] = {0};
         property_get("persist.mocha.cam.pipew", pw, "0");
@@ -1295,23 +1323,25 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
         }
     }
 
-    /* 每次 configure 前清空编码器流登记，避免上次会话的悬空指针。 */
+    /* Clear the encoder stream registration before every configure to avoid a stale pointer from the last session. */
     for (int k = 0; k < 4; k++) gEncoderStreams[k] = nullptr;
-    /* 【2026-11-22 拍照落盘】所有输出流都补 GRALLOC_USAGE_SW_WRITE_OFTEN：
-     * BLOB 缓冲是 HAL 用 CPU 直接写 JPEG 的，缺这个 usage 时 vendor gralloc
-     * 分配出来的映射不保证可写，写完之后 App 侧再 lock 会一直
-     * "AcquireBufferLock timed out ... LockState -1"（拍照存不下来、最后 ANR）。
-     * 参考 Dargons10 的 lineage-19.1 设备树，它对每条流都加了这一位。 */
+    /* [2026-11-22 still capture] Every output stream gets
+     * GRALLOC_USAGE_SW_WRITE_OFTEN: the BLOB is written by the HAL on the CPU, and
+     * without this usage vendor gralloc does not guarantee a writable mapping, so the
+     * app's next lock spins forever ("AcquireBufferLock timed out ... LockState -1") and
+     * capture fails or ends in an ANR. The Dargons10 lineage-19.1 tree sets this bit on
+     * every stream for the same reason. */
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type != CAMERA3_STREAM_OUTPUT) continue;
         stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
-        /* Tegra gralloc 只对相机分配放行 flexible YUV，缺这位会 EINVAL。
-         * 【2026-11-22 录像 0 帧】编码器输入流被我们改成了 YV12，但只给
-         * YCbCr_420_888 加了 HW_CAMERA_WRITE —— YV12 的分配被 gralloc 拒绝，
-         * framework dequeue 一直 -EINVAL（Camera3-OutputStream: Stream 2:
-         * Can't dequeue next output buffer: Invalid argument），MediaRecorder
-         * 永远等不到视频关键帧。给 YV12 也加上。 */
+        /* Tegra gralloc only accepts flexible YUV for camera allocations; without this
+         * bit the allocation gets EINVAL.
+         * [2026-11-22 recording produced 0 frames] The encoder input stream was changed
+         * to YV12 but HW_CAMERA_WRITE was only added for YCbCr_420_888, so the YV12
+         * allocation was refused and the framework's dequeue kept returning -EINVAL
+         * (Camera3-OutputStream: Stream 2: Can't dequeue next output buffer: Invalid
+         * argument), hence no video keyframe ever arrived. Add it for YV12 too. */
         if (stream->format == HAL_PIXEL_FORMAT_YCbCr_420_888 ||
             stream->format == HAL_PIXEL_FORMAT_YV12) {
             stream->usage |= GRALLOC_USAGE_HW_CAMERA_WRITE;
@@ -1321,30 +1351,31 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
         camera3_stream_t *stream = config->streams[i];
         if (stream->stream_type == CAMERA3_STREAM_OUTPUT &&
             stream->format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
-            /* 【录像修复 2026-11-17】录像时框架多配一条"编码器输入流"
-             * （usage 带 GRALLOC_USAGE_HW_VIDEO_ENCODER）。MediaCodec 的
-             * input Surface 只接受 YUV，之前把所有 PRIV 流统一改成 RGBA_8888，
-             * 编码器拿到 RGBA 缓冲后一帧都出不来（CameraX 报
-             * ERROR_NO_VALID_DATA、screenrecord 也是 recorded 0 frames）。
-             * 这里把编码器流保留为 YCbCr_420_888，pipeline 原生支持写 YUV；
-             * 预览流仍然用 RGBA_8888。 */
+            /* [recording fix 2026-11-17] While recording the framework configures an extra
+             * "encoder input stream" (usage includes GRALLOC_USAGE_HW_VIDEO_ENCODER).
+             * MediaCodec's input Surface only accepts YUV, and every PRIV stream used to be
+             * rewritten to RGBA_8888, so the encoder got RGBA buffers and produced not a
+             * single frame (CameraX reported ERROR_NO_VALID_DATA, screenrecord recorded 0
+             * frames). The encoder stream stays YCbCr_420_888, which the pipeline writes
+             * natively as YUV; the preview stays RGBA_8888. */
             if ((stream->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) != 0) {
-                /* 【2026-11-18】真机 GraphiBuffer 构造日志已定性：
+                /* [2026-11-18] The on-device GraphicBuffer log settled it:
                  *   err=3 (GRALLOC1_ERROR_UNSUPPORTED) fmt=0x23 usage=0x10033 mapperVersion=2
-                 * 即 **vendor gralloc1 不支持 YCbCr_420_888 + HW_VIDEO_ENCODER** 这个组合，
-                 * 编码器输入缓冲根本分配不出来。改用 YV12 —— 老 NVIDIA 相机/编码路径
-                 * 一直支持的格式，我们的 fan-out 也有 YV12 铺平面的兜底分支。 */
-                /* 【2026-11-22】YV12 无论如何配 usage 都被 vendor gralloc 拒绝
-                 * （dequeue -22）。回到 YCbCr_420_888：11-18 失败的是
-                 * YCbCr + HW_VIDEO_ENCODER 组合，现在 HW_VIDEO_ENCODER 已剥掉，
-                 * 分配走的是 flexible YUV + 相机写路径（shim 有放行逻辑）。 */
+                 * i.e. **vendor gralloc1 does not support YCbCr_420_888 + HW_VIDEO_ENCODER**,
+                 * so the encoder input buffer could not be allocated at all. Use YV12, which
+                 * the old NVIDIA camera/encoder path always supported and which our fan-out
+                 * already handles with a plane-packing fallback. */
+                /* [2026-11-22] YV12 is refused by vendor gralloc with any usage (dequeue
+                 * -22), so go back to YCbCr_420_888: what failed on 11-18 was the YCbCr +
+                 * HW_VIDEO_ENCODER combination, and with HW_VIDEO_ENCODER stripped the
+                 * allocation takes the flexible YUV camera-write path (the shim allows it). */
                 stream->format = HAL_PIXEL_FORMAT_YCbCr_420_888;
                 stream->usage |= GRALLOC_USAGE_SW_WRITE_OFTEN;
-                /* 【2026-11-22 录像 0 帧】YV12 + HW_VIDEO_ENCODER 的组合被 vendor
-                 * gralloc 拒绝（dequeue 一直 -EINVAL，MediaRecorder 等不到视频
-                 * 关键帧，连 OpenCamera/MediaRecorder 都 0 产出）。这个位只是
-                 * 分配建议——缓冲是 HAL 用 CPU 写、编码器用 GPU/硬件读，去掉它
-                 * 分配就能过。 */
+                /* [2026-11-22 recording 0 frames] YV12 + HW_VIDEO_ENCODER is refused by vendor
+                 * gralloc (dequeue always -EINVAL, MediaRecorder never gets a keyframe and
+                 * both OpenCamera and MediaRecorder produce nothing). The bit is only an
+                 * allocation hint - the HAL writes with the CPU and the encoder reads with
+                 * GPU/hardware - so dropping it lets the allocation through. */
                 stream->usage &= ~GRALLOC_USAGE_HW_VIDEO_ENCODER;
                 for (int k = 0; k < 4; k++) {
                     if (gEncoderStreams[k] == nullptr) {
@@ -1352,9 +1383,9 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
                         break;
                     }
                 }
-                /* 【2026-11-18】回到 4：实测 max_buffers=2 时 Camera3 的 dequeue 直接
-                 * 返回 -EINVAL（mocha-dequeue 日志：max_buffers=2 total=4 handedOut=0），
-                 * 4 个槽位时至少能正常 dequeue、录制能起来。 */
+                /* [2026-11-18] Back to 4: with max_buffers=2 Camera3's dequeue returned
+                 * -EINVAL outright (mocha-dequeue log: max_buffers=2 total=4 handedOut=0),
+                 * while 4 slots at least dequeue normally and recording starts. */
                 if (stream->max_buffers < 4) {
                     stream->max_buffers = 4;
                 }
@@ -1365,7 +1396,7 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
             }
         }
     }
-    /* pipeline 的建立/配置收敛到 openPipelineAt()（高分辨率拍照也复用它）。 */
+    /* Pipeline creation and configuration live in openPipelineAt() (high-resolution capture reuses it). */
     int ret = openPipelineAt(dev, pipeW, pipeH);
     if (ret != 0) {
         ALOGE("configureStreams: openPipelineAt(%ux%u) failed: %d", pipeW, pipeH, ret);
@@ -1567,7 +1598,7 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
     add_camera_metadata_entry(metadata, ANDROID_REQUEST_ID, &requestId, 1);
 
     /* ANDROID_SCALER_CROP_REGION - full active array (16:9, see init_static_characteristics) */
-    /* 【2026-11-18】原来硬编码 3280x2464（4:3），前摄也照抄；现在跟随 16:9 有效阵列。 */
+    /* [2026-11-18] Used to be hard-coded to the 4:3 3280x2464 for both cameras; now it follows the 16:9 active array. */
     int32_t cropRegion[4] = {
         gAppliedCrop[0], gAppliedCrop[1], gAppliedCrop[2], gAppliedCrop[3]
     };
@@ -1607,21 +1638,24 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
 
 // Copy a captured frame from one gralloc buffer to another (same format/dimensions).
 // Used to fan a single captured frame out to every output stream (preview + video).
-// 【拍照保存修复 2026-11-17】改用 GraphicBufferMapper（mapper@2.1），与 App 侧
-// 锁语义一致，避免 NVIDIA 跨进程 LockState 残留。
-/* 【录像修复 2026-11-17】RGBA_8888 最近邻缩放。
- * 录像时框架会配两个 output 流：预览流和编码器输入流，两者分辨率常常不同
- * （例如预览 1280x720、录像 1920x1080）。原来 copyFrameBetweenBuffers 遇到
- * 尺寸不同直接 return，导致**编码器那条流从来没被写过**，MediaCodec 等不到
- * 关键帧，CameraX 最终报 ERROR_NO_VALID_DATA、DCIM 里没有 mp4。
- * 这里按目标分辨率做一次最近邻缩放（先预算列映射，内层只有查表和拷贝，
- * 720p→1080p 在 TK1 上大约几十毫秒，比双线性省一半以上内存带宽）。 */
+// [still-capture fix 2026-11-17] Use GraphicBufferMapper (mapper@2.1) so the lock
+// semantics match the app's and no NVIDIA cross-process LockState leaks.
+/* [recording fix 2026-11-17] Nearest-neighbour RGBA_8888 scaling.
+ * While recording the framework configures two output streams, preview and encoder
+ * input, usually at different resolutions (preview 1280x720, recording 1920x1080).
+ * copyFrameBetweenBuffers() used to return early when the sizes differed, so
+ * **the encoder stream was never written**, MediaCodec never saw a keyframe and
+ * CameraX ended with ERROR_NO_VALID_DATA and no mp4 in DCIM.
+ * Scale to the target resolution here (column map precomputed, the inner loop is
+ * table lookup plus copy; 720p->1080p costs tens of ms on TK1, half the memory
+ * bandwidth of a bilinear filter). */
 static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
                              uint8_t* dst, int dstW, int dstH) {
     if (!src || !dst || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
 
-    /* 【2026-11-22】宽高比不同时按目标比例居中裁切再缩放（不拉伸）。
-     * 例如 16:9 采集 -> 4:3 预览只裁掉左右；同比例时裁切窗口就是整幅。 */
+    /* [2026-11-22] When the aspect ratios differ, centre-crop to the target ratio
+     * before scaling (no stretching). A 16:9 capture into a 4:3 preview only loses the
+     * sides; with equal ratios the crop window is the whole frame. */
     int cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
     if ((int64_t)srcW * dstH > (int64_t)srcH * dstW) {
         cropW = (int)((int64_t)srcH * dstW / dstH) & ~1;
@@ -1633,7 +1667,7 @@ static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
         cropY = (srcH - cropH) / 2;
     }
 
-    /* 列映射：dstX -> srcX，避免每像素做除法 */
+    /* Column map dstX -> srcX so the per-pixel loop needs no division */
     std::vector<int> xmap(dstW);
     for (int x = 0; x < dstW; x++)
         xmap[x] = cropX + (int)((int64_t)x * cropW / dstW);
@@ -1650,19 +1684,20 @@ static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
     }
 }
 
-/* 【录像修复 2026-11-17】RGBA_8888 -> YUV420（BT.601，limited range）。
- * 编码器输入 Surface 的缓冲是 YUV，而 pipeline 出的画面是 RGBA，
- * 所以 fan-out 到编码器那条流时必须做一次颜色空间转换。
- * android_ycbcr 的布局由 gralloc 决定：chroma_step==2 是 NV12/NV21 那样的
- * 半平面（Cb/Cr 交错），==1 是 I420 的独立平面，这里两种都支持。 */
+/* [recording fix 2026-11-17] RGBA_8888 -> YUV420 (BT.601, limited range).
+ * The encoder input Surface holds YUV while the pipeline produces RGBA, so the
+ * fan-out to the encoder stream needs a colour space conversion.
+ * gralloc decides the android_ycbcr layout: chroma_step==2 is a semi-planar
+ * NV12/NV21 style buffer (interleaved Cb/Cr), ==1 is I420 with separate planes;
+ * both are supported here. */
 static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
                                int dstW, int dstH, struct android_ycbcr* out) {
     if (!rgba || !out || !out->y || !out->cb || !out->cr) return;
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     const int w = dstW, h = dstH;
 
-    /* 【2026-11-22】与 scaleRgbaNearest 一致：宽高比不同时居中裁切，
-     * 保证编码流的画面不被拉宽/压扁。 */
+    /* [2026-11-22] Same as scaleRgbaNearest: centre-crop on aspect mismatch so the
+     * encoder stream is never stretched or squeezed. */
     int cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
     if ((int64_t)srcW * dstH > (int64_t)srcH * dstW) {
         cropW = (int)((int64_t)srcH * dstW / dstH) & ~1;
@@ -1725,9 +1760,9 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
     }
 }
 
-/* 把整幅 RGBA 写进一条 YUV 输出流：优先用 gralloc 给出的真实平面布局
- * （lockYCbCr），不支持时退化成 lock() + 假定 YV12（Y + V + U）。
- * 【2026-11-22】多流同一帧要写多条流时复用这段。 */
+/* Write a whole RGBA frame into a YUV output stream: prefer the real plane layout
+ * from lockYCbCr, and fall back to lock() with an assumed YV12 (Y + V + U) layout
+ * when that is unsupported. [2026-11-22] Shared by multi-stream writes of one frame. */
 static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
                              const uint8_t* rgba, int sw, int sh) {
     if (!dst || !dst->buffer || !dst->stream || !rgba) return false;
@@ -1768,8 +1803,9 @@ static void copyFrameBetweenBuffers(
         const camera3_stream_buffer_t* src, const camera3_stream_buffer_t* dst) {
     if (!src || !dst || !src->buffer || !dst->buffer) return;
     const bool srcRgba = (src->stream->format == HAL_PIXEL_FORMAT_RGBA_8888);
-    /* 【2026-11-18 方案1】编码器流的 format 现在是 IMPLEMENTATION_DEFINED（没改写），
-     * 这里用内部标记把它仍然按 YUV 目标处理，走 NV12/YV12 写入路径。 */
+    /* [2026-11-18 plan 1] The encoder stream format is IMPLEMENTATION_DEFINED (not
+     * rewritten), so the internal marker still routes it to the YUV target and the
+     * NV12/YV12 write path. */
     const bool dstYuv  = (dst->stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) ||
                          isEncoderStream(dst->stream);
     if (src->stream->format != dst->stream->format && !(srcRgba && dstYuv)) {
@@ -1781,8 +1817,8 @@ static void copyFrameBetweenBuffers(
             (src->stream->width != dst->stream->width ||
              src->stream->height != dst->stream->height);
     if (needScale) {
-        /* 不再直接放弃：缩放到目标流分辨率（见 scaleRgbaNearest 注释）。
-         * 只在尺寸组合变化时打一条日志，避免每帧刷屏。 */
+        /* No longer give up: scale to the target stream size instead (see the
+         * scaleRgbaNearest comment). Log once per size combination, not per frame. */
         static uint32_t lastSrcW = 0, lastSrcH = 0, lastDstW = 0, lastDstH = 0;
         if (lastSrcW != src->stream->width || lastSrcH != src->stream->height ||
             lastDstW != dst->stream->width || lastDstH != dst->stream->height) {
@@ -1804,16 +1840,16 @@ static void copyFrameBetweenBuffers(
         return;
     }
     if (dstYuv) {
-        /* 目标是编码器那条 YUV 流：先用 lockYCbCr 拿到真实的平面布局，
-         * 再把 RGBA 转成 YUV420 写进去（同时按需缩放）。
+        /* The target is the encoder YUV stream: lockYCbCr first for the real plane
+         * layout, then convert RGBA to YUV420 while scaling as needed.
          *
-         * 【录像修复 2026-11-17】原厂 gralloc 是新旧混杂的：README 里记着它对
-         * YV12 的 lockYCbCr 直接返回 -ENOSYS（SoftwareRenderer 那次遇到过），
-         * 但 HAL_PIXEL_FORMAT_YCBCR_420_888 走的是另一条分支，未必也不支持。
-         * 所以这里两条路都走：lockYCbCr 能用就用它给的 ystride/cstride/
-         * chroma_step；用不了就退化成 lock() + 按 YV12 手工铺平面。
-         * 不管走哪条，第一次都打一行布局日志——下次真机验证时一眼就能看出
-         * 编码器那条流到底是哪种布局。 */
+         * [recording fix 2026-11-17] The vendor gralloc is a mix of old and new: the
+         * README notes that lockYCbCr on YV12 returns -ENOSYS (hit by SoftwareRenderer),
+         * but HAL_PIXEL_FORMAT_YCBCR_420_888 takes a different branch and may be
+         * supported. So try both: use the ystride/cstride/chroma_step lockYCbCr reports
+         * when it works, else fall back to lock() and pack YV12 by hand. Either way log
+         * the layout once, so the next on-device run shows at a glance which layout the
+         * encoder stream really has. */
         struct android_ycbcr ycbcr;
         memset(&ycbcr, 0, sizeof(ycbcr));
         ret = android::GraphicBufferMapper::get().lockYCbCr(*dst->buffer,
@@ -1832,10 +1868,10 @@ static void copyFrameBetweenBuffers(
                                &ycbcr);
             android::GraphicBufferMapper::get().unlock(*dst->buffer);
         } else {
-            /* 退化路径：gralloc 不支持对这条流 lockYCbCr。
-             * 假设内部就是 YV12（Y 平面 + V + U），stride 取宽——录像用的
-             * 1280/1920 都是 32 的整数倍，原厂 YV12 stride 就是按 32 对齐的，
-             * 这两个分辨率下 stride == width 成立。 */
+            /* Fallback: gralloc cannot lockYCbCr this stream. Assume YV12 internally
+             * (Y plane + V + U) with stride = width: the 1280/1920 sizes used for
+             * recording are multiples of 32 and the vendor YV12 stride is 32-aligned, so
+             * stride == width holds for both. */
             void* yuvVaddr = nullptr;
             int lockRet = android::GraphicBufferMapper::get().lock(*dst->buffer,
                     GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &yuvVaddr);
@@ -1849,7 +1885,7 @@ static void copyFrameBetweenBuffers(
                 ycbcr.cstride = (size_t)w / 2;
                 ycbcr.chroma_step = 1;
                 ycbcr.y = static_cast<uint8_t*>(yuvVaddr);
-                /* YV12：V 平面在前，U 平面在后，各占 w*h/4 */
+                /* YV12: V plane first, then U, w*h/4 each */
                 ycbcr.cr = static_cast<uint8_t*>(yuvVaddr) + ySize;
                 ycbcr.cb = static_cast<uint8_t*>(yuvVaddr) + ySize + ySize / 4;
                 if (!fallbackLogged) {
@@ -1877,7 +1913,7 @@ static void copyFrameBetweenBuffers(
         ALOGE("copyFrameBetweenBuffers: failed to lock dst buffer: %d", ret);
         return;
     }
-    // RGBA_8888: 4 bytes/pixel（configure_streams 已把所有非 BLOB 流改成 RGBA_8888）
+    // RGBA_8888: 4 bytes/pixel (configure_streams rewrote every non-BLOB stream)
     if (needScale) {
         scaleRgbaNearest(static_cast<const uint8_t*>(srcVaddr),
                          (int)src->stream->width, (int)src->stream->height,
@@ -1914,14 +1950,16 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         return -EINVAL;
     }
 
-    /* 【2026-11-23 fence 泄漏】HAL3 合同：process_capture_request 一旦被接受，
-     * 请求里每条输出缓冲的 acquire_fence fd 都归 HAL 所有，无论走哪条路径
-     * 都必须 close。此前只关 captureBuf 一个，错误路径/多流路径上的其余
-     * fence 全部泄漏 —— cameraserver 的 fd 表以每帧一个 sync_fence 的速度
-     * 增长，约 18 分钟撞满 32768 上限，之后 binder 传输 GraphicBuffer 时
-     * fcntl(F_DUPFD_CLOEXEC) 失败（Parcel fds[i]=-1 → EMFILE），requestBuffer
-     * 报 FAILED_TRANSACTION，任何相机 App 预览约 25 分钟后死亡（OpenCamera
-     * 会话短没暴露，Aperture 长会话先炸）。这里统一等待并关闭全部 fence。 */
+    /* [2026-11-23 fence leak] The HAL3 contract: once process_capture_request is
+     * accepted, every output buffer's acquire_fence fd in the request belongs to the
+     * HAL and must be closed on every path. Only captureBuf used to be closed, so all
+     * the other fences leaked on error and multi-stream paths: cameraserver's fd table
+     * grew by one sync_fence per frame, hit the 32768 limit after about 18 minutes, and
+     * then binder failed to transfer GraphicBuffers because
+     * fcntl(F_DUPFD_CLOEXEC) returned EMFILE (Parcel fds[i]=-1), requestBuffer
+     * reported FAILED_TRANSACTION and any camera app died after about 25 minutes of
+     * preview (OpenCamera sessions are short and hid it; Aperture blew up first). Wait
+     * for and close every fence in one place here. */
     for (uint32_t fi = 0; fi < request->num_output_buffers; fi++) {
         int af = request->output_buffers[fi].acquire_fence;
         if (af >= 0) {
@@ -1940,12 +1978,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
     // Check if this frame was marked as error by flush()
     uint32_t frameNum = request->frame_number;
     if (dev->inflight_tracker && dev->inflight_tracker->isError(frameNum)) {
-        /* 【2026-11-22 录像 -38】原来这里直接 return -EAGAIN。HAL3 规范要求
-         * process_capture_request 只对畸形请求报错；CamDevSession 包装层把
-         * 其它错误一律映射为 INTERNAL_ERROR，框架再映射成 INVALID_OPERATION
-         * (-38)，Camera2Client 当致命错误直接拆会话（Error 1 → App 退出）。
-         * 改为清除标记、正常取帧：捕获成功交 OK，失败走尾部统一的 REQUEST
-         * 错误通知 + 缓冲 ERROR 状态（框架丢弃并重试）。 */
+        /* [2026-11-22 recording -38] This used to return -EAGAIN directly. HAL3 only
+         * allows process_capture_request to fail for malformed requests; the CamDevSession
+         * wrapper maps any other error to INTERNAL_ERROR, the framework maps that to
+         * INVALID_OPERATION (-38) and Camera2Client tears the session down as fatal
+         * (Error 1 -> app exits). Clear the flag and capture normally instead: success
+         * reports OK, failure goes through the shared REQUEST error notification plus a
+         * buffer ERROR state, which the framework discards and retries. */
         ALOGW("Frame %u was marked by flush, recapturing", frameNum);
         dev->inflight_tracker->remove(frameNum);
     }
@@ -2011,9 +2050,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         }
     }
 
-    // 【2026-11-17 修正】前摄 OV5693 定焦、没有 VCM，这里只让后摄走 AF 流程。
-    // 前摄就算 framework 误发 AF 请求也不再空跑对比度扫描（每次扫描要独占
-    // V4L2 若干帧，会让前摄预览卡顿）。
+    // [2026-11-17 fix] The front OV5693 is fixed focus with no VCM, so only the back
+    // camera runs the AF flow. Even if the framework sends an AF request to the front
+    // camera it no longer sweeps (each sweep owns the V4L2 device for several frames and
+    // makes the front preview stutter).
     if (dev->pipeline && dev->camera_id == 0) {
         mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (dev->af_mode == ANDROID_CONTROL_AF_MODE_AUTO ||
@@ -2025,13 +2065,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             } else if (dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
                        dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_IDLE &&
                        !dev->af_trigger_handled) {
-                /* 【修复 2026-11-17】CONTINUOUS_PICTURE 模式下 framework 只发
-                 * mode=4/trigger=0（IDLE），从不发 AF_TRIGGER_START —— 它期望
-                 * HAL 自动持续对焦。原代码只在 trigger==START 时扫描，于是
-                 * Aperture 全程不对焦、画面一直糊（实测 10:05 日志
-                 * "AF request: mode=4 trigger=0" 连续出现，无任何 AF: coarse）。
-                 * 这里在连续对焦模式下也主动跑一次扫描（场景变化由后续
-                 * 重新打开或 preview 重启再触发），至少让用户拍到合焦画面。 */
+                /* [fix 2026-11-17] In CONTINUOUS_PICTURE mode the framework only sends
+                 * mode=4/trigger=0 (IDLE) and never AF_TRIGGER_START - it expects the HAL
+                 * to keep focusing. The old code only scanned on trigger==START, so
+                 * Aperture never focused and the picture stayed blurry (the 10:05 log shows
+                 * "AF request: mode=4 trigger=0" repeatedly and never an "AF: coarse"). Run
+                 * one sweep in continuous mode too, triggered by later session or preview
+                 * restarts, so the user at least gets a focused frame. */
                 ALOGI("AF: CONTINUOUS_PICTURE, running initial scan");
                 p->startAfScan();
                 dev->af_trigger_handled = true;
@@ -2043,10 +2083,11 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         }
     }
 
-    /* 【录像修复 2026-11-17】优先用 RGBA 的流做采集目标。
-     * 录像时两条流里编码器那条是 YUV，如果从它开始采集，fan-out 就得做
-     * YUV->RGBA 转换（没实现、也更贵）；反过来以 RGBA 预览流为源、向编码器
-     * 流做 RGBA->YUV，两条流都能拿到正确内容，代价也小。 */
+    /* [recording fix 2026-11-17] Prefer an RGBA stream as the capture source. While
+     * recording the encoder stream is YUV, and capturing from it would need a
+     * YUV->RGBA conversion in the fan-out (unimplemented and more expensive);
+     * sourcing from the RGBA preview and doing RGBA->YUV towards the encoder gives
+     * both streams correct content for less work. */
     const camera3_stream_buffer_t* captureBuf = &request->output_buffers[0];
     for (uint32_t bi = 0; bi < request->num_output_buffers; bi++) {
         if (request->output_buffers[bi].stream &&
@@ -2063,7 +2104,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         return -EINVAL;
     }
 
-    /* acquire_fence 已在函数入口统一等待并关闭（见上方 fence 泄漏修复）。 */
+    /* acquire_fence is already waited for and closed at function entry (see the fence leak fix above). */
 
     ALOGI("Processing capture: frame=%llu stream=%dx%d format=%d pipeline=%dx%d",
           (unsigned long long)request->frame_number,
@@ -2073,12 +2114,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
  
     bool frameCaptured = false;
 
-    /* 【2026-11-22 预览全屏】多流（预览 + 编码 / 预览 + 照片 YUV）时，先按
-     * pipeline 分辨率捕一帧到临时 RGBA，再按每条流自己的宽高比裁切缩放写入。
-     * 原因：4:3 预览是 16:9 采集的中心裁切；若先把画面缩进预览、再拿它去放大
-     * 填 16:9 的编码流，画面会被横向拉宽（变形）。各流独立裁切才正确，顺带让
-     * 照片/录像拿到真正的 1080p，而不是 720p 预览再放大。
-     * 单流（纯预览 / 纯拍照 BLOB）仍走下面的零拷贝直写路径。 */
+    /* [2026-11-22 full-screen preview] With multiple streams (preview + encoder, or
+     * preview + photo YUV), capture one frame at the pipeline resolution into a scratch
+     * RGBA buffer, then crop and scale per stream with that stream's own aspect ratio.
+     * A 4:3 preview is a centre crop of a 16:9 capture; scaling the preview and then
+     * blowing it up to fill a 16:9 encoder stream stretches the picture horizontally.
+     * Independent per-stream crops are correct and also give photos and recordings a
+     * real 1080p instead of an upscaled 720p preview.
+     * Single-stream cases (preview only, BLOB only) keep the zero-copy direct write. */
     uint32_t nonBlobStreams = 0, maxNonBlobArea = 0;
     bool hasBlobStream = false;
     for (uint32_t i = 0; i < request->num_output_buffers; i++) {
@@ -2089,9 +2132,11 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         const uint32_t area = s->width * s->height;
         if (area > maxNonBlobArea) maxNonBlobArea = area;
     }
-    /* 只有各流宽高比不一致时才需要这条路径：那时候「先缩进预览、再放大到编码流」
-     * 会把画面拉变形。两路同比例（录像的常见情况）直接用零拷贝直写更省、
-     * 也不会碰 CameraX 的 GL 输出面（实测多流 SW 写入会诱发 libglcore 崩溃）。 */
+    /* This path is only needed when the streams disagree on aspect ratio: then "shrink
+     * into the preview, then blow up into the encoder" would distort the picture. Two
+     * streams with the same ratio (the usual recording case) are cheaper through the
+     * zero-copy direct write, and avoid touching CameraX's GL output surface
+     * (multi-stream software writes triggered libglcore crashes in testing). */
     bool aspectMismatch = false;
     if (!hasBlobStream && nonBlobStreams > 1 && captureBuf->stream) {
         const uint64_t refW = captureBuf->stream->width;
@@ -2105,11 +2150,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             }
         }
     }
-    /* 【2026-11-22 录像无关键帧】只要请求带不止一条输出流就必须走 fan-out：
-     * 录像会话是 预览(RGBA 4:3) + 编码流(YV12) + BLOB 三条流，同尺寸时宽高比
-     * 一致，之前收紧成"仅宽高比不一致才走"后，编码流在单流分支里被完全跳过
-     * → MediaRecorder 永远等不到视频关键帧（OpenCamera/Aperture 录像全都
-     * 0 产出）。aspectMismatch 现在只影响裁切行为（函数内部已各自处理）。 */
+    /* [2026-11-22 recording without keyframes] Any request with more than one output
+     * stream must go through the fan-out: a recording session configures preview
+     * (RGBA 4:3) + encoder (YV12) + BLOB, and with equal sizes the aspect ratios match.
+     * When the condition was tightened to "only on aspect mismatch", the encoder stream
+     * was skipped entirely in the single-stream branch, so MediaRecorder never got a
+     * keyframe (OpenCamera and Aperture recordings produced nothing). aspectMismatch now
+     * only affects cropping, which each branch handles itself. */
     (void)aspectMismatch;
     if (dev->pipeline && dev->streams_configured &&
         request->num_output_buffers > 1) {
@@ -2123,9 +2170,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             }
         }
         uint32_t pipeW = dev->pipeline_width, pipeH = dev->pipeline_height;
-        /* 【2026-11-22 高分辨率拍照】照片流比采集尺寸大时，临时把采集切到照片
-         * 尺寸，拍完立刻切回：预览仍是 30fps 的快尺寸，照片是真 5MP
-         * （而不是把 1080p 放大出来的假高分辨率）。 */
+        /* [2026-11-22 high-resolution capture] When the photo stream is larger than the
+         * capture size, switch capture to the photo size briefly and switch back right
+         * after: the preview keeps its fast 30 fps size while the photo is a real 5 MP
+         * frame, not an upscaled 1080p. */
         uint32_t restoreW = 0, restoreH = 0;
         if (hasBlobStream) {
             uint32_t wantW = 0, wantH = 0, best = pipeW * pipeH;
@@ -2141,7 +2189,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 if (openPipelineAt(dev, wantW, wantH, keepExp, keepGain) == 0) {
                     restoreW = pipeW; restoreH = pipeH;
                     pipeW = wantW; pipeH = wantH;
-                    /* openPipelineAt 已经把旧对象 delete 了，必须重新取指针。 */
+                    /* openPipelineAt() already deleted the old object, so the pointer must be fetched again. */
                     pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
                     ALOGI("still capture: pipeline switched to %ux%u for the shot", pipeW, pipeH);
                 } else {
@@ -2156,14 +2204,16 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
             dev->temp_rgba_size = rgbaSize;
         }
-        /* 【2026-11-22】刚切过传感器模式时 AE/AWB 是从默认值重新收敛的，
-         * 直接取帧会得到偏暗、偏绿的图（8MP 实测）。先丢几帧喂给 3A 再正式取。 */
+        /* [2026-11-22] Right after a sensor mode switch AE/AWB reconverge from
+         * defaults and capturing immediately gives a dark, green-tinted frame (measured
+         * at 8 MP). Drop a few frames for 3A before capturing. */
         if (restoreW && dev->temp_rgba) {
             for (int warm = 0; warm < 5; warm++)
                 (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
         }
-        /* 【2026-11-22】刚切过传感器模式时 AE/AWB 是从默认值重新收敛的，
-         * 直接取帧会得到偏暗、偏绿的图（8MP 实测）。先丢几帧喂给 3A 再正式取。 */
+        /* [2026-11-22] Right after a sensor mode switch AE/AWB reconverge from
+         * defaults and capturing immediately gives a dark, green-tinted frame (measured
+         * at 8 MP). Drop a few frames for 3A before capturing. */
         if (restoreW && dev->temp_rgba) {
             for (int warm = 0; warm < 5; warm++)
                 (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
@@ -2171,9 +2221,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         int captureRet = -ENOMEM;
         if (dev->temp_rgba)
             captureRet = pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
-        /* 【2026-11-22 录像 -38】取帧失败（含 -EAGAIN）不再 return：CamDevSession
-         * 包装层把任何非 BAD_VALUE 错误映射为致命错误，录制会话直接被拆。
-         * 落到下面的 else 走 REQUEST 错误通知流程。 */
+        /* [2026-11-22 recording -38] A failed capture (including -EAGAIN) no longer
+         * returns: the CamDevSession wrapper turns any non-BAD_VALUE error into a fatal
+         * one and the recording session is torn down. Fall through to the else branch and
+         * report a REQUEST error instead. */
         if (captureRet == 0) {
             bool allOk = true;
             for (uint32_t i = 0; i < request->num_output_buffers; i++) {
@@ -2221,7 +2272,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 ALOGI("still capture: pipeline restored to %ux%u", restoreW, restoreH);
         }
     } else if (dev->pipeline && dev->streams_configured) {
-    // Capture frame from pipeline（单流零拷贝直写路径）
+    // Capture a frame from the pipeline (single-stream zero-copy direct write)
         mocha::CameraPipeline* pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
 
         // Auto-restart pipeline if it was stopped by flush()
@@ -2240,11 +2291,12 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
 
         /* BLOB format = JPEG still capture */
         if (buf.stream->format == HAL_PIXEL_FORMAT_BLOB) {
-            /* 【2026-11-22】照片按 BLOB 流的尺寸出：JPEG 的宽高必须等于流声明的
-             * 宽高，否则 framework/App 会丢掉这张图（实测 4:3 照片流 + 16:9
-             * 编码 -> 一行 "JPEG captured" 但 DCIM 里没有文件）。
-             * captureFrameRgba 自带裁切缩放，直接按 BLOB 尺寸捕一帧即可，
-             * 4:3 照片就是 16:9 采集的居中裁切，和预览取景一致。 */
+            /* [2026-11-22] Stills come out at the BLOB stream size: the JPEG width and
+             * height must match what the stream declared, otherwise the framework or app
+             * throws the picture away (measured with a 4:3 photo stream plus a 16:9
+             * encoder: one "JPEG captured" line and no file in DCIM). captureFrameRgba()
+             * crops and scales, so capture at the BLOB size and a 4:3 photo becomes a
+             * centre crop of the 16:9 capture, matching the preview framing. */
             const uint32_t blobW = buf.stream->width;
             const uint32_t blobH = buf.stream->height;
             const uint32_t rgbaSize = blobW * blobH * 4;
@@ -2256,9 +2308,11 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             if (!dev->temp_rgba) {
                 ALOGE("Failed to allocate temp RGBA buffer");
             } else {
-                /* 单流拍照（Aperture/CameraX 就是这种：BLOB 单独一个请求）：
-                 * 采集尺寸不够 BLOB 大时先切上去，丢几帧喂 3A，取帧，拍完切回。
-                 * 写 JPEG 走 writeJpegToBlob（图像几何 lock、不写尾标），与多流路径一致。 */
+                /* Single-stream still capture (what Aperture/CameraX do: the BLOB gets its
+                 * own request): if the capture size is smaller than the BLOB, switch up
+                 * briefly, drop a few frames for 3A, capture and switch back.
+                 * writeJpegToBlob() locks by image geometry and skips the trailer, same as
+                 * the multi-stream path. */
                 const uint32_t keepW = dev->pipeline_width, keepH = dev->pipeline_height;
                 bool switched = false;
                 if (blobW * blobH > keepW * keepH) {
@@ -2286,7 +2340,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                     blobBuf.stream = buf.stream;
                     frameCaptured = writeJpegToBlob(dev, blobBuf, dev->temp_rgba, blobW, blobH);
                 } else {
-                    /* 【2026-11-22 录像 -38】-EAGAIN 也不 return，原因同上。 */
+                    /* [2026-11-22 recording -38] -EAGAIN does not return either, for the reason above. */
                     ALOGE("Failed to capture frame for JPEG: %d", captureRet);
                 }
             }
@@ -2321,13 +2375,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 if (captureRet == 0) {
                     frameCaptured = true;
                 }
-                /* 【2026-11-22 录像 -38】captureRet == -EAGAIN 时不再 unlock 后
-                 * return -EAGAIN（致命错误映射问题），统一走尾部错误流程。 */
+                /* [2026-11-22 recording -38] On captureRet == -EAGAIN do not unlock and return
+                 * -EAGAIN (fatal error mapping); use the shared error path at the end. */
                 android::GraphicBufferMapper::get().unlock(handle);
             }
         } else {
-            /* 预览（RGBA/IMPLEMENTATION_DEFINED）：先捕到紧凑缓冲，再按 surface 的
-             * 真实 stride 逐行写出去（见 writeRgbaToSurface 注释）。 */
+            /* Preview (RGBA/IMPLEMENTATION_DEFINED): capture into a packed buffer first, then
+             * write it out row by row using the surface's real stride (see the
+             * writeRgbaToSurface comment). */
             const uint32_t w = buf.stream->width, h = buf.stream->height;
             const uint32_t need = w * h * 4;
             if (!dev->temp_rgba || dev->temp_rgba_size < need) {
@@ -2514,10 +2569,11 @@ int MochaCameraHAL::openCamera(int cameraId, hw_device_t **device) {
 
     mocha_camera_device_t *dev = (mocha_camera_device_t *)*device;
     dev->camera_id = cameraId;
-    /* 【2026-11-18】result metadata 里要用到本路传感器的有效阵列尺寸（crop region），
-     * 而 build_result_metadata() 拿不到 cameraId，这里用一个文件级变量记住当前
-     * 打开的相机。以前那里硬编码 3280x2464，前摄（2624x1956）上报的 crop region
-     * 比实际传感器还大，CameraX 做裁剪换算会算错。 */
+    /* [2026-11-18] The result metadata needs this sensor's active array size (crop
+     * region) and build_result_metadata() has no camera id, so the currently open camera
+     * is kept in a file-level variable. It used to be hard-coded to 3280x2464, so the
+     * front camera (2624x1956) reported a crop region larger than its sensor and
+     * CameraX's crop maths came out wrong. */
     gActiveCameraId = cameraId;
 
     ALOGI("Camera %d opened successfully", cameraId);

@@ -134,11 +134,12 @@ int CameraPipeline::setExposure(int exposure) {
     ctrl.id = V4L2_CID_EXPOSURE;
     ctrl.value = exposure;
     /*
-     * 【曝光 I2C 失败修复 2026-11-16】mocha 的相机 I2C 总线（tegra12-i2c.2）
-     * 对 IMX179 写入偶发超时（dmesg 实测 -110/-121，写 0x0202 失败后紧接着
-     * 读 chip ID 却成功），单次 VIDIOC_S_CTRL 失败率高。内核侧 tegra-i2c
-     * 驱动只重试 2 次，这里在用户态再补 3 次重试（间隔 10ms），
-     * 否则 AE 环每帧报 errno=5(EIO)、曝光永远定在 800，画面过暗。
+     * [exposure I2C failure fix 2026-11-16] mocha's camera I2C bus (tegra12-i2c.2)
+     * occasionally times out writing to IMX179 (dmesg: -110/-121, writing 0x0202
+     * fails and the chip ID read right after succeeds), so a single VIDIOC_S_CTRL
+     * has a high failure rate. The kernel tegra-i2c driver only retries twice, so
+     * retry three more times here (10 ms apart); otherwise the AE loop reports
+     * errno=5 (EIO) every frame, exposure sticks at 800 and the picture is too dark.
      */
     int ret = -1;
     for (int retry = 0; retry < 3; retry++) {
@@ -317,12 +318,14 @@ int CameraPipeline::configure(const PipelineConfig& config) {
 int CameraPipeline::startStreaming() {
     if (mState != PIPELINE_OPENED) return -EINVAL;
 
-    /* 【2026-11-22 录像 0 帧】stopStreaming() 在 STREAMOFF 后 munmap 全部缓冲
-     * 并把 mBufferCount 清零；本函数原来只 QBUF mBufferCount 个——flush 之后
-     * （录像启动必然触发 camera_device_flush → STREAMOFF → 重启流）这里就是
-     * 0 个，STREAMON 时 VI 的 buf_queue 为空（内核日志 "0 buffers ... buf_queue=
-     * EMPTY"），之后每次 DQBUF 都拿不到帧，录像的视频轨道全程 0 帧。
-     * 现在检测到无缓冲就按 configure() 的同一套流程重新 REQBUFS + mmap。 */
+    /* [2026-11-22 recording 0 frames] stopStreaming() munmaps every buffer after
+     * STREAMOFF and zeroes mBufferCount, but this function used to QBUF only
+     * mBufferCount buffers - which is 0 after a flush (starting a recording always
+     * triggers camera_device_flush -> STREAMOFF -> stream restart). STREAMON then
+     * left the VI buf_queue empty (kernel log: "0 buffers ... buf_queue=EMPTY") and
+     * every later DQBUF came back empty, so the video track stayed at 0 frames for
+     * the whole recording. If no buffers are queued, the configure() REQBUFS + mmap
+     * sequence is repeated now. */
     if (mBufferCount == 0) {
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
@@ -437,11 +440,13 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     float avgLuma = (float)sum / count / 255.0f;
     float target = mConfig.targetLuma;
 
-    /* 【2026-11-22 闪烁】原来每帧都按 target/avg 直接乘上去，没有死区也没有步长
-     * 限制：曝光档一过冲就反向往回跳，画面肉眼可见地忽明忽暗（用户实测）。
-     * 现在改成"比例控制 + 死区"：
-     *   - 偏差在 ±12% 以内完全不动（挡掉量化噪声与档位抖动）；
-     *   - 每次只走 60% 的差距，且单帧最多 1.33×/0.75×，保证单调收敛不过冲。 */
+    /* [2026-11-22 flicker] Every frame used to multiply straight by target/avg with
+     * no dead zone and no step limit, so an overshoot flipped the exposure back and
+     * the picture visibly pulsed (measured by the user). It is proportional control
+     * with a dead zone now:
+     *   - within +/-12% nothing moves (rejects quantisation noise and step jitter);
+     *   - each step covers only 60% of the gap and at most 1.33x/0.75x per frame, so
+     *     it converges monotonically without overshoot. */
     if (avgLuma > target * 0.88f && avgLuma < target * 1.12f) {
         return;
     }
@@ -458,11 +463,13 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
      * (v4l2_ctrl_new_std in imx179.c). The old caps (2000/120) saturated on
      * ordinary indoor scenes and left the frame badly underexposed even
      * though the sensor still had headroom. */
-    /* 【2026-11-22】驱动侧 imx179 允许 exposure 1..2500、gain 0..255。之前把
-     * gain 卡在 180，暗场只能靠软件增益硬抬（实测抬到 3.91× 再加 AWB 的 2.18×，
-     * 画面被洗成一片白）。真实传感器增益优先。 */
-    /* 实测把 gain 上限放到 255 会让画面反而全黑（驱动寄存器不是线性映射，
-     * 0x40 才是 1x）。180 是这台机器上验证过的最大可用值。 */
+    /* [2026-11-22] The imx179 driver allows exposure 1..2500 and gain 0..255. Gain
+     * used to be capped at 180, so dark scenes could only be pushed with software
+     * gain (measured up to 3.91x, times 2.18x from AWB, which washed the picture
+     * white). Prefer real sensor gain. */
+    /* Measured: raising the gain cap to 255 makes the picture go black instead (the
+     * driver registers are not a linear mapping; 0x40 is 1x). 180 is the highest
+     * usable value verified on this device. */
     const int kExpMax = 2500;
     const int kGainMax = 180;
 
@@ -502,8 +509,9 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     if (mCurrentExposure >= 2500 && mCurrentGain >= kGainMax) {
         float dg = mDigitalGain;
         if (avgLuma < target * 0.8f) {
-            /* 【2026-11-22】这里原来按 need 无限向上抬（实测到 3.91×），把画面洗白、
-             * 噪点也放大。软件增益只用来补一点点，天花板 1.5×。 */
+            /* [2026-11-22] This used to raise without limit until need was met (measured
+             * up to 3.91x), washing out the picture and amplifying noise. Software gain
+             * only fills small gaps now, ceiling 1.5x. */
             float need = target / (avgLuma > 0.05f ? avgLuma : 0.05f);
             if (need > 1.25f) need = 1.25f;
             dg = dg * need;
@@ -547,14 +555,16 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     float avgG = (float)sumG / pixelCount;
     float avgB = (float)sumB / pixelCount;
 
-    /* 【2026-11-23 暗场绿偏】全局平均在暗场会被暗部像素的噪声谱主导：
-     * 台灯照亮的一面白墙只占 11% 像素，88% 是 OV5693 绿主导的暗噪声，
-     * 算出的增益只中和"全帧均值"，亮着的墙反而没人管。暗场时改用
-     * 最亮十分位样本（真正的白参考：被照亮的表面/高光）来算增益；
-     * 亮场景全局统计已被验证是准的（后摄 R/G=1.00），保持不动。 */
+    /* [2026-11-23 dark-scene green cast] The global average is dominated by noise in
+     * the dark: a white wall lit by a lamp covers only 11% of the pixels while 88% is
+     * OV5693's green-dominated dark noise, so the computed gain only neutralises the
+     * full-frame mean and the lit wall is never corrected. In dark scenes the gain
+     * comes from the brightest decile instead (the real white reference: lit surfaces
+     * and highlights); bright-scene global statistics are verified correct (back
+     * camera R/G=1.00) and stay untouched. */
     bool dark = (avgG < 30.0f);
     if (dark) {
-        /* Pass 1: 采样网格的亮度直方图，找最亮十分位的门槛。 */
+        /* Pass 1: luma histogram over the sample grid, to find the brightest-decile threshold. */
         uint32_t hist[256];
         memset(hist, 0, sizeof(hist));
         for (int y = 0; y < h; y += step) {
@@ -574,7 +584,7 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
             if (seen >= brightTarget) { brightThr = i; break; }
         }
 
-        /* Pass 2: 只累计门槛以上的样本。 */
+        /* Pass 2: accumulate only the samples above the threshold. */
         uint64_t bR = 0, bG = 0, bB = 0;
         uint32_t bN = 0;
         for (int y = 0; y < h; y += step) {
@@ -591,8 +601,9 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
             }
         }
 
-        /* 亮区要有足够的样本和真实信号（avgG>=8，低于这个就是噪声谱）
-         * 才值得换参考；否则保持现增益不追噪声。 */
+        /* The bright region needs enough samples and real signal (avgG>=8, below that
+         * it is the noise floor) before the reference is switched; otherwise keep the
+         * current gain and do not chase noise. */
         if (bN >= 100) {
             float bAvgR = (float)bR / bN;
             float bAvgG = (float)bG / bN;
@@ -607,13 +618,15 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
                 return;
             }
         }
-        /* 没凑够样本就走全局平均（原行为）。 */
+        /* Not enough samples: fall back to the global average (previous behaviour). */
     }
 
-    /* 【2026-11-22 前摄偏绿】暗场里三通道均值都很低，原来 <5 直接跳过 AWB，
-     * 于是 OV5693 的原生绿色偏色（前摄"偏绿"的来源）在暗场完全无人修正。
-     * 降到 2：10-bit raw 下 2/4≈八位 0.5，噪声仍不至于把均值推到假平衡。
-     * 5 的门槛只对后摄高亮度场景有意义，前摄暗场必须也参与。 */
+    /* [2026-11-22 front camera green cast] All three channel means are tiny in the
+     * dark and AWB used to be skipped below 5, so OV5693's native green cast (the
+     * source of "the front camera is green") was never corrected in the dark. Lower it
+     * to 2: 2/4 is about 0.5 in 8-bit terms and noise still cannot push the means into
+     * a false balance. The 5 threshold only made sense for bright back-camera scenes;
+     * the dark front camera has to take part too. */
     if (avgR < 2.0f || avgG < 2.0f || avgB < 2.0f) return;
 
     float rGain = avgG / avgR;
@@ -803,10 +816,11 @@ int CameraPipeline::captureFrameDirect(uint8_t* outputBuffer, uint32_t outputFor
 static void cropScaleRgba(const uint8_t* src, int sw, int sh,
                           uint8_t* dst, int dw, int dh,
                           int cx, int cy, int cw, int ch) {
-    /* 【2026-11-22 预览全屏】裁切窗口的宽高比与输出不一致时，先按输出比例
-     * 把窗口居中收紧，再做最近邻缩放。这样 16:9 采集 -> 4:3 预览是"居中
-     * 裁掉左右"，而不是把画面横向压扁；窗口本来就同比例时（录像/拍照）
-     * 这段什么也不改，行为与之前完全一致。 */
+    /* [2026-11-22 full-screen preview] When the crop window aspect differs from the
+     * output, first tighten the window around its centre to the output ratio and then
+     * scale nearest-neighbour, so 16:9 capture -> 4:3 preview crops the sides instead
+     * of squeezing the picture horizontally. When the ratios already match (recording,
+     * stills) nothing here changes and behaviour is exactly as before. */
     if (cw > 0 && ch > 0 && dw > 0 && dh > 0) {
         if ((int64_t)cw * dh > (int64_t)ch * dw) {
             int nw = (int)((int64_t)ch * dw / dh) & ~1;
@@ -865,9 +879,10 @@ int CameraPipeline::captureFrameRgba(uint8_t* outputBuffer,
                             mCropH == (int)mConfig.height &&
                             outW == mConfig.width && outH == mConfig.height);
     if (fullFrame) {
-        /* 【2026-11-22】这里原来先调了一次 processBayerToYuv(nullptr, ...)
-         * 再捕帧：空指针进 demosaic，纯属白跑一趟还往输出缓冲写垃圾。整幅
-         * 直接走 captureFrameInternal（它自己会做 demosaic/WB/gamma/翻转）。 */
+        /* [2026-11-22] This used to call processBayerToYuv(nullptr, ...) once before
+         * capturing: a null pointer into demosaic, a wasted call that also wrote
+         * garbage into the output buffer. The whole frame goes straight through
+         * captureFrameInternal, which does demosaic/WB/gamma/flip itself. */
         return captureFrameInternal(outputBuffer);
     }
     /* general path: full-frame RGBA, then crop+scale */

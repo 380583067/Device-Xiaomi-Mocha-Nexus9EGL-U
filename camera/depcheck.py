@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-递归分析一个 ELF 库的整条依赖树，找出所有运行时无法解析的未定义符号。
+Walk the whole dependency tree of an ELF library and report every undefined
+symbol that cannot be resolved at run time.
 
-背景：只检查 camera.vendor.tegra.so 自己的 345 个 UND 符号是不够的 ——
-它的依赖（libcuda.so / libphs.so / libnvmm_camera_v3.so ...）自身也可能引用
-在本 ROM 上不存在的符号，导致整条 dlopen 链断掉。
-（实际踩到：libcuda.so -> NvPHSSetThrottle，libphs.so 里只有 NvPHSSendThroughputHints。）
+Why: checking only the 345 UND symbols of camera.vendor.tegra.so is not enough -
+its dependencies (libcuda.so / libphs.so / libnvmm_camera_v3.so ...) can also
+reference symbols this ROM does not have, which breaks the whole dlopen chain.
+(Seen for real: libcuda.so -> NvPHSSetThrottle, while libphs.so only exports
+NvPHSSendThroughputHints.)
 
-用法：
+Usage:
     python3 depcheck.py <root.so> [--lib-dirs dir1 dir2 ...]
 """
 
@@ -28,7 +30,7 @@ def readelf_dyn(path, args):
         return []
     rows = []
     for line in out.stdout.splitlines():
-        # 形如：  194: 00000000     0 FUNC    GLOBAL DEFAULT  UND _ZN...
+        # layout:  194: 00000000     0 FUNC    GLOBAL DEFAULT  UND _ZN...
         parts = line.split()
         if len(parts) < 8 or not parts[0].endswith(":"):
             continue
@@ -37,7 +39,7 @@ def readelf_dyn(path, args):
 
 
 def get_exported(path):
-    """返回该库导出的符号名集合（排除 UND）。"""
+    """Return the set of symbol names this library exports (UND excluded)."""
     syms = set()
     for p in readelf_dyn(path, "--dyn-syms -W"):
         # p: [num, value, size, type, bind, vis, ndx, name]
@@ -103,8 +105,8 @@ def main():
             return True
         return any(path.startswith(d + os.sep) for d in recurse_only_in)
 
-    # 1. BFS 遍历依赖树
-    tree = {}          # realpath -> 依赖的 SONAME 列表
+    # 1. walk the dependency tree breadth first
+    tree = {}          # realpath -> list of needed SONAMEs
     missing_files = []
     queue = deque([os.path.abspath(args.root)])
     visited = set()
@@ -115,8 +117,9 @@ def main():
         visited.add(cur)
         needed = get_needed(cur)
         tree[cur] = needed
-        # 系统 framework 库（system/lib 下那些）只用来提供符号，不深入遍历，
-        # 否则会顺着 libstagefright/libcodec2 一路扩散到整个媒体栈。
+        # System framework libraries (the ones under system/lib) are only used as a
+        # symbol source and are not traversed, otherwise the walk spreads through
+        # libstagefright/libcodec2 into the whole media stack.
         if not should_recurse(cur):
             continue
         for n in needed:
@@ -126,9 +129,10 @@ def main():
             elif p not in visited:
                 queue.append(p)
 
-    print(f"依赖树共 {len(tree)} 个库\n")
+    print(f"dependency tree: {len(tree)} libraries\n")
 
-    # 2. 收集全树中所有库导出的符号（同一个 namespace 下可互相解析）
+    # 2. collect the symbols exported by every library in the tree (resolvable
+    #    within one namespace)
     exported = set()
     for p in tree:
         exported |= get_exported(p)
@@ -139,14 +143,15 @@ def main():
                 s = line.strip()
                 if s:
                     exported.add(s.split("@")[0])
-        print(f"（额外载入符号池：{len(exported)} 个）")
+        print(f"(extra symbols loaded, pool now {len(exported)})")
 
-    # 3. 逐个库找无法解析的 UND
+    # 3. per library, find the UND symbols that cannot be resolved
     print("=" * 78)
-    print("无法解析的符号（按库分组）")
+    print("unresolved symbols, grouped by library")
     print("=" * 78)
     total = 0
-    # 这些是 libc/libm/libdl 等稳定 ABI，readelf 从这些库读不到符号属正常
+    # These are stable ABI from libc/libm/libdl and friends; readelf cannot read
+    # their symbols, which is expected.
     ignore_prefix = ("__aeabi_", "__gnu_", "_Unwind_")
 
     for p in sorted(tree):
@@ -156,19 +161,19 @@ def main():
             total += len(miss)
             print(f"\n### {p}")
             for s in miss:
-                # 顺便尝试 demangle，便于人工判断
+                # also try demangling so a human can read it
                 d = subprocess.run(["c++filt", s], capture_output=True, text=True).stdout.strip()
                 print(f"    {s}" + (f"\n        -> {d}" if d != s else ""))
 
     print("\n" + "=" * 78)
     if missing_files:
-        print("缺失的库文件：")
+        print("missing library files:")
         for src, n in missing_files:
-            print(f"    {n}   (被 {os.path.basename(src)} 需要)")
+            print(f"    {n}   (needed by {os.path.basename(src)})")
     else:
-        print("缺失的库文件：无")
+        print("missing library files: none")
 
-    print(f"\n合计无法解析符号：{total}")
+    print(f"\nunresolved symbols in total: {total}")
     return 0 if total == 0 and not missing_files else 1
 
 
