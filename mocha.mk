@@ -406,11 +406,6 @@ PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.ccodec=0 \
     debug.stagefright.omx_default_rank=768 \
     debug.stagefright.omx_default_rank.sw-other=100
-PRODUCT_PROPERTY_OVERRIDES += \
-    debug.stagefright.c2-poolmask=0xF0000 \
-    debug.stagefright.ccodec=4 \
-    debug.stagefright.omx_default_rank=768 \
-    debug.stagefright.omx_default_rank.sw-other=100
 
 # [mocha 2026-11-21] 4 = every component keeps its normal rank, so OMX (0x100)
 # outranks Codec2 software (0x200) and OMX is tried first - which is what the
