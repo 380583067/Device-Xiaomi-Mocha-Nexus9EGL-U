@@ -1914,6 +1914,29 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         return -EINVAL;
     }
 
+    /* 【2026-11-23 fence 泄漏】HAL3 合同：process_capture_request 一旦被接受，
+     * 请求里每条输出缓冲的 acquire_fence fd 都归 HAL 所有，无论走哪条路径
+     * 都必须 close。此前只关 captureBuf 一个，错误路径/多流路径上的其余
+     * fence 全部泄漏 —— cameraserver 的 fd 表以每帧一个 sync_fence 的速度
+     * 增长，约 18 分钟撞满 32768 上限，之后 binder 传输 GraphicBuffer 时
+     * fcntl(F_DUPFD_CLOEXEC) 失败（Parcel fds[i]=-1 → EMFILE），requestBuffer
+     * 报 FAILED_TRANSACTION，任何相机 App 预览约 25 分钟后死亡（OpenCamera
+     * 会话短没暴露，Aperture 长会话先炸）。这里统一等待并关闭全部 fence。 */
+    for (uint32_t fi = 0; fi < request->num_output_buffers; fi++) {
+        int af = request->output_buffers[fi].acquire_fence;
+        if (af >= 0) {
+            struct pollfd pfd;
+            pfd.fd = af;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, 500);
+            if (pr <= 0) {
+                ALOGW("acquire fence (buf %u) not signaled in 500ms, proceeding", fi);
+            }
+            close(af);
+        }
+    }
+
     // Check if this frame was marked as error by flush()
     uint32_t frameNum = request->frame_number;
     if (dev->inflight_tracker && dev->inflight_tracker->isError(frameNum)) {
@@ -2040,25 +2063,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         return -EINVAL;
     }
 
-    // Wait for acquire_fence before writing to buffer
-    int fence = buf.acquire_fence;
-    if (fence >= 0) {
-        // Wait up to 2000ms for the buffer to be ready
-        struct pollfd pfd;
-        pfd.fd = fence;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int pollRet = poll(&pfd, 1, 2000);
-        if (pollRet > 0 && (pfd.revents & POLLIN)) {
-            // Fence signaled, buffer is ready
-            ALOGV("Acquire fence signaled for frame %u", frameNum);
-        } else if (pollRet == 0) {
-            ALOGW("Acquire fence timeout for frame %u, proceeding anyway", frameNum);
-        } else {
-            ALOGW("Acquire fence poll error for frame %u: %s", frameNum, strerror(errno));
-        }
-        close(fence);
-    }
+    /* acquire_fence 已在函数入口统一等待并关闭（见上方 fence 泄漏修复）。 */
 
     ALOGI("Processing capture: frame=%llu stream=%dx%d format=%d pipeline=%dx%d",
           (unsigned long long)request->frame_number,

@@ -112,6 +112,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <dirent.h>
 #include <cutils/properties.h>
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
@@ -153,6 +154,12 @@ static int (*gVendorLockAsyncYCbCr)(const gralloc_module_t *, buffer_handle_t,
 static int (*gVendorUnlockAsync)(const gralloc_module_t *, buffer_handle_t,
                                  int *) = NULL;
 
+static int (*gVendorUnlock)(const gralloc_module_t *,
+                            buffer_handle_t) = NULL;
+
+static int (*gVendorLockAsync)(const gralloc_module_t *, buffer_handle_t, int,
+                               int, int, int, int, void **, int) = NULL;
+
 /*
  * The allocator as the vendor wrote it, kept before its pointer is replaced.
  * Reading it back out of the device would read the replacement, and the first
@@ -176,6 +183,24 @@ static bool tracing() {
     }
 
     return state == 1;
+}
+
+/* 【2026-11-23 fd 泄漏探针】cameraserver 的 fd 表以每帧一个 sync_fence 的速度
+ * 增长，撞满 32768 上限后 Parcel fd 翻译失败，任何相机 App 预览 25 分钟即死。
+ * 每次 vendor 调用前后数一遍 /proc/self/fd，trace 门控，谁在造 fd 一眼可见。 */
+static int fd_probe_count(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int n = 0;
+    while (readdir(d) != NULL) n++;
+    closedir(d);
+    return n - 3; /* ".", "..", 和目录自身的 fd */
+}
+
+static void fd_probe(const char *what, int before, int after) {
+    if (tracing() && after != before) {
+        ALOGI("fdprobe %s: %d -> %d (%+d)", what, before, after, after - before);
+    }
 }
 
 /*
@@ -404,8 +429,10 @@ static int tegra_lock_async_ycbcr(const gralloc_module_t *module,
                                   buffer_handle_t handle, int usage, int l,
                                   int t, int w, int h,
                                   struct android_ycbcr *ycbcr, int fence) {
+    int before = tracing() ? fd_probe_count() : 0;
     int result = gVendorLockAsyncYCbCr(module, handle, usage, l, t, w, h, ycbcr,
                                        fence);
+    fd_probe("lockAsync_ycbcr", before, tracing() ? fd_probe_count() : before);
 
     if (result != 0) {
         /* 同 tegra_lock_ycbcr：vendor 拒绝时合成线性 YV12 视图。fence 由
@@ -471,8 +498,10 @@ static int64_t now_us() {
 
 static int tegra_unlock_async(const gralloc_module_t *module,
                               buffer_handle_t handle, int *fenceFd) {
+    int before = tracing() ? fd_probe_count() : 0;
     int fence = -1;
     int result = gVendorUnlockAsync(module, handle, &fence);
+    fd_probe("unlockAsync", before, tracing() ? fd_probe_count() : before);
 
     if (fence >= 0) {
         int64_t start = tracing() ? now_us() : 0;
@@ -500,12 +529,36 @@ static int tegra_unlock_async(const gralloc_module_t *module,
     return result;
 }
 
+/* 【2026-11-23 回滚】曾把 plain unlock 路由到 unlockAsync（等待+关闭 fence）
+ * 试图堵 fd 泄漏，但 SF 每帧都走 plain unlock：路径被阻塞最长 1 秒、fence
+ * 未完成即被关闭 → 合成损坏 → composer 崩溃循环（开机动画反复重启）。
+ * 恢复为直接透传 vendor 的同步 unlock，仅保留 fd 计数探针；泄漏另找源头。 */
+static int tegra_unlock(const gralloc_module_t *module,
+                        buffer_handle_t handle) {
+    int before = tracing() ? fd_probe_count() : 0;
+    int result = gVendorUnlock(module, handle);
+    fd_probe("unlock", before, tracing() ? fd_probe_count() : before);
+    return result;
+}
+
+static int tegra_lock_async(const gralloc_module_t *module,
+                            buffer_handle_t handle, int usage, int l, int t,
+                            int w, int h, void **vaddr, int fenceFd) {
+    int before = tracing() ? fd_probe_count() : 0;
+    int result = gVendorLockAsync(module, handle, usage, l, t, w, h, vaddr,
+                                  fenceFd);
+    fd_probe("lockAsync", before, tracing() ? fd_probe_count() : before);
+    return result;
+}
+
 static int tegra_open(const hw_module_t *module, const char *name,
                       hw_device_t **device) {
     if (gVendorOpen == NULL) {
         ALOGE("no vendor module to open");
         return -ENODEV;
     }
+
+    ALOGI("tegra_open: name=%s pid=%d", name ? name : "(null)", getpid());
 
     /*
      * The module handed on is ours, which is the copy every caller has, so the
@@ -604,5 +657,15 @@ __attribute__((constructor)) static void tegra_take_vendor_module() {
     if (HAL_MODULE_INFO_SYM.base.unlockAsync != NULL) {
         gVendorUnlockAsync = HAL_MODULE_INFO_SYM.base.unlockAsync;
         HAL_MODULE_INFO_SYM.base.unlockAsync = tegra_unlock_async;
+    }
+
+    if (HAL_MODULE_INFO_SYM.base.unlock != NULL) {
+        gVendorUnlock = HAL_MODULE_INFO_SYM.base.unlock;
+        HAL_MODULE_INFO_SYM.base.unlock = tegra_unlock;
+    }
+
+    if (HAL_MODULE_INFO_SYM.base.lockAsync != NULL) {
+        gVendorLockAsync = HAL_MODULE_INFO_SYM.base.lockAsync;
+        HAL_MODULE_INFO_SYM.base.lockAsync = tegra_lock_async;
     }
 }
