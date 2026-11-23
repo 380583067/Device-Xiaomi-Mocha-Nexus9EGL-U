@@ -1,0 +1,21 @@
+diff --git a/server/TetherController.cpp b/server/TetherController.cpp
+index 8c68d2b..eb4c81c 100644
+--- a/server/TetherController.cpp
++++ b/server/TetherController.cpp
+@@ -718,8 +718,14 @@ int TetherController::setForwardRules(bool add, const char *intIface, const char
+         "*raw\n"
+         "%s %s -i %s -m rpfilter --invert ! -s fe80::/64 -j DROP\n"
+         "COMMIT\n", op, LOCAL_RAW_PREROUTING, intIface);
+-    if (iptablesRestoreFunction(V6, rpfilterCmd, nullptr) == -1 && add) {
+-        return -EREMOTEIO;
++    // Best effort: the rpfilter match only reached mainline in Linux 3.13, and this
++    // board (Tegra K1) runs a 3.10 vendor kernel without xt_rpfilter. The rule is
++    // anti-spoofing hardening on the downstream interface, not a prerequisite for
++    // forwarding, so bailing out here would make every tethering attempt fail with
++    // TETHER_ERROR_ENABLE_FORWARDING_ERROR on such kernels. Log and carry on; the
++    // v4/v6 filter rules below are what actually enables forwarding.
++    if (iptablesRestoreFunction(V6, rpfilterCmd, nullptr) == -1) {
++        ALOGW("No rpfilter support on %s, continuing without source filtering", intIface);
+     }
+ 
+     std::vector<std::string> v4Ftp = {

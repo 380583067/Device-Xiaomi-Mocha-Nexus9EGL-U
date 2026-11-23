@@ -24,6 +24,7 @@ system    packages/apps
 system    packages/modules/adb
 system    packages/modules/IntentResolver
 system    packages/services
+system    system/netd
 power     bootable/recovery
 build     build/make
 build     system/core

@@ -164,7 +164,7 @@ build (build/make, system/core, system/sepolicy, prebuilts/gcc, vendor/lineage)
   prebuilts/gcc/0001     use python3 for the host toolchain wrappers
   vendor/lineage/0001    APN module ownership
 
-system (frameworks/base, lineage-sdk, packages/*)
+system (frameworks/base, lineage-sdk, packages/*, system/netd)
   Small Android 14 API and robustness fixes needed to build and run LineageOS 21
   on this device:
   frameworks/base/0001   power: fix the Notifier NPE on charging state changes
@@ -180,10 +180,32 @@ system (frameworks/base, lineage-sdk, packages/*)
   packages/modules/adb/0001         adb: stop the legacy FunctionFS transport from
                                     reporting detached while the host is probing
   packages/modules/Connectivity/0001 netbpfload: do not abort on a sysfs subdir
+  packages/modules/Connectivity/0002 tethering: default the BPF offload switch off.
+                                    Tethering uses BPF maps for NAT since
+                                    Android 14, but the 3.10 vendor kernel has no
+                                    eBPF at all (nativeBpfFdGet returns ENOSYS),
+                                    so BpfCoordinator can never build the
+                                    upstream4/downstream4/dev maps. With the
+                                    switch off TetherController::setNat()
+                                    programs the iptables MASQUERADE chain,
+                                    which this kernel does support. See
+                                    system/netd/0001 for the other half.
   packages/modules/IntentResolver/0001 intent forwarder: use the Android 14 PM API
   packages/modules/Wifi/0001        wifi: guard a null mWifi to avoid a
                                     system_server crash
   packages/services/Mms/0001        match the Android 14 IMms identity arguments
+  system/netd/0001                  tethering: treat the upstream-source filter
+                                    (ip6tables -m rpfilter) as best effort.
+                                    netd runs it before the forwarding rules and
+                                    used to abort with -EREMOTEIO when it fails,
+                                    which surfaces as
+                                    TETHER_ERROR_ENABLE_FORWARDING_ERROR and
+                                    leaves every USB/Wi-Fi tether attempt stuck
+                                    in AvailableState. rpfilter only entered
+                                    mainline in Linux 3.13; this 3.10 kernel has
+                                    no xt_rpfilter, and the rule is anti-spoofing
+                                    hardening rather than a forwarding
+                                    prerequisite, so log it and continue.
   hardware/broadcom/wlan/0001       wifi-hal: fix the use-after-free in the cleanup
                                     command loop
   hardware/broadcom/wlan/0002       wifi-hal: enable CFI for libwifi-hal-bcm (a
