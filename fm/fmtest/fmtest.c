@@ -1,16 +1,18 @@
 /*
- * fmtest - 小米平板1 (mocha) FM 芯片链路诊断工具
+ * fmtest - FM chip link diagnostic for the Mi Pad 1 (mocha)
  *
- * 目的：绕开 Android 框架（FMRadio App / libfmjni / AudioManager 耳机检测），
- *       直接对 /dev/radio0 做标准 V4L2 radio ioctl，验证
- *         kernel v4l2_fm_driver  ->  brcm-uim-sysfs  ->  BCM4354 FM 芯片
- *       这条链路是否真正可用。
+ * Goal: bypass the Android framework (FMRadio app / libfmjni / AudioManager
+ *       headset detection) and issue plain V4L2 radio ioctls on /dev/radio0 to
+ *       verify the whole chain
+ *         kernel v4l2_fm_driver  ->  brcm-uim-sysfs  ->  BCM4354 FM chip
+ *       actually works.
  *
- * 用法（root）：
- *   fmtest             # 完整诊断：QUERYCAP / G_TUNER / 调频 / 扫频 RSSI
- *   fmtest 97400       # 只调到指定频率 (kHz) 并读 RSSI
+ * Usage (root):
+ *   fmtest             # full run: QUERYCAP / G_TUNER / tune / RSSI sweep
+ *   fmtest 97400       # tune to one frequency (kHz) and read RSSI
  *
- * 注意：不涉及音频通路（I2S -> codec），音频需要真机插耳机验证。
+ * Note: the audio path (I2S -> codec) is not covered; that needs headphones on
+ * the real device.
  */
 
 #include <stdio.h>
@@ -26,22 +28,21 @@
 
 #define FM_DEV "/dev/radio0"
 
-/* V4L2 radio 的频率单位是 62.5 Hz，即 1 kHz = 16 */
+/* V4L2 radio frequencies are in units of 62.5 Hz, so 1 kHz = 16 */
 #define KHZ_TO_V4L2(khz) ((khz) * 16)
 
-/* HCI Reset 命令（OGF=0x03 Host Control, OCF=0x0003）：01 03 0C 00 */
+/* HCI Reset command (OGF=0x03 Host Control, OCF=0x0003): 01 03 0C 00 */
 static const unsigned char hci_reset_cmd[] = { 0x01, 0x03, 0x0C, 0x00 };
 
 /*
- * uart_probe - 往指定 tty 发一条 HCI Reset，看 BCM 芯片有没有回
- *              Command Complete (04 0E 04 01 03 0C 00)。
+ * uart_probe - send one HCI Reset to a tty and see whether the BCM chip answers
  *
- * 为什么要单独做这个：brcm-uim-sysfs 里串口名来自 bt_vendor.conf 的
- * UimUartPort。如果这个值和真机上 BT 实际连接的 UART 不一致，芯片永远
- * 不会有回应，uim 就会卡死在 read_hci_event，内核那边看到的就是
- *     line disc installation timed out
- *     Failed to get shared ldisc write func pointer
- * 直接扫一遍所有 ttyTHS 是最快的判定方式。
+ * Why this exists: brcm-uim-sysfs takes the serial port name from UimUartPort in
+ * bt_vendor.conf. If that value does not match the UART the BT chip is really
+ * wired to, the chip never answers, uim hangs in read_hci_event and the kernel
+ * sees a dead ldisc.
+ *
+ * Scanning every ttyTHS is the fastest way to tell.
  */
 static int uart_probe_once(const char *dev, int baud, int hwflow)
 {
@@ -82,7 +83,7 @@ static int uart_probe_once(const char *dev, int baud, int hwflow)
         return -1;
     }
 
-    /* 等最多 600ms 的回包 */
+    /* wait up to 600 ms for a reply */
     i = 0;
     while (i < 6) {
         FD_ZERO(&rfds);
@@ -94,10 +95,11 @@ static int uart_probe_once(const char *dev, int baud, int hwflow)
             int r = read(fd, buf, sizeof(buf));
             if (r > 0) {
                 int k;
-                printf("  %-16s [flow=%d] 收到 %d 字节:", dev, hwflow, r);
+                printf("  %-16s [flow=%d] got %d bytes:", dev, hwflow, r);
                 for (k = 0; k < r; k++)
                     printf(" %02x", buf[k]);
-                printf("%s\n", (buf[0] == 0x04) ? "   <== HCI event，就是它！" : "");
+                printf("%s
+", (buf[0] == 0x04) ? "   <== HCI event, that is the one!" : "");
                 close(fd);
                 return (buf[0] == 0x04) ? 1 : 0;
             }
@@ -109,7 +111,8 @@ static int uart_probe_once(const char *dev, int baud, int hwflow)
         }
     }
 
-    printf("  %-16s [flow=%d] 无响应\n", dev, hwflow);
+    printf("  %-16s [flow=%d] no response
+", dev, hwflow);
     close(fd);
     return 0;
 }
@@ -119,16 +122,17 @@ static int uart_probe(const char *dev, int baud)
     int fd, mcs;
     int hits = 0;
 
-    /* 先看调制解调器线状态：如果 CTS/DSR 全为 0，说明芯片根本没在线
-     * （没供电、串口焊错、或 pinmux 没配成 UART）。这一步不需要发数据，
-     * 是最"安静"的判定方法。 */
+    /* Check the modem line status first: with CTS/DSR all zero the chip is not
+     * there at all (no power, miswired UART or a pinmux not set to UART). This
+     * needs no traffic and is the quietest way to tell. */
     fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         printf("  %-16s open: %s\n", dev, strerror(errno));
         return -1;
     }
     if (ioctl(fd, TIOCMGET, &mcs) == 0) {
-        printf("  %-16s 线状态: CTS=%d DSR=%d DCD=%d RNG=%d RTS=%d DTR=%d\n",
+        printf("  %-16s line status: CTS=%d DSR=%d DCD=%d RNG=%d RTS=%d DTR=%d
+",
                dev,
                !!(mcs & TIOCM_CTS), !!(mcs & TIOCM_DSR), !!(mcs & TIOCM_CAR),
                !!(mcs & TIOCM_RNG), !!(mcs & TIOCM_RTS), !!(mcs & TIOCM_DTR));
@@ -137,7 +141,7 @@ static int uart_probe(const char *dev, int baud)
     }
     close(fd);
 
-    /* 有流控 / 无流控各试一次：BCM 的 BT UART 默认要 RTS/CTS */
+    /* Try with and without flow control: the BCM BT UART wants RTS/CTS by default */
     hits |= uart_probe_once(dev, baud, 1);
     if (!hits)
         hits |= uart_probe_once(dev, baud, 0);
@@ -152,13 +156,17 @@ static void scan_uarts(void)
     unsigned int i;
     int any = 0;
 
-    printf("\n-- 扫描 BT UART（发 HCI Reset @115200，等 600ms）--\n");
+    printf("
+-- scanning BT UARTs (HCI Reset @115200, 600 ms wait) --
+");
     for (i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
         int r = uart_probe(devs[i], B115200);
         if (r > 0) any = 1;
     }
-    printf("\n结论：%s\n", any ? "找到能回 HCI 事件的串口" :
-           "所有 ttyTHS 都无 HCI 响应 —— 芯片侧没有起来（供电/UART 连线/pinmux）");
+    printf("
+conclusion: %s
+", any ? "found a tty that answers with an HCI event" :
+           "no ttyTHS answered HCI - the chip side is dead (power/UART wiring/pinmux)");
 }
 
 
@@ -189,7 +197,8 @@ static int show_caps(int fd)
     printf("  capabilities: 0x%08x  (%s)\n", vc.capabilities, cap_name(vc.capabilities));
 
     if (!(vc.capabilities & V4L2_CAP_RADIO)) {
-        printf("  [WARN] 设备没有声明 V4L2_CAP_RADIO\n");
+        printf("  [WARN] the device does not declare V4L2_CAP_RADIO
+");
     }
     return 0;
 }
@@ -268,25 +277,26 @@ static void dump_controls(int fd)
     }
 }
 
-/* 常用频点（kHz），覆盖常规 FM 波段 */
+/* Common frequencies (kHz), covering the usual FM band */
 static const int scan_list[] = {
     87500, 90500, 93000, 95000, 97400, 99000, 101300, 103900, 106100, 107900
 };
 
 /*
- * 读 FM 驱动的调试 sysfs（只有 /dev/radio0 处于 open 状态时才存在，
- * release 时会 sysfs_remove_group 掉）。其中最有用的是：
- *   rssi_raw=0xNN  芯片 RSSI 寄存器原始值（0x00~0xFF）
- *   snr=NN         芯片 SNR 寄存器原始值
+ * Read the FM driver's debug sysfs (it only exists while /dev/radio0 is open;
+ * release calls sysfs_remove_group). The useful entries are:
+ *   rssi_raw=0xNN  raw chip RSSI register (0x00~0xFF)
+ *   snr=NN         raw chip SNR register
  *
- * 为什么必须看 raw：V4L2 的 tuner->signal 是驱动算过的
+ * Why raw matters: V4L2's tuner->signal is computed by the driver as
  *   signal = (128 - curr_rssi) * (65535 / 128)
- * 一旦 curr_rssi 的类型/符号在中间被截断，算出来的值会变成"看起来
- * 有信号但完全平坦"的假数据。只有 raw 能区分"真收到台"和"没天线在
- * 读噪声"。
+ * and once curr_rssi's type or sign is truncated on the way, the result becomes
+ * fake data that "looks like signal but is perfectly flat". Only raw values can
+ * tell "a real station" from "no antenna, reading noise".
  */
-/* 诊断用途，当前主流程没调用（antenna_probe 里为了取 raw 值用了 inline
- * 解析）。保留成工具函数，手动排障时可以直接搬用；加 unused 免掉编译警告。 */
+/* Diagnostic only, the main flow does not call it (antenna_probe parses the raw
+ * value inline). Kept as a utility that can be reused when debugging by hand;
+ * unused is here to silence the compiler. */
 static __attribute__((unused)) int read_fm_sysfs(void)
 {
     static const char *paths[] = {
@@ -314,14 +324,15 @@ static __attribute__((unused)) int read_fm_sysfs(void)
 }
 
 /*
- * antenna_probe - 判断"耳机当天线"到底有没有生效。
+ * antenna_probe - decide whether "headphones as antenna" really works.
  *
- * 思路：真收到电台时，RSSI raw 会随频率出现明显的峰谷（电台位置一个
- * 尖峰，空频点掉到底噪）。如果扫整个波段 raw 值只在很小范围内抖动，
- * 说明 RF 前端根本没接上天线 —— 此时数值是芯片内部噪声，与插不插
- * 耳机无关。
+ * Idea: with a real station the raw RSSI shows clear peaks and valleys across
+ * frequencies (a spike at each station, the noise floor in between). If the raw
+ * value only wiggles inside a narrow range over the whole band, the RF front end
+ * has no antenna at all and the numbers are the chip's internal noise, with or
+ * without headphones.
  *
- * 输出每个频点的 signal 和 raw rssi/snr，最后给出峰谷差（dynamic range）。
+ * Print signal plus raw rssi/snr for every frequency and finally the peak-to-valley (dynamic range).
  */
 static void antenna_probe(int fd)
 {
@@ -329,7 +340,9 @@ static void antenna_probe(int fd)
     int nr = 0, vmin = 1 << 30, vmax = 0;
     char line[256];
 
-    printf("\n-- 天线/频谱响应探测（每点 800ms，读 raw RSSI） --\n");
+    printf("
+-- antenna / frequency response probe (800 ms per step, raw RSSI) --
+");
     printf("  %-8s %-8s %-10s %s\n", "freq", "signal", "raw", "snr");
 
     for (i = 0; i < (int)(sizeof(scan_list) / sizeof(scan_list[0])); i++) {
@@ -340,14 +353,14 @@ static void antenna_probe(int fd)
 
         if (set_freq(fd, scan_list[i]) < 0)
             continue;
-        /* 800ms：给芯片完成 PLL 锁定 + RSSI 计数窗口刷新，350ms 偏短 */
+        /* 800 ms: lets the chip lock its PLL and refresh the RSSI window; 350 ms is too short */
         usleep(800 * 1000);
 
         memset(&vt, 0, sizeof(vt));
         vt.index = 0;
         sig = (ioctl(fd, VIDIOC_G_TUNER, &vt) == 0) ? (int)vt.signal : -1;
 
-        /* 顺带把 raw 寄存器抓出来 */
+        /* also grab the raw registers */
         fd2 = open("/sys/class/video4linux/radio0/fmrx_audio_status", O_RDONLY);
         if (fd2 >= 0) {
             int n = read(fd2, line, sizeof(line) - 1);
@@ -373,13 +386,17 @@ static void antenna_probe(int fd)
     }
 
     if (nr > 1) {
-        printf("\n  峰谷: max=%d min=%d 动态范围=%d (%.1f%%)\n",
+        printf("
+  peak/valley: max=%d min=%d dynamic range=%d (%.1f%%)
+",
                vmax, vmin, vmax - vmin,
                vmin ? (double)(vmax - vmin) * 100.0 / vmin : 0.0);
         if (vmax - vmin < vmax / 5)
-            printf("  判定: 频谱近乎平坦 —— RF 前端没有有效天线输入\n");
+            printf("  verdict: the spectrum is nearly flat - no effective antenna on the RF front end
+");
         else
-            printf("  判定: 存在明显峰谷 —— 天线链路有效，收到真实电台\n");
+            printf("  verdict: clear peaks and valleys - the antenna path works and real stations are received
+");
     }
 }
 
@@ -387,8 +404,8 @@ int main(int argc, char **argv)
 {
     int fd, i, rc = 0;
 
-    /* fmtest --uart : 只做串口扫描，判断 BT 芯片挂在哪个 tty 上。
-     * 不碰 /dev/radio0，所以可以在 FM 打不开时单独用。 */
+    /* fmtest --uart: only scan the serial ports to find which tty the BT chip is on.
+     * /dev/radio0 is not touched, so it works while FM itself cannot be opened. */
     if (argc > 1 && strcmp(argv[1], "--uart") == 0) {
         scan_uarts();
         return 0;
@@ -406,22 +423,25 @@ int main(int argc, char **argv)
     printf("\n-- capability --\n");
     if (show_caps(fd) < 0) { rc = 2; goto out; }
 
-    printf("\n-- tuner (power-on 后状态) --\n");
+    printf("
+-- tuner state after power-on --
+");
     show_tuner(fd, "G_TUNER");
 
-    /* fmtest --antenna : 只跑天线/频谱响应探测。必须在 atoi 之前拦，
-     * 否则 "--antenna" 会被 atoi 解成 0 走进"调频到 0 kHz"的分支。 */
+    /* fmtest --antenna: only run the antenna/frequency response probe. It must be
+     * caught before atoi, otherwise "--antenna" parses as 0 and tunes to 0 kHz. */
     if (argc > 1 && strcmp(argv[1], "--antenna") == 0) {
         antenna_probe(fd);
         goto out;
     }
 
-    /* fmtest --hold <khz> <sec> : 调到指定频点后**保持设备打开**，
-     * 期间每秒打印一次 signal。
+    /* fmtest --hold <khz> <sec>: tune to a frequency and **keep the device open**,
+     * printing the signal once per second.
      *
-     * 为什么要这个模式：FM 的 /dev/radio0 一旦 close，驱动 release 里会
-     * fmc_turn_fm_off() 把芯片关掉，音频立刻停。想验证"耳机里到底有没有
-     * 声音"，就必须让 fd 一直开着，外部再用 tinymix 配好 codec 路由去听。
+     * Why this mode: as soon as /dev/radio0 is closed, the driver's release calls
+     * fmc_turn_fm_off() and the chip is switched off, which stops the audio at once.
+     * To check "is there really sound in the headphones" the fd has to stay open
+     * while the codec routing is set up from outside with tinymix.
      */
     if (argc > 3 && strcmp(argv[1], "--hold") == 0) {
         int khz = atoi(argv[2]);
@@ -432,8 +452,10 @@ int main(int argc, char **argv)
         set_ctrl(fd, V4L2_CID_AUDIO_VOLUME, 15, "volume");
         if (set_freq(fd, khz) < 0) { rc = 3; goto out; }
         usleep(600 * 1000);
-        printf("\n-- 保持 %d 秒（现在去配 codec 路由 / 戴耳机听） --\n", sec);
-        printf("  实际频率: %d kHz\n", get_freq(fd));
+        printf("
+-- holding for %d s (set up the codec routing / put the headphones on now) --
+", sec);
+        printf("  actual frequency: %d kHz\n", get_freq(fd));
         for (i = 0; i < sec; i++) {
             usleep(1000 * 1000);
             printf("  [%2ds] ", i + 1);
@@ -445,31 +467,39 @@ int main(int argc, char **argv)
 
     if (argc > 1) {
         int khz = atoi(argv[1]);
-        printf("\n-- 调频到 %d kHz --\n", khz);
+        printf("
+-- tuning to %d kHz --
+", khz);
         if (set_freq(fd, khz) < 0) { rc = 3; goto out; }
         usleep(400 * 1000);
-        printf("  实际频率: %d kHz\n", get_freq(fd));
+        printf("  actual frequency: %d kHz\n", get_freq(fd));
         show_tuner(fd, "G_TUNER");
         goto out;
     }
 
     dump_controls(fd);
 
-    printf("\n-- 打开收音机（音量/静音/调频） --\n");
+    printf("
+-- powering the radio on (volume/mute/tune) --
+");
     set_ctrl(fd, V4L2_CID_AUDIO_MUTE, 0, "mute=off");
     set_ctrl(fd, V4L2_CID_AUDIO_VOLUME, 10, "volume");
 
-    printf("\n-- 逐频点扫描（看 signal 是否有变化） --\n");
+    printf("
+-- step through the band (does the signal change) --
+");
     printf("  %-8s %-8s %s\n", "freq", "got", "signal");
     for (i = 0; i < (int)(sizeof(scan_list) / sizeof(scan_list[0])); i++) {
         if (set_freq(fd, scan_list[i]) < 0) continue;
-        /* 等芯片稳定 + RSSI 更新 */
+        /* let the chip settle and the RSSI update */
         usleep(350 * 1000);
         printf("  %-8d %-8d %d\n", scan_list[i], get_freq(fd),
                show_tuner(fd, "sig"));
     }
 
-    printf("\n-- 硬件搜台 (VIDIOC_S_HW_FREQ_SEEK) --\n");
+    printf("
+-- hardware seek (VIDIOC_S_HW_FREQ_SEEK) --
+");
     {
         struct v4l2_hw_freq_seek seek;
         memset(&seek, 0, sizeof(seek));
@@ -480,9 +510,11 @@ int main(int argc, char **argv)
         seek.rangelow   = KHZ_TO_V4L2(87500);
         seek.rangehigh  = KHZ_TO_V4L2(108000);
         if (ioctl(fd, VIDIOC_S_HW_FREQ_SEEK, &seek) < 0)
-            printf("  [WARN] HW_SEEK 不支持或不成功: %s\n", strerror(errno));
+            printf("  [WARN] HW_SEEK unsupported or failed: %s
+", strerror(errno));
         else
-            printf("  搜到电台: %d kHz\n", get_freq(fd));
+            printf("  found a station: %d kHz
+", get_freq(fd));
     }
 
 out:

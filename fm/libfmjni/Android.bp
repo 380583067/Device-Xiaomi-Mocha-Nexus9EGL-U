@@ -15,11 +15,11 @@
 //
 
 /*
- * 修复说明（FM，2026-11-16）：
+ * FM fix (2026-11-16):
  *
- * 本模块原来写在同目录的 Android.mk 里（LOCAL_MODULE := libfmjni，
- * LOCAL_VENDOR_MODULE := true）。在 Android 14 上这条路走不通，原因是
- * packages/apps/FMRadio/Android.bp 里有：
+ * This module used to live in Android.mk in the same directory
+ * (LOCAL_MODULE := libfmjni, LOCAL_VENDOR_MODULE := true). That cannot work on
+ * Android 14, because packages/apps/FMRadio/Android.bp has:
  *
  *     android_app {
  *         name: "FMRadio",
@@ -27,29 +27,34 @@
  *         ...
  *     }
  *
- * jni_libs 是 **Soong** 属性，只能解析 Soong 模块。Make 模块（Android.mk）
- * 不会被 jni_libs 看到，于是直接报：
+ * jni_libs is a **Soong** property and only resolves Soong modules. A Make module
+ * (Android.mk) is invisible to it, which fails outright with:
  *
  *     error: packages/apps/FMRadio/Android.bp: FMRadio depends on
  *            undefined module "libfmjni"
  *
- * 这就是之前 BoardConfig.mk 里 BOARD_HAVE_BCM_FM 被迫回退成 false 的真正原因。
+ * That is the real reason BOARD_HAVE_BCM_FM had to fall back to false in
+ * BoardConfig.mk.
  *
- * 与此同时 packages/apps/FMRadio/jni/fmr/Android.bp 里还有一个 **MTK 版**的
- * libfmjni（MediaTek FM 芯片用的，和我们这颗 Broadcom BCM4354 完全不兼容）。
- * 两者同名，靠 soong namespace 隔离：
- *   - 那个目录带 soong_namespace {}，只有当 vendor/lineage/config/BoardConfigSoong.mk
- *     把 packages/apps/FMRadio/jni/fmr 加进 PRODUCT_SOONG_NAMESPACES 时才可见；
- *   - 我们在 BoardConfig.mk 里设 BOARD_HAVE_MTK_FM := true，把这个分支关掉，
- *     于是 MTK 版不再参与构建，本文件的 libfmjni 成为唯一的 libfmjni。
+ * packages/apps/FMRadio/jni/fmr/Android.bp also ships a **MediaTek** libfmjni
+ * (for MediaTek FM chips, completely incompatible with this Broadcom BCM4354).
+ * Both have the same name and are separated by a Soong namespace:
+ *   - that directory carries soong_namespace {} and is only visible when
+ *     vendor/lineage/config/BoardConfigSoong.mk adds
+ *     packages/apps/FMRadio/jni/fmr to PRODUCT_SOONG_NAMESPACES;
+ *   - BoardConfig.mk sets BOARD_HAVE_MTK_FM := true to turn that branch off, so
+ *     the MTK one is not built and this file's libfmjni is the only one.
  *
- * 安装位置选 /system/lib（不设 vendor: true）：
- *   1) FMRadio 是 platform 签名的 system app，jni_libs 只能引用对 platform 可见的库；
- *      vendor 库对 platform 不可见（会触发 check_platform_availability 报错）。
- *   2) libfmjni 运行时用 dlopen 加载 libfmradio.v4l2-fm.so，路径写死在同一目录，
- *      两者都在 /system/lib 可以保证 app 进程的 classloader-namespace 能访问到
- *      （app namespace 的 permitted.paths 包含 /system/lib，但不一定包含 /vendor/lib，
- *      跨 namespace 加载会被 linker 以 "not accessible for the namespace" 拒绝）。
+ * Installed to /system/lib (no vendor: true):
+ *   1) FMRadio is a platform-signed system app, so jni_libs can only reference
+ *      libraries visible to platform; vendor libraries are not, and
+ *      check_platform_availability fails.
+ *   2) At run time libfmjni dlopens libfmradio.v4l2-fm.so with a path hard-coded
+ *      to the same directory. Keeping both in /system/lib keeps them reachable
+ *      from the app process's classloader namespace (the app namespace's
+ *      permitted.paths includes /system/lib but not necessarily /vendor/lib, and
+ *      a cross-namespace load is refused by the linker with "not accessible for
+ *      the namespace").
  */
 cc_library_shared {
     name: "libfmjni",
@@ -63,8 +68,8 @@ cc_library_shared {
         "-Wall",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
-        // android_fm.cpp 里扫描这个目录找 libfmradio.<variant>.so，
-        // 必须和 libfmradio.v4l2-fm 的安装位置一致。
+        // android_fm.cpp scans this directory for libfmradio.<variant>.so, so this
+        // must match where libfmradio.v4l2-fm is installed.
         "-DLIBRARY_PATH=\"/system/lib/\"",
     ],
 
@@ -78,7 +83,8 @@ cc_library_shared {
         "libnativehelper",
     ],
 
-    // libfmradio.v4l2-fm 是 dlopen 加载的，不是链接依赖，但仍要保证它被装进镜像。
+    // libfmradio.v4l2-fm is dlopen'ed, not a link dependency, but it still has to be
+    // installed into the image.
     required: [
         "libfmradio.v4l2-fm",
         "brcm-uim-sysfs",

@@ -58,17 +58,20 @@
 #define LOCKTIME                        40000           // wait 40ms for card to lock on
 #define MAX_FREQS                       50              // number of max freq buffer for a full scan
 #define DEFAULT_THRESHOLD               500             // threshold for scan
-/* 【自动搜台修复 2026-11-17】原本全频段只用一个固定门限 500 比较信号强度。
- * 本机实测（fmtest --antenna + 搜台日志）：整段频带噪声底约 335~374，
- * 最强的真实电台（95.0MHz）也只有 437 —— 永远低于 500，所以"刷新/自动搜台"
- * 一个台都找不到，而手动调过去能正常收听。
- * 改为自适应：先完整测一遍频带，用均值当噪声底、用"均值 + 峰高的一半"当门限，
- * 再挑局部峰值。信号平坦（没插耳机天线）时退回配置门限，保持原行为。 */
-#define SCAN_MAX_POINTS                 256             // 全频段最多采样点数（87.5~108MHz/100kHz = 206）
-#define SCAN_MIN_ABS                    250             // 自适应门限的下限（0~1000 刻度）
-#define SCAN_MIN_SPAN                   30              // 峰高不足这个值视为全频带平坦（无台）
-#define SCAN_PEAK_SEP                   250             // 相邻两个台的合并间距（kHz，标准刻度）
-#define SCAN_NOISE_PRIME                4               // seek 时先用几个样本估噪声底
+/* [auto-scan fix 2026-11-17] The whole band used to be judged against one fixed
+ * threshold of 500. Measured here (fmtest --antenna plus scan logs): the noise
+ * floor sits around 335-374 and the strongest real station (95.0 MHz) only
+ * reaches 437, so it never crosses 500 and "refresh / auto scan" finds no station
+ * at all, while tuning to one by hand plays fine.
+ * It is adaptive now: measure the whole band first, use the mean as the noise
+ * floor and "mean + half the peak height" as the threshold, then pick local
+ * peaks. With a flat band (no headphone antenna) it falls back to the configured
+ * threshold and keeps the old behaviour. */
+#define SCAN_MAX_POINTS                 256             // max samples over the band (87.5-108 MHz / 100 kHz = 206)
+#define SCAN_MIN_ABS                    250             // lower bound of the adaptive threshold (0-1000 scale)
+#define SCAN_MIN_SPAN                   30              // a peak height below this means the band is flat (no station)
+#define SCAN_PEAK_SEP                   250             // merge distance between stations (kHz, standard tuning step)
+#define SCAN_NOISE_PRIME                4               // samples used to prime the noise floor on seek
 
 /* session struct holded by the FM SE stack */
 typedef struct fm_v4l2_data_t {
@@ -279,9 +282,9 @@ int v4l2_is_playing_in_stereo (void ** session_data){
 int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
    fm_v4l2_data* session;
    int increment, rate, freqi, ret;
-   int noise = -1;          /* 动态噪声底（0~1000 刻度），-1 表示还没估出来 */
-   int primed = 0;          /* 已用于估噪声底的样本数 */
-   int dyn;                 /* 当前动态门限 */
+   int noise = -1;          /* dynamic noise floor (0-1000 scale), -1 until estimated */
+   int primed = 0;          /* samples already used for the noise floor */
+   int dyn;                 /* current dynamic threshold */
 
    ALOGI("%s:\n", __FUNCTION__);
    session = get_session_data(session_data);
@@ -305,11 +308,13 @@ int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
       if (rate < 0)
          return -1;
 
-      /* 【下一个/上一个电台修复】旧实现拿固定 500 当门限比较，本机实测最强的
-       * 电台也只有 ~437，按一次永远找不到台。这里改成边扫边估噪声底：
-       * 先用前 SCAN_NOISE_PRIME 个样本的最小值估底（起点可能正好压在强台上，
-       * 取最小值比取第一个样本稳），之后用"噪声底 + 剩余头部空间的 1/8"
-       * 当动态门限，命中后再复测一次该频点以排除噪声尖峰。 */
+      /* [next/previous station fix] The old code compared against a fixed 500 and the
+       * strongest station here only reaches about 437, so a single press never found
+       * anything. The noise floor is estimated while scanning now: the minimum of the
+       * first SCAN_NOISE_PRIME samples gives the floor (the start may sit on a strong
+       * station, and the minimum is more robust than the first sample), then the
+       * threshold is "noise floor + 1/8 of the remaining headroom". A hit is measured
+       * once more to reject noise spikes. */
       if (primed < SCAN_NOISE_PRIME) {
           if (noise < 0 || rate < noise)
               noise = rate;
@@ -334,7 +339,7 @@ int v4l2_scan (void ** session_data, enum fmradio_seek_direction_t direction){
                   return get_standard_freq(freqi, session->fact);
               }
           } else {
-              /* 只在非候选点更新噪声底，避免被强台把底抬高 */
+              /* update the floor only on non-candidate points, so a strong station cannot raise it */
               noise = (noise * 3 + rate) / 4;
           }
       }
@@ -370,9 +375,10 @@ int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_stre
   if (total < 3)
       return 0;
 
-  /* 【自动搜台修复】第一遍：把整段频带完整测一遍并缓存。
-   * 旧实现是边测边和固定门限 500 比，本机最强电台只有 437，必然搜不到；
-   * 只有拿到整段数据后才能算出真实的噪声底和峰高。 */
+  /* [auto-scan fix] First pass: measure the whole band once and cache it.
+   * The old code compared against a fixed 500 while measuring, and the strongest
+   * station here is 437, so it could never find one; only the full sweep gives a
+   * real noise floor and peak height. */
   n = 0;
   for (freqi = session->low_freq;
        (freqi < session->high_freq) && (n < total) && (session->scan_band_run==SCAN_RUN);
@@ -398,7 +404,7 @@ int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_stre
       return 0;
   }
 
-  /* 统计噪声底与最强点：均值代表整段底噪，max - mean 代表最强台的峰高 */
+  /* Noise floor and strongest point: the mean is the band floor, max - mean is the strongest peak height */
   sum = 0;
   maxr = all_rate[0];
   minr = all_rate[0];
@@ -411,8 +417,9 @@ int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_stre
   span = maxr - mean;
 
   if (span < SCAN_MIN_SPAN) {
-      /* 全频带平坦：要么没插耳机当天线，要么这一带确实没有台。
-       * 退回用户/默认门限，保持原有"搜不到"的语义，避免刷出一堆假台。 */
+      /* Flat band: either no headphone antenna or genuinely no station here. Fall
+       * back to the user/default threshold, keeping the old "nothing found" semantics
+       * so no fake stations are reported. */
       thr = session->threshold;
       ALOGI("band flat: noise %d min %d max %d span %d < %d, keep threshold %d",
             mean, minr, maxr, span, SCAN_MIN_SPAN, thr);
@@ -431,21 +438,21 @@ int v4l2_full_scan (void ** session_data, int ** found_freqs, int ** signal_stre
     return -1;
   }
 
-  /* 第二遍：只挑"高于自适应门限的局部峰值"，并把靠得太近的峰合并
-   * （同一个台跨 1~2 个频道，保留最强的那个）。 */
+  /* Second pass: keep only local peaks above the adaptive threshold and merge peaks
+   * that are too close (one station spans one or two channels, keep the stronger). */
   founded = 0;
   for (i = 1; i < n - 1 && founded < MAX_FREQS; i++) {
       if (session->scan_band_run != SCAN_RUN)
           break;
       if (all_rate[i] < thr)
           continue;
-      /* 局部峰值判定：不低于左右邻居（平台峰两侧相等也算） */
+      /* local peak test: not lower than either neighbour (a flat top counts) */
       if (all_rate[i] < all_rate[i-1] || all_rate[i] < all_rate[i+1])
           continue;
 
       if (founded > 0 &&
           (all_freq[i] - temp_freq[founded-1]) < get_proprietary_freq(SCAN_PEAK_SEP, session->fact)) {
-          /* 与上一个台太近：只保留更强的 */
+          /* too close to the previous station: keep the stronger one only */
           if (all_rate[i] > temp_strenght[founded-1]) {
               temp_freq[founded-1] = all_freq[i];
               temp_strenght[founded-1] = all_rate[i];
