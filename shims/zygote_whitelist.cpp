@@ -13,16 +13,17 @@ PATH_WHITELIST_EXTRA
 };
 
 bool FileDescriptorAllowlist::IsAllowed(const std::string& path) const {
-  /* 【2026-11-17 修复，影响稳定性】
-   * 原写法把 IsAllowed_real 定义成**局部**变量且未初始化：
-   *     bool (*IsAllowed_real)(...);      // 栈上随机值
-   *     if (!IsAllowed_real) ...dlsym...  // 随机值非 0 就跳过 dlsym
-   *     if (IsAllowed_real) return IsAllowed_real(...);  // 把栈垃圾当函数指针调用
-   * 一旦栈上残留非 0 值，就会跳到野地址 → zygote 里 SIGSEGV。
-   * （编译器已用 -Wuninitialized 报警，本次全编暴露。）
-   *
-   * 同时原实现每次调用都 dlsym 一次，而 fd 白名单检查在 zygote 启动阶段很频繁。
-   * 改成函数内 static：C++11 保证只初始化一次且线程安全，失败也为 nullptr。 */
+  /* [2026-11-17 fix, stability] The old code declared IsAllowed_real as a
+   * **local** variable without initialising it:
+   *     bool (*IsAllowed_real)(...);      // garbage from the stack
+   *     if (!IsAllowed_real) ...dlsym...  // non-zero garbage skips the dlsym
+   *     if (IsAllowed_real) return IsAllowed_real(...);  // calls stack garbage
+   * Any non-zero leftover on the stack means a jump to a wild address, i.e. SIGSEGV
+   * in zygote (the compiler already warned with -Wuninitialized; a full build exposed
+   * it).
+   * The old code also called dlsym on every call, and the fd whitelist check is very
+   * frequent during zygote start-up. It is a function-local static now: C++11
+   * guarantees one thread-safe initialisation, and a failure stays nullptr. */
   static bool (*const IsAllowed_real)(const FileDescriptorAllowlist*,
                                       const std::string&) =
       (bool (*)(const FileDescriptorAllowlist*, const std::string&))dlsym(

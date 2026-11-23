@@ -203,11 +203,11 @@ struct pcm {
     /** Flags that were passed to @ref pcm_open */
     unsigned int flags;
     /** Whether the PCM is running or not
-     * 【2026-11-17】原来是 `int running:1`——有符号一位位域只有 {-1,0} 两个取值，
-     * `pcm->running = 1` 实际被截断成 -1，编译期报
-     * -Wsingle-bit-bitfield-constant-conversion（6 处）。当前代码全部用真值判断
-     * （if (pcm->running)），行为正确；改成 unsigned 消除隐患，避免以后有人写
-     * `== 1` 比较时永远不成立。 */
+     * [2026-11-17] This used to be `int running:1`: a signed one-bit bitfield only
+     * holds {-1,0}, so `pcm->running = 1` was truncated to -1 and the compiler warned
+     * -Wsingle-bit-bitfield-constant-conversion six times. The current code only tests
+     * truthiness (if (pcm->running)) and behaves correctly; making it unsigned removes
+     * the trap, so a future `== 1` comparison cannot silently never match. */
     unsigned int running:1;
     /** Whether or not the PCM has been prepared */
     unsigned int prepared:1;

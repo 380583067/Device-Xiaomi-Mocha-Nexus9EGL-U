@@ -1,19 +1,20 @@
 /*
- * yv12locktest — mocha (Tegra K1 / TN8) gralloc YUV lock 能力诊断工具
+ * yv12locktest - diagnostic for the gralloc YUV lock capability on mocha (Tegra K1 / TN8)
  *
- * 背景：
- *   Android 14 的 SoftwareRenderer 在渲染软件解码的 YUV420 帧时，会把
- *   Surface buffer 配置成 HAL_PIXEL_FORMAT_YV12，然后调用
- *   GraphicBufferMapper::lockYCbCr() 拿到 Y/Cb/Cr 三个平面指针。
- *   在 mocha 上该调用返回 -ENOSYS(-38)，导致 SoftwareRenderer 的
- *   CHECK_EQ(0, ...) 直接 abort，图库一播视频就闪退。
+ * Background:
+ *   When Android 14's SoftwareRenderer draws a software-decoded YUV420 frame it sets
+ *   the Surface buffer to HAL_PIXEL_FORMAT_YV12 and calls
+ *   GraphicBufferMapper::lockYCbCr() for the Y/Cb/Cr plane pointers. On mocha that
+ *   call returns -ENOSYS(-38), so SoftwareRenderer's CHECK_EQ(0, ...) aborts and the
+ *   gallery crashes as soon as it plays a video.
  *
- * 本工具用来确认：
- *   1) 该 gralloc 的 lockYCbCr 对哪些 YUV 格式可用；
- *   2) 若 lockYCbCr 不可用，单平面 lock() 是否能拿到 YV12 的基址
- *      （决定 SoftwareRenderer 兜底方案是"手工算平面"还是"强制 RGB565 转换"）。
+ * This tool establishes:
+ *   1) which YUV formats this gralloc supports lockYCbCr for;
+ *   2) if lockYCbCr is unavailable, whether a single-plane lock() yields the YV12 base
+ *      address (which decides whether the SoftwareRenderer fallback computes planes by
+ *      hand or forces an RGB565 conversion).
  *
- * 仅用于调试，不随正式版本发布。
+ * Debug only, not shipped in release builds.
  */
 
 #define LOG_TAG "yv12locktest"
@@ -62,7 +63,7 @@ void testFormat(const FormatCase& c, int w, int h) {
     const Rect bounds(w, h);
     const native_handle_t* handle = buffer->getNativeBuffer()->handle;
 
-    // 1) 走 lockYCbCr（SoftwareRenderer 当前用的路径）
+    // 1) through lockYCbCr (the path SoftwareRenderer uses today)
     android_ycbcr ycbcr;
     memset(&ycbcr, 0, sizeof(ycbcr));
     status_t e1 = mapper.lockYCbCr(handle,
@@ -77,7 +78,7 @@ void testFormat(const FormatCase& c, int w, int h) {
         printf("  lockYCbCr FAILED: %d (%s)\n", e1, strerror(-e1));
     }
 
-    // 2) 走单平面 lock（兜底方案要用它拿基址，再自己算 YV12 平面）
+    // 2) through a single-plane lock (the fallback needs the base address to compute the YV12 planes itself)
     void* vaddr = nullptr;
     status_t e2 = mapper.lock(handle,
             GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,

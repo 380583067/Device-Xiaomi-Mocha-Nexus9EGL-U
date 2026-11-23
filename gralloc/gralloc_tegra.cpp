@@ -185,16 +185,17 @@ static bool tracing() {
     return state == 1;
 }
 
-/* 【2026-11-23 fd 泄漏探针】cameraserver 的 fd 表以每帧一个 sync_fence 的速度
- * 增长，撞满 32768 上限后 Parcel fd 翻译失败，任何相机 App 预览 25 分钟即死。
- * 每次 vendor 调用前后数一遍 /proc/self/fd，trace 门控，谁在造 fd 一眼可见。 */
+/* [2026-11-23 fd leak probe] cameraserver's fd table grows by one sync_fence per
+ * frame, and once the 32768 limit is hit the Parcel fd translation fails and any
+ * camera app dies after about 25 minutes of preview. Count /proc/self/fd around
+ * every vendor call, gated by a trace property, so the fd source is obvious. */
 static int fd_probe_count(void) {
     DIR *d = opendir("/proc/self/fd");
     if (!d) return -1;
     int n = 0;
     while (readdir(d) != NULL) n++;
     closedir(d);
-    return n - 3; /* ".", "..", 和目录自身的 fd */
+    return n - 3; /* ".", ".." and the directory's own fd */
 }
 
 static void fd_probe(const char *what, int before, int after) {
@@ -252,14 +253,16 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
               usage, result, (result == 0 && stride != NULL) ? *stride : -1);
     }
 
-    /* 【2026-11-22 录像色度条纹】只被 CPU 摸的 YUV 缓冲（MediaRecorder 的
-     * CameraSource 队列：usage 仅含 SW 位）不用 vendor 的 YV12——vendor 对
-     * YV12 的 unlock blit 按它自己的真实布局重排数据，任何按别的布局写入
-     * 的内容都会在解锁时被搅乱（编码出的视频 chroma 逐行错位、绿黑条纹）。
-     * 改为分配一块 BLOB 线性内存、由本 shim 重解释成 YV12：布局完全由我们
-     * 定义（ystride=w、cstride=w/2、V@w*h、U@w*h+(w/2)(h/2)），没有 blit，
-     * 写方（相机 HAL）和读方（软编码器）都通过下面的 lock_ycbcr 合成视图，
-     * 端到端一致。带 GPU/显示位的分配（解码输出等）不走这条，仍交给 vendor。 */
+    /* [2026-11-22 recording chroma stripes] A YUV buffer only touched by the CPU
+     * (MediaRecorder's CameraSource queue, usage with SW bits only) must not use the
+     * vendor YV12: the vendor unlock blit rearranges the data according to its own
+     * real layout, so anything written in another layout is scrambled on unlock
+     * (encoded chroma shifted per row, green/black stripes). Allocate BLOB linear
+     * memory instead and reinterpret it as YV12 in this shim: the layout is ours
+     * (ystride=w, cstride=w/2, V@w*h, U@w*h+(w/2)(h/2)), there is no blit, and the
+     * writer (camera HAL) and reader (software encoder) both go through the
+     * lock_ycbcr view below, so the two ends agree. Allocations with GPU/display bits
+     * (decoder output and such) do not take this path and still go to the vendor. */
     bool cpuOnlyYuv = (format == HAL_PIXEL_FORMAT_YCbCr_420_888) &&
                       (usage & GRALLOC_USAGE_SW_READ_MASK) &&
                       !(usage & (GRALLOC_USAGE_HW_TEXTURE |
@@ -284,20 +287,21 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
             if (stride != NULL) *stride = w;
             return 0;
         }
-        /* BLOB 分配失败则落到下面的 YV12 重试。 */
+        /* If the BLOB allocation fails, fall through to the YV12 retry below. */
     }
 
-    /* 【2026-11-22 录像 0 帧】编码器流（YCbCr_420_888，HAL 已剥掉
-     * HW_VIDEO_ENCODER）在分配时也被 EINVAL 拒绝。这类拒绝 vendor 的口味是
-     * "要一个软件读位"——给 YV12/YCbCr 都放宽：只要还没有 SW 读位就补一个
-     * SW_READ_RARELY 再试一次（SW_WRITE 已在的用法同样能补）。 */
+    /* [2026-11-22 recording 0 frames] The encoder stream (YCbCr_420_888, with
+     * HW_VIDEO_ENCODER already stripped by the HAL) is also refused with EINVAL at
+     * allocation. That kind of refusal means "give me a software access bit" - relax
+     * for both YV12 and YCbCr: if no SW read bit is set yet, add SW_READ_RARELY and
+     * retry (the same works when SW_WRITE is already set). */
     if (result == 0 || format != HAL_PIXEL_FORMAT_YCbCr_420_888) {
         return result;
     }
 
     if (!(usage & GRALLOC_USAGE_SW_READ_MASK)) {
-        /* 无 SW 位的情形（C2BqBuffer 探测等）：vendor 拒的是"一个软件位都
-         * 没有"，补 SW_READ_RARELY 就能过。 */
+        /* The no-SW-bit case (C2BqBuffer probing and such): what the vendor refuses is
+         * "not a single software bit", and adding SW_READ_RARELY gets through. */
         int retried = usage | GRALLOC_USAGE_SW_READ_RARELY;
 
         int second = gVendorAlloc(dev, w, h, format, retried, handle, stride);
@@ -314,17 +318,18 @@ static int tegra_alloc(alloc_device_t *dev, int w, int h, int format, int usage,
         }
     }
 
-    /* 【2026-11-22 录像】带 SW_READ_OFTEN 的 YCbCr_420_888 被 vendor 以
-     * -ENOMEM(NO_RESOURCES) 拒绝——它的门槛是"YCbCr_420_888 一律不许带软件
-     * 访问位"（3516/35bc 的第一道闸）。这挡住了 MediaRecorder 的
-     * StageFright-CameraSource 队列（usage 0x3 = SW_READ_OFTEN）：分配失败
-     * 后 CameraSource 视频轨道 0 帧，停止时报 -1007，文件被删，表现为
-     * "录像保存不下来/退出"。
-     *
-     * YV12 是 vendor 唯一放行的带软件位 YUV 格式（软解缩略图一路都在用）。
-     * 同参数改报 YV12：写方（相机 HAL）与读方（软编码器）都走 lock_ycbcr /
-     * lock() 的平面布局，拿到的是 vendor 真实给出的 YV12，双方一致。
-     * 格式写在 GraphicBuffer 元数据里仍是 35，无碍：两侧都不信那个字段。 */
+    /* [2026-11-22 recording] YCbCr_420_888 with SW_READ_OFTEN is refused by the
+     * vendor with -ENOMEM (NO_RESOURCES): the gate (3516/35bc) is "YCbCr_420_888 may
+     * never carry a software access bit". That blocks MediaRecorder's
+     * StageFright-CameraSource queue (usage 0x3 = SW_READ_OFTEN): the allocation
+     * fails, the video track stays at 0 frames and stopping reports -1007, the file
+     * is deleted, which the user sees as "recording will not save / it just exits".
+     * YV12 is the only YUV format the vendor allows with software bits (the software
+     * decoder thumbnail path uses it all the time). Re-request the same parameters as
+     * YV12: both the writer (camera HAL) and reader (software encoder) use
+     * lock_ycbcr / lock() plane layouts and get the vendor's real YV12, so they
+     * agree. The format stays 35 in the GraphicBuffer metadata, which is fine because
+     * neither side trusts that field. */
     {
         int yv12 = gVendorAlloc(dev, w, h, HAL_PIXEL_FORMAT_YV12, usage, handle,
                                 stride);
@@ -408,8 +413,9 @@ static int tegra_lock_ycbcr(const gralloc_module_t *module,
     int result = gVendorLockYCbCr(module, handle, usage, l, t, w, h, ycbcr);
 
     if (result != 0) {
-        /* vendor 对 YCbCr_420_888/YV12 的 lockYCbCr 一律 -ENOSYS：退化为普通
-         * lock 并按 synthesize_ycbcr 注释的线性布局合成视图。 */
+        /* The vendor's lockYCbCr always returns -ENOSYS for YCbCr_420_888/YV12: fall
+         * back to a plain lock and synthesise the view with the linear layout described
+         * in the synthesize_ycbcr comment. */
         int syn = synthesize_ycbcr(module, handle, usage, l, t, w, h, ycbcr);
 
         if (tracing()) {
@@ -435,8 +441,8 @@ static int tegra_lock_async_ycbcr(const gralloc_module_t *module,
     fd_probe("lockAsync_ycbcr", before, tracing() ? fd_probe_count() : before);
 
     if (result != 0) {
-        /* 同 tegra_lock_ycbcr：vendor 拒绝时合成线性 YV12 视图。fence 由
-         * 调用方持有，普通 lock 不动它。 */
+        /* Same as tegra_lock_ycbcr: synthesise a linear YV12 view when the vendor
+         * refuses. The fence belongs to the caller and a plain lock leaves it alone. */
         int syn = synthesize_ycbcr(module, handle, usage, l, t, w, h, ycbcr);
 
         if (tracing()) {
@@ -529,10 +535,12 @@ static int tegra_unlock_async(const gralloc_module_t *module,
     return result;
 }
 
-/* 【2026-11-23 回滚】曾把 plain unlock 路由到 unlockAsync（等待+关闭 fence）
- * 试图堵 fd 泄漏，但 SF 每帧都走 plain unlock：路径被阻塞最长 1 秒、fence
- * 未完成即被关闭 → 合成损坏 → composer 崩溃循环（开机动画反复重启）。
- * 恢复为直接透传 vendor 的同步 unlock，仅保留 fd 计数探针；泄漏另找源头。 */
+/* [2026-11-23 rollback] plain unlock was once routed to unlockAsync (wait for and
+ * close the fence) to plug the fd leak, but SF takes plain unlock every frame: the
+ * path blocked for up to 1 s, fences were closed before completing, composition broke
+ * and the composer entered a crash loop (the boot animation restarted over and over).
+ * Back to a direct pass-through of the vendor's synchronous unlock, keeping only the
+ * fd counting probe; the leak has to be found elsewhere. */
 static int tegra_unlock(const gralloc_module_t *module,
                         buffer_handle_t handle) {
     int before = tracing() ? fd_probe_count() : 0;
@@ -632,7 +640,7 @@ __attribute__((constructor)) static void tegra_take_vendor_module() {
      * vendor has one to call. A null stays null: a caller checks for it.
      */
     if (HAL_MODULE_INFO_SYM.base.lock != NULL) {
-        /* synthesize_ycbcr 依赖它：vendor 拒绝 lock_ycbcr 时退化为普通 lock。 */
+        /* synthesize_ycbcr relies on it: fall back to a plain lock when the vendor refuses lock_ycbcr. */
         gVendorLock = HAL_MODULE_INFO_SYM.base.lock;
     }
 

@@ -93,22 +93,21 @@ Only the three quirks included above are recognized at this point:
             <Limit name="alignment" value="2x2" />
             <Feature name="adaptive-playback" />
         </MediaCodec>
-        <!-- mocha 说明：libnvomx.so 里虽然同时存在非 secure 的
-             OMX.Nvidia.h264.decode，但该 2014 年的厂商 blob 与 Android 14 的
-             ACodec 原生 buffer ABI 不兼容（setPortMode 到 DynamicANWBuffer 直接
-             失败），实测选中后画面不推进、解码器空转。
-             因此这里只保留 secure 版本（DRM 用），普通视频走
-             media_codecs_google_video.xml 里的软件解码器，
-             配合 SoftwareRenderer 的 gralloc 兜底（见 frameworks/av 补丁）
-             可以正常播放。 -->
-        <!-- mocha 2026-11-20（结论）：非 secure 硬解**永久移除**，不要再加回。
-             实测链：设备无 /dev/nvhost-msdec|vde、内核 drivers/video/tegra/host/
-             下只有 msenc/vi/vic03/isp，没有解码引擎驱动 →
-             NvxVideoDecoderAcquireResources: NvxNvMMTransformOpen failed →
-             ACodec ERROR(0x80001000) → ExoPlayer "Decoder failed"（直接黑屏报错）。
-             即：这个 blob 的硬解在本内核上无法初始化，与 ACodec/metadata 协商
-             无关（那些补丁解决的是崩溃，不是可解码性）。
-             本机 H.264 只能走 OMX.google.h264.decoder 软解。 -->
+        <!-- mocha note: libnvomx.so does contain a non-secure OMX.Nvidia.h264.decode,
+             but that 2014 vendor blob is incompatible with the Android 14 ACodec
+             native buffer ABI (setPortMode to DynamicANWBuffer fails outright), and in
+             testing the picture never advanced while the decoder spun.
+             Only the secure version (for DRM) is kept here; ordinary video goes to the
+             software decoders in media_codecs_google_video.xml and plays fine with the
+             SoftwareRenderer gralloc fallback (see the frameworks/av patches). -->
+        <!-- mocha 2026-11-20 (conclusion): the non-secure hardware decoder is **gone for
+             good**, do not add it back. Measured chain: the device has no
+             /dev/nvhost-msdec|vde, and drivers/video/tegra/host/ only has
+             msenc/vi/vic03/isp - no decoder engine driver - so ACodec fails with
+             ERROR(0x80001000) and ExoPlayer reports "Decoder failed" (black screen and
+             an error). The blob's hardware decode cannot initialise on this kernel at
+             all, independent of ACodec/metadata negotiation (those patches fixed crashes,
+             not decodability). H.264 here can only use OMX.google.h264.decoder. -->
         <MediaCodec name="OMX.Nvidia.h264.decode.secure" type="video/avc" rank="0x300" >
             <Limit name="size" min="32x32" max="3840x2176" />
             <Limit name="alignment" value="2x2" />
@@ -143,9 +142,10 @@ Only the three quirks included above are recognized at this point:
             <Feature name="adaptive-playback" />
         </MediaCodec>
 
-        <!-- mocha 修复：原声明为 audio/mpeg-L2，Android 14 的 MediaCodecsXmlParser
-             不接受该 MIME，启动时报 "OMX.Nvidia.mp3.decoder does not support any
-             media types"，组件等于不生效。MP3 对应 MIME 为 audio/mpeg。 -->
+        <!-- mocha fix: this was declared as audio/mpeg-L2, which Android 14's
+             MediaCodecsXmlParser rejects, so startup logged "OMX.Nvidia.mp3.decoder
+             does not support any media types" and the component was effectively dead.
+             MP3 is audio/mpeg. -->
         <MediaCodec name="OMX.Nvidia.mp3.decoder" type="audio/mpeg" rank="0x300" >
             <Limit name="channel-count" max="2" />
             <Limit name="sample-rate" ranges="16000,22050,24000,32000,44100,48000" />
@@ -184,13 +184,13 @@ Only the three quirks included above are recognized at this point:
         <MediaCodec name="c2.android.aac.decoder" update="true" rank="768" />
         <MediaCodec name="c2.android.flac.decoder" update="true" rank="768" />
         <MediaCodec name="c2.android.opus.decoder" update="true" rank="768" />
-        <!-- 【2026-11-22 音乐僵死】这个漏了：FLACExtractor 对 .flac 直接吐
-         * audio/raw PCM，NuPlayer 于是选 c2.android.raw.decoder（trait rank
-         * 8，dumpsys media.player 可见），它同样"吃下音轨、永不吐帧"——
-         * NPDecoder 的 looper 消息永远处理不完，mediaserver 里的 NuPlayer
-         * 从此僵死，之后所有 MediaPlayer 播放（音乐/视频/铃声）全部只有
-         * 状态推进没有声音。降到 768 让 OMX.google.raw.decoder（rank 0x10）
-         * 接管 audio/raw，与前几个条目同一原因、同一症状。 -->
+        <!-- [2026-11-22 music hang] This one was missed: FLACExtractor emits audio/raw
+         * PCM for .flac, so NuPlayer picks c2.android.raw.decoder (trait rank 8,
+         * visible in dumpsys media.player), which likewise swallows the track and never
+         * emits a frame - NPDecoder's looper never drains, NuPlayer in mediaserver hangs
+         * from then on, and every later MediaPlayer playback (music/video/ringtones)
+         * advances state with no sound. Lower it to 768 so OMX.google.raw.decoder (rank
+         * 0x10) handles audio/raw - same cause and same symptom as the entries above. -->
         <MediaCodec name="c2.android.raw.decoder" update="true" rank="768" />
     </Decoders>
 

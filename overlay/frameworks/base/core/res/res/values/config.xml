@@ -282,14 +282,17 @@
          alive. Absolute value is in KB and rescales the whole table. -->
     <integer name="config_lowMemoryKillerMinFreeKbytesAbsolute">131072</integer>
 
-    <!-- [2026-11-23] 限制缓存进程数。
-         实测依据（reports/短视频App压力测试报告-2026-11-23.md）：
-         刷快手极速版时 dumpsys meminfo 显示 system_server 376MB + SystemUI 163MB
-         + launcher 93MB + 各类 HAL，加上 32 个 cached 进程，系统 free 长期在 0-20MB；
-         清理后台后 free 能从 64MB 回到 335MB。
-         AOSP 默认 32（config_customizedMaxCachedProcesses）对本机 2GB 明显偏大，
-         降到 12 可让后台更早被淘汰，把内存留给前台。
-         代价：多任务切回时会重载，对单 App 使用（视频/相机）无影响。 -->
+    <!-- [2026-11-23] Cap the number of cached processes.
+         Measured (reports/short-video-stress-test-2026-11-23.md): while scrolling
+         Kuaishou Lite, dumpsys meminfo showed system_server 376 MB + SystemUI 163 MB +
+         launcher 93 MB + the HALs, and with 32 cached processes free memory sat at
+         0-20 MB for long stretches; clearing background apps moved free from 64 MB back
+         to 335 MB.
+         AOSP's default 32 (config_customizedMaxCachedProcesses) is clearly too much for
+         2 GB, so 12 lets the background be evicted earlier and keeps memory for the
+         foreground.
+         Cost: switching back to a task reloads it; single-app use (video, camera) is
+         unaffected. -->
     <integer name="config_customizedMaxCachedProcesses">12</integer>
 
 </resources>

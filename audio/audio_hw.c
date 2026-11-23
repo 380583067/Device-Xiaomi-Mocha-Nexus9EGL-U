@@ -2476,14 +2476,11 @@ static void fm_set_codec_route(bool enable)
         if (ctl)
             mixer_ctl_set_enum_by_string(ctl, "IF4 DAC");
         /*
-         * 【FM 无声修复 2026-11-16】必须打开 Stereo DAC MIX 的 DAC1 输入开关。
-         * RT5671 的 DAPM 完整链路是：
-         *   IF4 DAC -> DAC1 MIXL/R(DAC1 Switch) -> Stereo DAC MIXL/R(DAC L1/R1
-         *   Switch) -> DAC L1/R1 -> DAC 1 -> HPO MIX(DAC1 Switch) -> HP Amp
-         *   -> HPOL/HPOR -> Headphone Jack
-         * 正常音乐播放时 audio HAL 的常规路由会顺带打开 Stereo DAC MIX 开关，
-         * 但 FM 单独播放时不经过常规路由，这两个开关保持 Off，
-         * DAC1 MIX 到 Stereo DAC MIX 之间断链 -> FM 调谐正常却完全无声。
+         * [FM silence fix 2026-11-16] The DAC1 input switch on Stereo DAC MIX must be on.
+         * The full RT5671 DAPM path is DAC1 -> Stereo DAC MIX -> output; normal music
+         * playback turns the Stereo DAC MIX switch on through the regular HAL routing,
+         * but FM audio bypasses that routing, so both switches stay off, the link between
+         * DAC1 MIX and Stereo DAC MIX is broken and FM tunes fine yet stays silent.
          */
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
         if (ctl)
@@ -2506,8 +2503,8 @@ static void fm_set_codec_route(bool enable)
         ctl = mixer_get_ctl_by_name(mixer, "DAC1 R Mux");
         if (ctl)
             mixer_ctl_set_enum_by_string(ctl, "IF1 DAC");
-        /* 关闭 FM 时把 Stereo DAC MIX 的 DAC1 输入也断开，
-         * 让 DAC1 通路回到常规播放的独占状态。 */
+        /* When FM stops, disconnect the DAC1 input on Stereo DAC MIX again so the DAC1
+         * path returns to exclusive use by normal playback. */
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
