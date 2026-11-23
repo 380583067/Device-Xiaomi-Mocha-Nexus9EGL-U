@@ -1,12 +1,12 @@
 # ADB
-# 修复说明：原先设备树缺少 ADB 相关属性，导致 persist.sys.usb.config 残留为纯 adb
-# 模式，host 端 adb 授权握手异常，表现为 offline。补齐 USB 默认 mtp,adb 模式。
+# Fix: the device tree lacked the ADB properties, so persist.sys.usb.config stayed
+# adb-only, the host handshake broke and adb showed offline. Default to mtp,adb.
 #
-# 注意：ro.secure / ro.adb.secure / ro.debuggable 不能写在此处——它们由 build 系统
-# 自动加入（main.mk 的 ADDITIONAL_SYSTEM_PROPERTIES 和 lineage common.mk 的
-# PRODUCT_SYSTEM_DEFAULT_PROPERTIES），在此重复赋值会触发
-# "found duplicate sysprop assignments" 编译错误。这些只读属性的覆盖改在
-# lineage_mocha.mk 里用 filter-out 方式处理。
+# Note: ro.secure / ro.adb.secure / ro.debuggable cannot live here - the build
+# system adds them (main.mk ADDITIONAL_SYSTEM_PROPERTIES and lineage common.mk
+# PRODUCT_SYSTEM_DEFAULT_PROPERTIES) and a second assignment fails the build with
+# "found duplicate sysprop assignments". Override those read-only properties in
+# lineage_mocha.mk with filter-out instead.
 persist.service.adb.enable=1
 persist.service.debuggable=1
 persist.sys.usb.config=mtp,adb
@@ -40,16 +40,15 @@ persist.tegra.didim.video=5
 persist.tegra.didim.normal=3
 
 # DNS
-# 【2026-11-19 域名解析偶发卡十几秒】家用路由的 RA 会把链路本地地址
-# fe80::100 当首选 DNS 下发（LinkProperties 里是
-# DnsAddresses=[fe80::100%wlan0, 192.168.2.1]），实测该地址 100% 不可达
-# （IPv6 上游是断的，只有 RA 还在宣告）。netd 的解析器是串行试服务器的，
-# 撞到死地址时每次尝试都要等满 RES_TIMEOUT（5 秒）才轮到下一个，
-# 冷查询因此被拖到 13~20 秒。
-# netd 允许用 device_config 覆盖这个重传间隔（见
-# packages/modules/DnsResolver/res_cache.cpp：base_timeout_msec 为 0 时读
-# netd_native 实验标志），这里把单次等待压到 1 秒。局域网/公网 DNS 正常
-# 都在 200ms 内应答，不影响正常解析，而不可达的服务器最多只耽误 1 秒。
+# [2026-11-19 DNS sometimes stalls for ~15 s] The home router's RA advertises the
+# link-local fe80::100 as the preferred DNS (LinkProperties shows
+# DnsAddresses=[fe80::100%wlan0, 192.168.2.1]) and that address is 100% unreachable
+# here, because the IPv6 uplink is down and only the RA still announces it. netd
+# probes name servers serially, so each dead entry costs a full RES_TIMEOUT (5 s)
+# before the next one and cold lookups took 13-20 s. netd lets device_config
+# override the retry interval (packages/modules/DnsResolver/res_cache.cpp reads
+# base_timeout_msec when it is non-zero), so cap a single wait at 1 s: LAN and
+# public DNS answer within 200 ms and an unreachable server costs at most 1 s.
 persist.device_config.netd_native.retransmission_time_interval=1000
 
 # DRM
@@ -113,31 +112,30 @@ persist.lineage.nofool=true
 
 # LMKD Memory Tuning for mocha 2GB, A14, use_minfree_levels mode
 #
-# 【2026-11-21 修正】先弄清这几个属性在 A14 里到底是什么含义
-# （system/memory/lmkd/lmkd.cpp 的 update_props()）：
-#   ro.lmk.low / medium / critical 是 **vmpressure 三个级别各自对应的
-#   oom_score_adj 阈值**，取值范围 -1000~1000；默认 low=1001，而
-#   "> OOM_SCORE_ADJ_MAX(1000)" 的语义是"该级别不杀进程"。
-# 原配置写的是 8192 / 6144 / 4096 / 2048，全部越界，等于把 vmpressure 分级
-# 彻底废掉；其中 ro.lmk.high 在 A14 的 lmkd 里连对应级别都不存在（只有
-# VMPRESS_LEVEL_LOW/MEDIUM/CRITICAL），纯属死配置。
-# 而且 use_minfree_levels=true 时判定走的是 framework 下发的 minfree 表
-# （sys.lmk.minfree_levels），根本不会用这几个 oom_score_adj。
-# 这里恢复成默认值（low 关闭），只保留真正生效的开关。
+# [2026-11-21 fix] What these properties mean on A14 (lmkd.cpp update_props()):
+#   ro.lmk.low/medium/critical are the oom_score_adj thresholds of the three
+#   vmpressure levels, valid range -1000..1000; the default low=1001 and anything
+#   above OOM_SCORE_ADJ_MAX(1000) means "never kill at this level".
+# The old values 8192/6144/4096/2048 were all out of range and disabled the
+# vmpressure grading entirely, and ro.lmk.high has no matching level in A14's lmkd
+# at all (only VMPRESS_LEVEL_LOW/MEDIUM/CRITICAL), so it was dead config. With
+# use_minfree_levels=true the decision comes from the framework's minfree table
+# (sys.lmk.minfree_levels) anyway, never from these oom_score_adj values.
+# Restore the defaults (low disabled) and keep only the switches that do something.
 ro.lmk.low=1001
 ro.lmk.medium=800
 ro.lmk.critical=0
 ro.lmk.critical_upgrade=1
 ro.lmk.upgrade_pressure=70
 ro.lmk.downgrade_pressure=50
-# lmkd 在 minfree 级别判定的候选集合里挑进程：开着这个开关时挑 RSS 最大的，
-# 而 2GB 平板上"最大的那个"往往就是用户正在用的大型应用 —— 也就是"游戏自己
-# 退出了"这类反馈的直接来源。关掉之后 lmkd 按调度顺序拿第一个符合 adj 条件的
-# 进程（最可杀的那个），后台先死，前台大应用保住。
+# With this enabled lmkd picks the largest-RSS candidate at a given minfree level,
+# and on a 2 GB tablet that is usually the big app the user is in - the source of
+# the "the game closed itself" reports. Disabled, lmkd takes the first process that
+# matches the adj condition, so background dies first and the foreground survives.
 ro.lmk.kill_heaviest_task=0
 ro.lmk.kill_timeout_ms=500
-# 本内核没有 CONFIG_PSI（3.10 内核），PSI 模式必须关掉，否则 lmkd 拿不到压力
-# 信号就只剩硬杀；minfree 模式是这台机器上唯一可用的路径。
+# This 3.10 kernel has no CONFIG_PSI, so PSI mode must stay off or lmkd loses its
+# pressure signal and only has hard kills left; minfree is the only usable path.
 ro.lmk.use_minfree_levels=true
 ro.lmk.use_psi=false
 
@@ -184,21 +182,19 @@ persist.wlan.ti.calibrated=0
 persist.sys.binary_xml=false
 
 # Disable unlock
-# 【2026-11-21 修正】原来写的是 false，但 ro.oem_unlock_supported 是 **int**
-# 属性（framework 侧读的是 SystemProperties.getInt），开机日志里一直报：
+# [2026-11-21 fix] This used to be false, but ro.oem_unlock_supported is an int
+# property (the framework reads it with SystemProperties.getInt) and every boot logged:
 #   E init: Do not have permissions to set 'ro.oem_unlock_supported' to 'false'
 #           in property file '/system/build.prop': Property type check failed
-# 也就是说这行从来没生效过。改成 0。
+# so the line never had any effect. Use 0.
 ro.oem_unlock_supported=0
 
-# 【开机动画循环修复 2026-11-17】原厂 NVIDIA gralloc（Android 7/8 时代的 blob）
-# 在 NvGrUnregisterBuffer 里会对一个已经关闭的 fd 再 close 一次（实测报
-# "attempted to close file descriptor 0"）。Android 14 的 bionic 默认对该情况
-# 直接 fdsan abort，于是 SurfaceFlinger 收到 SIGABRT → init 重启 SF →
-# SF 启动时重新拉起开机动画 → 用户看到开机动画反复播放（四清后的第二次开机
-# 尤其明显，因为此时 buffer 生命周期与首次开机不同）。
-# bionic 支持用 debug.fdsan 属性调整这个检查的严重级别（见
-# bionic/libc/bionic/fdsan.cpp 的 android_fdsan_set_error_level_from_property）：
-#   warn_once = 只在第一次记一条日志，之后不再 abort
-# 这样老的 gralloc blob 可以继续工作，不再把 SurfaceFlinger 打死。
+# [boot animation loop fix 2026-11-17] The vendor NVIDIA gralloc (an Android 7/8
+# era blob) closes an already-closed fd in NvGrUnregisterBuffer ("attempted to close
+# file descriptor 0"). Android 14's bionic fdsan aborts on that, so SurfaceFlinger
+# got SIGABRT, init restarted it, SF restarted the boot animation and the animation
+# looped forever - most visible on the second boot after a factory reset, when the
+# buffer lifetimes differ from the first boot. bionic lets debug.fdsan lower the
+# severity (android_fdsan_set_error_level_from_property): warn_once logs once and
+# stops aborting, so the old gralloc blob keeps working and SF stays alive.
 debug.fdsan=warn_once
