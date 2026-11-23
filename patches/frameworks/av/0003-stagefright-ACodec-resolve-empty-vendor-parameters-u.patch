@@ -1,7 +1,7 @@
 From 2b8f1c2074c70ccd7e9c690428609e524a09df5c Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 00:32:38 +0800
-Subject: [PATCH 3/4] stagefright: ACodec: resolve empty vendor parameters
+Subject: [PATCH 3/5] stagefright: ACodec: resolve empty vendor parameters
  usage
 
 Upstream LineageOS fix (Adrian DC, 2017) that the mocha tree was missing:

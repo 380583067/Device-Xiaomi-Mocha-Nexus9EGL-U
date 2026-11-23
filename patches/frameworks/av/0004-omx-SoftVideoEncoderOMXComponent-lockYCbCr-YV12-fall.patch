@@ -1,7 +1,7 @@
 From 96d1d9f6ca934aaabf8a5ee70f604472c7e00045 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 00:19:42 +0800
-Subject: [PATCH 4/4] omx: SoftVideoEncoderOMXComponent lockYCbCr YV12 fallback
+Subject: [PATCH 4/5] omx: SoftVideoEncoderOMXComponent lockYCbCr YV12 fallback
  for tegra gralloc
 
 tegra's gralloc blob refuses lockYCbCr outright for YCbCr_420_888 and

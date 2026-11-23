@@ -1,7 +1,7 @@
 From 5337c55703a16e7a745f8ea874ecccca3459baf3 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 20:56:33 +0800
-Subject: [PATCH 1/4] mocha: NvMM-era display/decode compat for the legacy
+Subject: [PATCH 1/5] mocha: NvMM-era display/decode compat for the legacy
  tegra stack
 
 MEDIA:

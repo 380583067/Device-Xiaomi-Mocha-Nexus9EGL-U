@@ -1,7 +1,7 @@
 From 07e7e7aee7ae5fa80ca67b9e6379f0aa097db444 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 00:38:45 +0800
-Subject: [PATCH 2/4] codec2: legacy gralloc support (mocha/Tegra K1)
+Subject: [PATCH 2/5] codec2: legacy gralloc support (mocha/Tegra K1)
 
 tegra's gralloc0 is the old single-buffer style: no lockYCbCr, picky
 about usage bits, and no HW_TEXTURE for raw YUV. Three problems broke
