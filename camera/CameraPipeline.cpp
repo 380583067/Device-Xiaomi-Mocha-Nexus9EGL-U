@@ -547,6 +547,69 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     float avgG = (float)sumG / pixelCount;
     float avgB = (float)sumB / pixelCount;
 
+    /* 【2026-11-23 暗场绿偏】全局平均在暗场会被暗部像素的噪声谱主导：
+     * 台灯照亮的一面白墙只占 11% 像素，88% 是 OV5693 绿主导的暗噪声，
+     * 算出的增益只中和"全帧均值"，亮着的墙反而没人管。暗场时改用
+     * 最亮十分位样本（真正的白参考：被照亮的表面/高光）来算增益；
+     * 亮场景全局统计已被验证是准的（后摄 R/G=1.00），保持不动。 */
+    bool dark = (avgG < 30.0f);
+    if (dark) {
+        /* Pass 1: 采样网格的亮度直方图，找最亮十分位的门槛。 */
+        uint32_t hist[256];
+        memset(hist, 0, sizeof(hist));
+        for (int y = 0; y < h; y += step) {
+            for (int x = 0; x < w; x += step) {
+                int off = (y * w + x) * 3;
+                int l = (rgbBuffer[off] * 299 + rgbBuffer[off+1] * 587 +
+                         rgbBuffer[off+2] * 114) / 1000;
+                hist[l]++;
+            }
+        }
+        uint32_t total = 0;
+        for (int i = 0; i < 256; i++) total += hist[i];
+        uint32_t seen = 0, brightTarget = total / 10;
+        int brightThr = 255;
+        for (int i = 255; i >= 0; i--) {
+            seen += hist[i];
+            if (seen >= brightTarget) { brightThr = i; break; }
+        }
+
+        /* Pass 2: 只累计门槛以上的样本。 */
+        uint64_t bR = 0, bG = 0, bB = 0;
+        uint32_t bN = 0;
+        for (int y = 0; y < h; y += step) {
+            for (int x = 0; x < w; x += step) {
+                int off = (y * w + x) * 3;
+                int l = (rgbBuffer[off] * 299 + rgbBuffer[off+1] * 587 +
+                         rgbBuffer[off+2] * 114) / 1000;
+                if (l >= brightThr) {
+                    bR += rgbBuffer[off];
+                    bG += rgbBuffer[off+1];
+                    bB += rgbBuffer[off+2];
+                    bN++;
+                }
+            }
+        }
+
+        /* 亮区要有足够的样本和真实信号（avgG>=8，低于这个就是噪声谱）
+         * 才值得换参考；否则保持现增益不追噪声。 */
+        if (bN >= 100) {
+            float bAvgR = (float)bR / bN;
+            float bAvgG = (float)bG / bN;
+            float bAvgB = (float)bB / bN;
+            if (bAvgG >= 8.0f) {
+                avgR = bAvgR;
+                avgG = bAvgG;
+                avgB = bAvgB;
+                ALOGI("AWB: using bright decile (%u samples, thr=%d)", bN, brightThr);
+            } else {
+                ALOGI("AWB: dark scene, bright decile has no signal, keep gains");
+                return;
+            }
+        }
+        /* 没凑够样本就走全局平均（原行为）。 */
+    }
+
     /* 【2026-11-22 前摄偏绿】暗场里三通道均值都很低，原来 <5 直接跳过 AWB，
      * 于是 OV5693 的原生绿色偏色（前摄"偏绿"的来源）在暗场完全无人修正。
      * 降到 2：10-bit raw 下 2/4≈八位 0.5，噪声仍不至于把均值推到假平衡。
