@@ -80,6 +80,9 @@ class Actuator {
     /* Writes that do not take the lock and do not cancel anything, so the
      * playback thread can use them on itself. */
     bool writeStrength(uint8_t amplitude) const;
+    /* A step's amplitude is already on the amplifier's own scale; only a
+     * framework amplitude needs the 1..255 -> 1..127 mapping. */
+    bool writeRawStrength(uint8_t strength) const;
     bool startTimer(uint32_t milliseconds) const;
     bool halt() const;
 
@@ -99,7 +102,7 @@ class Actuator {
 
     /* What the framework asked for. An effect borrows the strength node, so
      * this is what has to be put back before a plain run can use it again. */
-    mutable std::atomic<uint8_t> mFrameworkStrength{MAX_STRENGTH};
+    mutable std::atomic<uint8_t> mFrameworkStrength{255};
 
     mutable std::mutex mLock;
     mutable std::condition_variable mWake;

@@ -103,6 +103,14 @@ bool Actuator::writeStrength(uint8_t amplitude) const {
     return mocha::sysfs::write(STRENGTH, static_cast<int>(strength));
 }
 
+bool Actuator::writeRawStrength(uint8_t strength) const {
+    if (!mStrengthAdjustable) return true;
+
+    if (strength > MAX_STRENGTH) strength = MAX_STRENGTH;
+
+    return mocha::sysfs::write(STRENGTH, static_cast<int>(strength));
+}
+
 bool Actuator::startTimer(uint32_t milliseconds) const {
     return mocha::sysfs::write(ENABLE, static_cast<int>(milliseconds));
 }
@@ -217,7 +225,7 @@ void Actuator::playbackLoop() {
             if (step.first == 0) {
                 halt();
             } else {
-                writeStrength(step.first);
+                writeRawStrength(step.first);
                 startTimer(step.second);
             }
 
