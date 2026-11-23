@@ -125,6 +125,18 @@ on boot
 
     write /sys/module/workqueue/parameters/power_efficient 1
 
+    # 【2026-11-23 CPU 优化】zram 压缩流数 1 -> 4（Cortex-A15 四核）。
+    # 注意：**这里不能写 sysfs**。max_comp_streams_store 在 init_done 之后
+    # 只允许减少不允许增加，实测 `echo 4 > max_comp_streams` 返回 EINVAL、
+    # 读回仍是 1，并在 dmesg 打出 "Cannot change max compression streams"。
+    # 真正生效的位置在内核默认值：
+    #   drivers/block/zram/zram_drv.c  zram_add() / zram_reset_device()
+    #   zram->max_comp_streams = 4;
+    # 单流时内存压力下的换出压缩只占 1 个核，另 3 核空转，压缩延迟直接
+    # 表现为前台视频/渲染掉帧；4 流可并行压缩（总 CPU 不变，抖动显著降低）。
+    # 压缩算法已是 lz4（CONFIG_ZRAM_LZ4_COMPRESS=y），实测压缩比 3.25:1，
+    # 1.5GB zram 容量足够，不需要扩容——扩大会鼓励内核多换出，反而增加 CPU 负担。
+
     # Little VM tweaks
     # swappiness 100: the only swap device is 1GB of zram, so pushing anonymous
     # pages out is cheap and keeps more applications resident. The kernel
@@ -135,7 +147,13 @@ on boot
     # kswapd with almost no headroom: allocations then go through direct reclaim
     # in the allocating thread (the UI thread), which shows up as frame spikes.
     # 8MB costs little and keeps reclaim off the fast path.
-    write /proc/sys/vm/min_free_kbytes 8192
+    #
+    # [2026-11-23 提到 16MB] 短视频压测实测：刷快手极速版时系统 MemFree 长期
+    # 0-20MB（多次采到 0），此时内核回收 libglcore 的 file-backed JIT 页
+    # （/data/data/<pkg>/cache/.glXXXXXX，mmap 后 unlink，属可回收页），
+    # 驱动仍持有函数指针 → _glDrawArrays 跳 0 地址 SIGSEGV。
+    # 提高水位让 kswapd 更早介入、少走 direct reclaim 的极端回收。
+    write /proc/sys/vm/min_free_kbytes 16384
     
     # Prepare CPU/EMC scaling based on DT
     chown system system /sys/kernel/tegra_cpu_emc/table_src
