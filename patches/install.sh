@@ -1,85 +1,60 @@
 #!/usr/bin/env bash
-# Apply the categorized patch series from any working directory. The check is
-# non-destructive; changes are then applied in sorted order so dependent patches
-# see the changes they build on.
+# Apply the patch series after a repo sync.
+#
+# The series is preflighted with check.sh first; if anything conflicts nothing
+# is installed. Patches are applied in sorted path order so a dependent patch
+# sees the changes it builds on. If one fails mid-way, only the patches applied
+# by this run are reversed, so pre-existing local work is preserved.
 
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ANDROID_TOP="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
+# shellcheck source=lib/patchlib.sh
+. "$SCRIPT_DIR/lib/patchlib.sh"
 
-if [[ ! -f "$ANDROID_TOP/build/envsetup.sh" || ! -d "$ANDROID_TOP/.repo" ]]; then
-    echo "ERROR: cannot locate the Android source root from $SCRIPT_DIR" >&2
-    exit 2
+pl_init
+pl_parse_args "$@"
+pl_collect
+
+if (( PL_LIST )); then
+    pl_list
+    exit 0
 fi
 
-ONLY=""
-while (( $# )); do
-    case "$1" in
-        --only)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --only needs a project path, e.g. --only frameworks/av" >&2
-                exit 2
-            fi
-            ONLY="${2%/}"
-            shift 2
-            ;;
-        -h|--help)
-            echo "usage: $(basename "$0") [--only <repo path>]"
-            exit 0
-            ;;
-        *)
-            echo "ERROR: unknown argument: $1" >&2
-            exit 2
-            ;;
-    esac
-done
+preflight_args=()
+[[ -n "$PL_ONLY" ]] && preflight_args+=(--only "$PL_ONLY")
+[[ -n "$PL_CATEGORY" ]] && preflight_args+=(--category "$PL_CATEGORY")
 
-if ! "$SCRIPT_DIR/check.sh" ${ONLY:+--only "$ONLY"}; then
+if ! "$SCRIPT_DIR/check.sh" "${preflight_args[@]}"; then
     echo "ERROR: patch preflight failed; no patches were installed." >&2
     exit 1
 fi
 
-patches=()
-while IFS= read -r -d '' patch_file; do
-    repo_relative="${patch_file#"$SCRIPT_DIR"/}"
-    repo_relative="${repo_relative%/*}"
-    if [[ -n "$ONLY" && "$repo_relative" != "$ONLY" ]]; then
-        continue
-    fi
-    patches+=("$patch_file")
-done < <(find "$SCRIPT_DIR" -type f -name '*.patch' -print0 | sort -z)
-
 applied=()
 install_failed=0
 
-for patch_file in "${patches[@]}"; do
-    relative_patch="${patch_file#"$SCRIPT_DIR"/}"
-    repo_relative="${relative_patch%/*}"
-    repo_path="$ANDROID_TOP/$repo_relative"
-    actual_repo="$(git -C "$repo_path" rev-parse --show-toplevel 2>/dev/null || true)"
-    expected_repo="$(cd -- "$repo_path" && pwd -P 2>/dev/null || true)"
+for patch in "${PL_PATCHES[@]}"; do
+    relative_patch="$(pl_display "$patch")"
 
-    if [[ -z "$actual_repo" || "$actual_repo" != "$expected_repo" ]]; then
-        printf 'ERROR: missing Git project root for %s (%s)\n' "$relative_patch" "$repo_path" >&2
+    if ! pl_verify_repo "$patch"; then
         install_failed=1
         break
     fi
 
-    if git -C "$repo_path" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    if pl_is_applied "$patch"; then
         printf 'SKIP     %s (already applied)\n' "$relative_patch"
         continue
     fi
 
-    if ! git -C "$repo_path" apply --check "$patch_file"; then
+    if ! pl_applies "$patch"; then
         printf 'ERROR: patch no longer applies: %s\n' "$relative_patch" >&2
         install_failed=1
         break
     fi
 
-    if git -C "$repo_path" apply "$patch_file"; then
+    if git -C "$(pl_repo_path "$patch")" apply "$patch"; then
         printf 'APPLIED  %s\n' "$relative_patch"
-        applied+=("$patch_file")
+        applied+=("$patch")
     else
         printf 'ERROR: failed to apply: %s\n' "$relative_patch" >&2
         install_failed=1
@@ -88,15 +63,13 @@ for patch_file in "${patches[@]}"; do
 done
 
 if (( install_failed != 0 )); then
-    # Roll back only patches installed by this invocation, in reverse order.
-    # This preserves all pre-existing edits in the source repositories.
+    # Roll back only what this invocation installed, in reverse order. This
+    # preserves all pre-existing edits in the source repositories.
     for ((i=${#applied[@]} - 1; i >= 0; i--)); do
-        patch_file="${applied[$i]}"
-        relative_patch="${patch_file#"$SCRIPT_DIR"/}"
-        repo_relative="${relative_patch%/*}"
-        repo_path="$ANDROID_TOP/$repo_relative"
-        if ! git -C "$repo_path" apply --reverse "$patch_file"; then
-            printf 'ERROR: rollback failed for %s; inspect that repository before continuing.\n' "$relative_patch" >&2
+        patch="${applied[$i]}"
+        if ! git -C "$(pl_repo_path "$patch")" apply --reverse "$patch"; then
+            printf 'ERROR: rollback failed for %s; inspect that repository before continuing.\n' \
+                "$(pl_display "$patch")" >&2
         fi
     done
     exit 1

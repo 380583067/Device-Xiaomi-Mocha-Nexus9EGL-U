@@ -1,0 +1,32 @@
+# Patch categories, used by --list and --category in the three scripts.
+#
+# Format: <category> <repo path prefix>
+# A patch belongs to the category of the first prefix that matches its source
+# project path (the directory it lives in). Unmatched projects fall back to
+# "other" so nothing silently disappears from --list.
+#
+# The directory layout stays <repo path>/NNNN-<slug>.patch because that is what
+# decides where a patch applies; the category is only a grouping for humans and
+# for selective runs such as: check.sh --category camera
+
+camera    hardware/interfaces
+media     frameworks/av
+# The cameraservice fence fix lives in frameworks/av but belongs to the camera
+# work, so name it explicitly; a full patch path wins over a project prefix.
+camera    frameworks/av/0005-cameraservice-close-acquire-fence-handles-in-passthr.patch
+display   frameworks/native
+wifi      hardware/broadcom/wlan
+wifi      packages/modules/Wifi
+wifi      packages/modules/Connectivity
+system    frameworks/base
+system    lineage-sdk
+system    packages/apps
+system    packages/modules/adb
+system    packages/modules/IntentResolver
+system    packages/services
+power     bootable/recovery
+build     build/make
+build     system/core
+build     system/sepolicy
+build     prebuilts/gcc
+build     vendor/lineage

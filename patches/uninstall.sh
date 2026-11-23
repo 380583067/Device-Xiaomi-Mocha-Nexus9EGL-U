@@ -1,79 +1,47 @@
 #!/usr/bin/env bash
-# Reverse only this patch series. Descending lexical order removes later patches
-# first (for example, frameworks/av/0041 before 0034, which it depends on).
+# Reverse only this patch series, nothing else.
+#
+# Descending path order removes later patches first, so a patch that depends on
+# an earlier one is undone before its base. It never runs git checkout or git
+# clean, so local work outside the series is preserved.
 
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ANDROID_TOP="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
+# shellcheck source=lib/patchlib.sh
+. "$SCRIPT_DIR/lib/patchlib.sh"
 
-if [[ ! -f "$ANDROID_TOP/build/envsetup.sh" || ! -d "$ANDROID_TOP/.repo" ]]; then
-    echo "ERROR: cannot locate the Android source root from $SCRIPT_DIR" >&2
-    exit 2
+pl_init
+pl_parse_args "$@"
+pl_collect
+
+if (( PL_LIST )); then
+    pl_list
+    exit 0
 fi
-
-ONLY=""
-while (( $# )); do
-    case "$1" in
-        --only)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --only needs a project path, e.g. --only frameworks/av" >&2
-                exit 2
-            fi
-            ONLY="${2%/}"
-            shift 2
-            ;;
-        -h|--help)
-            echo "usage: $(basename "$0") [--only <repo path>]"
-            exit 0
-            ;;
-        *)
-            echo "ERROR: unknown argument: $1" >&2
-            exit 2
-            ;;
-    esac
-done
-
-patches=()
-while IFS= read -r -d '' patch_file; do
-    patches+=("$patch_file")
-done < <(find "$SCRIPT_DIR" -type f -name '*.patch' -print0 | sort -z)
 
 undone=()
 uninstall_failed=0
 
-for ((i=${#patches[@]} - 1; i >= 0; i--)); do
-    patch_file="${patches[$i]}"
-    relative_patch="${patch_file#"$SCRIPT_DIR"/}"
-    repo_relative="${relative_patch%/*}"
-    if [[ -n "$ONLY" && "$repo_relative" != "$ONLY" ]]; then
-        continue
-    fi
-    repo_path="$ANDROID_TOP/$repo_relative"
+for ((i=${#PL_PATCHES[@]} - 1; i >= 0; i--)); do
+    patch="${PL_PATCHES[$i]}"
+    relative_patch="$(pl_display "$patch")"
 
-    if [[ ! -d "$repo_path" ]]; then
-        printf 'ERROR: missing Git project for %s (%s)\n' "$relative_patch" "$repo_path" >&2
-        uninstall_failed=1
-        break
-    fi
-    actual_repo="$(git -C "$repo_path" rev-parse --show-toplevel 2>/dev/null || true)"
-    expected_repo="$(cd -- "$repo_path" && pwd -P)"
-    if [[ -z "$actual_repo" || "$actual_repo" != "$expected_repo" ]]; then
-        printf 'ERROR: %s is not at a Git project root (%s)\n' "$relative_patch" "$repo_path" >&2
+    if ! pl_verify_repo "$patch"; then
         uninstall_failed=1
         break
     fi
 
-    if git -C "$repo_path" apply --reverse --check "$patch_file"; then
-        if git -C "$repo_path" apply --reverse "$patch_file"; then
+    if pl_is_applied "$patch"; then
+        if git -C "$(pl_repo_path "$patch")" apply --reverse "$patch"; then
             printf 'REVERSED %s\n' "$relative_patch"
-            undone+=("$patch_file")
+            undone+=("$patch")
         else
             printf 'ERROR: failed to reverse %s\n' "$relative_patch" >&2
             uninstall_failed=1
             break
         fi
-    elif git -C "$repo_path" apply --check "$patch_file" >/dev/null 2>&1; then
+    elif pl_applies "$patch"; then
         printf 'SKIP     %s (not applied)\n' "$relative_patch"
     else
         printf 'ERROR: cannot safely determine or reverse patch state: %s\n' "$relative_patch" >&2
@@ -83,15 +51,13 @@ for ((i=${#patches[@]} - 1; i >= 0; i--)); do
 done
 
 if (( uninstall_failed != 0 )); then
-    # Restore only patches reversed by this invocation, preserving unrelated
-    # staged and unstaged work in every source repository.
+    # Restore only what this invocation reversed, preserving unrelated staged
+    # and unstaged work in every source repository.
     for ((i=${#undone[@]} - 1; i >= 0; i--)); do
-        patch_file="${undone[$i]}"
-        relative_patch="${patch_file#"$SCRIPT_DIR"/}"
-        repo_relative="${relative_patch%/*}"
-        repo_path="$ANDROID_TOP/$repo_relative"
-        if ! git -C "$repo_path" apply "$patch_file"; then
-            printf 'ERROR: rollback failed for %s; inspect that repository before continuing.\n' "$relative_patch" >&2
+        patch="${undone[$i]}"
+        if ! git -C "$(pl_repo_path "$patch")" apply "$patch"; then
+            printf 'ERROR: rollback failed for %s; inspect that repository before continuing.\n' \
+                "$(pl_display "$patch")" >&2
         fi
     done
     exit 1

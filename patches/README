@@ -17,19 +17,44 @@ apply position inside that project and `-<slug>` repeats the commit subject.
 The scripts glob `*.patch`, sort by path and apply in that order, so the numeric
 prefix alone decides the order within one project.
 
+Categories
+----------
+
+The directory layout is dictated by where a patch applies, so the functional
+grouping lives in `patches/categories` instead:
+
+  camera   hardware/interfaces, frameworks/av/0005 (camera fences)
+  media    frameworks/av (decoding, ACodec, OMX encoder)
+  display  frameworks/native (binder interfaces, SurfaceFlinger)
+  wifi     hardware/broadcom/wlan, packages/modules/{Wifi,Connectivity}
+  system   frameworks/base, lineage-sdk, packages/apps, packages/modules,
+           packages/services
+  power    bootable/recovery (charger mode display)
+  build    build/make, system/core, system/sepolicy, prebuilts/gcc,
+           vendor/lineage
+
+A full patch path in that file overrides the project prefix, which is how the
+cameraservice fence fix stays in `camera` even though it applies to
+`frameworks/av`. List the series with its grouping at any time:
+
+  patches/check.sh --list
+
 Scripts
 -------
 
   patches/check.sh      validate the series without touching any worktree
   patches/install.sh    apply the series (check first, roll back on failure)
   patches/uninstall.sh  reverse only the patches from this series
+  patches/lib/patchlib.sh
+                        the shared half: locating the Android root, argument
+                        parsing, series discovery and category lookup
 
-All three locate the Android root relative to their own path, so they can be
-run from anywhere. `--only <repo path>` restricts a run to one project, e.g.
+All three take the same arguments and locate the Android root relative to their
+own path, so they can be run from anywhere:
 
-  patches/check.sh --only frameworks/av
-  patches/install.sh --only frameworks/native
-  patches/uninstall.sh --only frameworks/av
+  --only <repo path>   one source project, e.g. --only frameworks/av
+  --category <name>    one category, e.g. --category camera
+  --list               print the series grouped by category and exit
 
 `check.sh` uses a throwaway Git index per project, so dependent patches see the
 patches before them without changing files or the real index. It prints one of:
@@ -39,45 +64,50 @@ patches before them without changing files or the real index. It prints one of:
   COVERED   the change is already included by an earlier patch
   CONFLICT  does not apply; the diff is printed
 
-`install.sh` runs `check.sh` first and aborts if anything conflicts. It applies
-in the same order and, if a patch fails mid-way, reverses only the patches it
-applied during that run. `uninstall.sh` reverses in reverse order and never runs
-`git checkout` or `git clean`, so local work is preserved.
+`install.sh` runs `check.sh` with the same filters first and aborts if anything
+conflicts. It applies in the same order and, if a patch fails mid-way, reverses
+only the patches it applied during that run. `uninstall.sh` reverses in reverse
+order and never runs `git checkout` or `git clean`, so local work is preserved.
 
 Source tree dependencies
 ------------------------
 
 Two projects come from personal forks instead of the LineageOSUL organisation,
 because that organisation is read-only for this account
-(`permissions.push=false`). The local manifest pins:
+(`permissions.push=false`). The local manifest
+(`.repo/local_manifests/mocha-nvidia.xml`) pins:
 
   frameworks/av      -> 380583067/android_frameworks_av      lineage-21.0-mocha
   frameworks/native  -> 380583067/android_frameworks_native  lineage-21.0-mocha
 
 Those branches contain exactly the patches below for the corresponding project:
 
-  frameworks/av      0001, 0031, 0033, 0035, 0041, 0042, 0043, 0050
+  frameworks/av      0001-0005
   frameworks/native  0001
 
 If the manifest is switched back to `LineageOSUL/android_frameworks_{av,native}`
 at `lineage-21.0`, run `install.sh` after `repo sync` and the tree ends up in the
 same state. Keeping both in sync matters: the device tree assumes the changes
-are present either way.
+are present either way, and with the forks pinned `install.sh` simply reports
+those patches as already applied.
+
+`build/make` is a third dependency that is not a fork: it is a shallow clone in
+detached HEAD, so its two patches cannot be committed there. They live here and
+are applied to the checkout, which is why `build/make` shows up in this series
+even though nothing is pushed anywhere for it.
 
 What the patches are for
 ------------------------
 
-frameworks/av
-  0001  re-enable the software OMX nodes (the NVIDIA OMX store hides them)
-  0031  accept YVU420 semi-planar from the camera
-  0033  ACodec: resolve empty vendor parameters (upstream LineageOS fix the
-        mocha tree was missing; without it getVendorParameters loops over an
-        empty key list and spams OMX failures)
-  0035  use 64-bit usage for native_window_set_usage
-  0041  fix the OMX buffer leak on lock timeout
-  0042  SoftwareRenderer: fall back when gralloc has no lockYCbCr
-  0043  skip the broken NVIDIA h264 encoder
-  0050  Codec2: make c2.android.* software video decode work on the legacy
+camera (hardware/interfaces, frameworks/av/0005)
+  0001  hwc2on1adapter: release the acquire fence handles it leaks on every
+        passthrough camera buffer, otherwise cameraserver runs out of fds
+        (frameworks/av/0005 does the same on the cameraservice side)
+  0005  cameraservice: close acquire fence handles in the passthrough path
+
+media (frameworks/av)
+  0001  NvMM-era display/decode compatibility for the legacy stack
+  0002  Codec2: make c2.android.* software video decode work on the legacy
         Tegra gralloc0 (this is what lets `debug.stagefright.ccodec=2` work):
         - add GRALLOC_USAGE_HW_TEXTURE only for CPU_WRITE + YUV allocations,
           so SurfaceFlinger can sample the decoder output while BLOB/CSD
@@ -87,8 +117,19 @@ frameworks/av
           the SW access bits
         - describe YV12 as planar Y/V/U instead of interleaved UV (the old
           description swapped red and green on screen)
+  0003  ACodec: resolve empty vendor parameters (upstream LineageOS fix the
+        mocha tree was missing; without it getVendorParameters loops over an
+        empty key list and spams OMX failures)
+  0004  SoftVideoEncoderOMXComponent: lockYCbCr YV12 fallback
 
-bootable/recovery
+display (frameworks/native)
+  0001  three display/binder compatibility changes bundled together:
+        legacy camera HIDL/AIDL interfaces in kDownstreamManualInterfaces,
+        format/size/usage logging when SurfaceFlinger blacks a layer out, and
+        persist.sf.force_gpu_composition (the Tegra HWC blob crashes the
+        composer during surface teardown; a userspace reboot loop follows)
+
+power (bootable/recovery)
   0001  charger-mode display fix. minui's fbdev backend flips its double buffer
         with FBIOPUT_VSCREENINFO alone, but tegra_fb_set_par() only takes the
         pixel format, stride and mode out of the var - it never touches
@@ -102,35 +143,63 @@ bootable/recovery
         unblanks before binding the window, because a pan issued against a
         disabled display controller has nothing to update.
 
-system/sepolicy
-  0001  two gaps in the system-private policy this board needs and vendor
-        policy cannot express (both domains live in
-        system/sepolicy/private, so no device-side rule can name them):
-        - linkerconfig reads the NVIDIA /vendor blobs while building the
-          linker namespaces
-        - misctrl reads its own property block (upstream only grants set_prop)
-        This is the only patch series outside the device tree that touches a
-        system-private domain; everything else is done in device sepolicy.
+build (build/make, system/core, system/sepolicy, prebuilts/gcc, vendor/lineage)
+  build/make/0001        non-A/B OTA: keep the rootfs symlinks in the package
+  build/make/0002        drop DeviceAsWebcam from handheld_system.mk (a
+                         filter-out cannot remove an inherited module, see
+                         lineage_mocha.mk for why)
+  system/core/0001       init: zygote32 LD_PRELOAD shim
+  system/sepolicy/0001   two gaps in the system-private policy this board needs
+                         and vendor policy cannot express (both domains live in
+                         system/sepolicy/private, so no device-side rule can
+                         name them):
+                         - linkerconfig reads the NVIDIA /vendor blobs while
+                           building the linker namespaces
+                         - misctrl reads its own property block (upstream only
+                           grants set_prop)
+                         This is the only place outside the device tree that
+                         touches a system-private domain; everything else is
+                         done in device sepolicy.
+  prebuilts/gcc/0001     use python3 for the host toolchain wrappers
+  vendor/lineage/0001    APN module ownership
 
-frameworks/native
-  0001  three display/binder compatibility changes bundled together:
-        legacy camera HIDL/AIDL interfaces in kDownstreamManualInterfaces,
-        format/size/usage logging when SurfaceFlinger blacks a layer out, and
-        persist.sf.force_gpu_composition (the Tegra HWC blob crashes the
-        composer during surface teardown; a userspace reboot loop follows)
-
-The remaining directories hold the small compatibility fixes needed to build
-LineageOS 21 for this device: frameworks/base, system/core, hardware/broadcom,
-hardware/interfaces, lineage-sdk, packages/*, prebuilts/gcc, build/make and
-vendor/lineage.
+system (frameworks/base, lineage-sdk, packages/*)
+  Small Android 14 API and robustness fixes needed to build and run LineageOS 21
+  on this device:
+  frameworks/base/0001   power: fix the Notifier NPE on charging state changes
+  frameworks/base/0002   settings: add the biometric protected-packages config
+  frameworks/base/0003   sqlite: check selection brackets in the tokenizer
+  frameworks/base/0004   screenrecord: AVC fallback and encoder accepted size
+  frameworks/base/0005   screenrecord: disable the HEVC switch without a HW encoder
+  frameworks/base/0006   screenrecord: keep the share dialog buttons on screen
+  lineage-sdk/0001       user content observer: match the Android 14 callback
+  packages/apps/Glimpse/0001        request/release audio focus for video playback
+  packages/apps/Settings/0001       use the Android 14 device-admin and biometric APIs
+  packages/apps/Trebuchet/0001      quickstep: match the Android 14 APIs
+  packages/modules/adb/0001         adb: stop the legacy FunctionFS transport from
+                                    reporting detached while the host is probing
+  packages/modules/Connectivity/0001 netbpfload: do not abort on a sysfs subdir
+  packages/modules/IntentResolver/0001 intent forwarder: use the Android 14 PM API
+  packages/modules/Wifi/0001        wifi: guard a null mWifi to avoid a
+                                    system_server crash
+  packages/services/Mms/0001        match the Android 14 IMms identity arguments
+  hardware/broadcom/wlan/0001       wifi-hal: fix the use-after-free in the cleanup
+                                    command loop
+  hardware/broadcom/wlan/0002       wifi-hal: enable CFI for libwifi-hal-bcm (a
+                                    failed CFI check aborts the HAL, which throws
+                                    an NPE in system_server and replays the boot
+                                    animation)
 
 Working tree notes
 ------------------
 
-The author keeps the longer explanatory comments in Chinese in the local
-working copy; the commits pushed to GitHub carry the English wording. If the
-tree shows those files as modified while `git diff` only touches comments, that
-is expected - `git checkout -- <file>` restores the committed English version.
+The author keeps the longer explanatory comments in Chinese in the local working
+copy; the commits pushed to GitHub carry the English wording. If the tree shows
+those files as modified while `git diff` only touches comments, that is expected
+- `git checkout -- <file>` restores the committed English version.
+
+The same convention covers this series: the patch files themselves are committed
+with English comments, and the device tree sources they touch follow it too.
 
 Removed entries and why
 -----------------------
@@ -154,6 +223,11 @@ only so that an older build log can still be matched:
   `0001-adb-fix-legacy-functionfs-offline-transport-detached.patch`, which is
   a different change: it stops the legacy transport from reporting the USB
   endpoint as detached while the host is still probing it.
+
+Every remaining patch was re-verified on 2026-11-23: `git apply --reverse
+--check` succeeds for all 31 of them in their own project, so each one is
+actually installed in the tree and none of them is dead weight. `check.sh`
+reports the same (31/31 APPLIED).
 
 Note on frameworks/av/0041
 --------------------------
