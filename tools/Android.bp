@@ -1,4 +1,4 @@
-// mocha gralloc YUV lock 能力诊断工具（临时调试用，不随正式版本发布）
+// mocha gralloc YUV lock capability probe (temporary debug tool, not shipped)
 cc_binary {
     name: "yv12locktest",
     srcs: ["yv12locktest.cpp"],

@@ -37,10 +37,11 @@ on fs
     setprop ro.crypto.umount_sd false
     setprop ro.crypto.fuse_sdcard true
     setprop audio.custompolicy 1
-    # 【2026-11-17 修正】原来这里创建 /dev/cpuset/camera-daemon 并写 cpus/mems。
-    # 本机内核只开了 CONFIG_CGROUPS、没开 CONFIG_CPUSETS（开了会开机死锁到 MI logo），
-    # /dev/cpuset 根本不存在，这些 mkdir/write 每次开机必然失败刷错误日志。
-    # camera-daemon 的 cpuset 由 frameworks 侧在 cpuset 可用时才创建，这里直接删掉。
+    # [2026-11-17 fix] This used to create /dev/cpuset/camera-daemon and write its
+    # cpus/mems. This kernel enables CONFIG_CGROUPS but not CONFIG_CPUSETS (enabling it
+    # deadlocks the boot at the MI logo), so /dev/cpuset does not exist at all and the
+    # mkdir/write failed on every boot and spammed the log. camera-daemon's cpuset is
+    # created by the framework when cpusets are available, so these lines are gone.
 
 on boot
     #max resolution supported for Miracast is 1080p, represented interms of macroblocks
@@ -74,17 +75,19 @@ on init
     setprop keyguard.no_require_sim true
     setprop persist.tegra.didim.enable 0
 
-    # 【2026-11-21 修正】page-cluster 原来是 0（每次换入只读 1 页），这是给
-    # "swap 在 eMMC 上" 那个年代留的省 IO 设置。本机 fstab 里挂的是 1GB
-    # /dev/block/zram0，换入换出都在内存里，1 页粒度只增加循环次数和锁开销；
-    # 内存压力大（A14 + 2GB）时表现就是"越用越卡"。改回内核默认 3（8 页=32KB）。
+    # [2026-11-21 fix] page-cluster was 0 (one page read per swap-in), a leftover
+    # from the era of swapping to eMMC, tuned to save IO. This device mounts a 1 GB
+    # /dev/block/zram0, so swap in and out stays in RAM and a one-page granularity
+    # only adds loop iterations and lock overhead; under memory pressure (A14 on 2 GB)
+    # it shows up as "slower the longer you use it". Back to the kernel default 3
+    # (8 pages = 32 KB).
     write /proc/sys/vm/page-cluster 3
 
-    # 原来这里还有一行：
-    #     write /d/tegra_actmon/cpu_emc/avg_act_threshold 50000
-    # 本内核（kernel/xiaomi/mocha）里没有 tegra_actmon 的 debugfs 节点，连 /d
-    # 这个符号链接都不存在（init.tegra.rc 只把 debugfs 挂到 /sys/kernel/debug），
-    # 这行每次开机都是 write 失败。删掉，避免日志噪声和误以为在配 EMC 采样。
+    # There used to be one more line here:
+    # This kernel (kernel/xiaomi/mocha) has no tegra_actmon debugfs node and not even
+    # the /d symlink (init.tegra.rc only mounts debugfs at /sys/kernel/debug), so that
+    # write failed on every boot. Removed to cut log noise and the false impression
+    # that EMC sampling was being configured.
 
 service charger /system/bin/charger
     class charger

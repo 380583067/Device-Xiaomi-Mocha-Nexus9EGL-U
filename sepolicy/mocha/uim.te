@@ -1,79 +1,86 @@
-# brcm-uim-sysfs —— Broadcom 蓝牙/FM 共享传输的用户态初始化进程（UIM）
+# brcm-uim-sysfs - the user-space initialisation process (UIM) of the Broadcom
+# Bluetooth/FM shared transport
 #
-# 修复说明（FM，2026-11-16）：
-# 这个可执行文件一直存在于设备树（device/xiaomi/mocha/fm/brcm-uim-sysfs），
-# init.comms.rc 里也有对应的 service（class late_start, user root,
-# group bluetooth net_bt），但此前因为 BOARD_HAVE_BCM_FM=false 让它根本没被
-# 编译、更没装进镜像，所以从来跑不起来——这才是 FM 完全不可用的第一层原因。
+# FM fix (2026-11-16):
+# The binary always existed in the device tree (device/xiaomi/mocha/fm/
+# brcm-uim-sysfs) and init.comms.rc had a service for it (class late_start, user
+# root, group bluetooth net_bt), but BOARD_HAVE_BCM_FM=false meant it was never
+# built, let alone installed, so it never ran - the first reason FM was completely
+# unusable.
 #
-# 它的职责：通过 bcm_ldisc 驱动暴露的 sysfs 节点（install / vendor_params /
-# snoop_enable / bdaddr / fw_patchfile）给 BCM4354 下发 patchram 参数、控制芯片
-# 上电时序，把芯片从「蓝牙 HCI 模式」切到「UIM/FM 模式」。之后
-# libfmradio.v4l2-fm 才能 open("/dev/radio0") 与芯片通信。
+# What it does: through the sysfs nodes of the bcm_ldisc driver (install /
+# vendor_params / snoop_enable / bdaddr / fw_patchfile) it pushes patchram
+# parameters to the BCM4354, drives the chip's power sequence and moves it from
+# "Bluetooth HCI mode" to "UIM/FM mode". Only then can libfmradio.v4l2-fm
+# open("/dev/radio0") and talk to the chip.
 #
-# 注意本文件原来只有一行 "type uim, domain;"（也没人给 uim 配 exec_type，
-# 所以 init_daemon_domain 用不了，进程实际会掉到 init 域）。这里补齐：
-#   - uim_exec 可执行文件类型（file_contexts 里已挂到 /vendor/bin/brcm-uim-sysfs）
-#   - init_daemon_domain：让 init 孵化时自动从 uim_exec 切到 uim 域
-#   - 最小访问集合：读 bt_vendor.conf、读写 bcm_ldisc 的 sysfs、开蓝牙串口
+# This file used to hold one line, "type uim, domain;" (and nothing gave uim an
+# exec_type, so init_daemon_domain was unusable and the process really fell into
+# the init domain). Completed here with:
+#   - the uim_exec executable type (file_contexts maps it to /vendor/bin/brcm-uim-sysfs)
+#   - init_daemon_domain, so init switches from uim_exec into the uim domain
+#   - a minimal access set: read bt_vendor.conf, read/write the bcm_ldisc sysfs, open the BT UART
 #
-# 本机 SELinux 目前是 permissive（BoardConfig: androidboot.selinux=permissive），
-# 所以这些规则眼下不会真的拦截任何操作，但作用有三：
-#   1) 让 uim 真的跑在自己的域里，而不是 init 域（排查日志更清楚）；
-#   2) 将来切 enforcing 时不用从零补；
-#   3) 减少开机期间 permissive=1 的 avc denial 噪音（每条都要写 logd，很占 IO）。
+# SELinux is permissive here (BoardConfig: androidboot.selinux=permissive), so these
+# rules do not really deny anything yet, but they matter because:
+#   1) uim really runs in its own domain instead of init (clearer logs);
+#   2) nothing has to be written from scratch when enforcing is switched on;
+#   3) there is less permissive=1 avc denial noise during boot (each one writes logd, which costs IO).
 
 type uim, domain;
 type uim_exec, exec_type, vendor_file_type, file_type;
 
 init_daemon_domain(uim)
 
-# 读 /system/etc/bluetooth/bt_vendor.conf（UimUartPort / UartBaudRate /
-# FwPatchFileName / LpmEnable 等参数就从这个文件来）。
+# Read /system/etc/bluetooth/bt_vendor.conf (UimUartPort / UartBaudRate /
+# FwPatchFileName / LpmEnable and friends come from that file).
 allow uim system_file:file r_file_perms;
 
-# bcm_ldisc 的 sysfs 通道：install、vendor_params、snoop_enable、bdaddr、fw_patchfile。
-# uim 要读状态、写参数，所以给目录 search 和文件读写。
+# The bcm_ldisc sysfs channel: install, vendor_params, snoop_enable, bdaddr,
+# fw_patchfile. uim reads state and writes parameters, so the directory needs search
+# and the files need read/write.
 allow uim sysfs:dir search;
 allow uim sysfs:file rw_file_perms;
 
-# ==== 关键：芯片上电（FM，2026-11-16 真机实测）====
+# ==== The critical bit: chip power-on (FM, measured on the device 2026-11-16) ====
 #
-# uim 负责给 BCM4354 的 BT/FM 核上电，方式是写
-#     /sys/class/rfkill/rfkill0/state        （u:object_r:sysfs_bluetooth_writable）
-# 这个 rfkill 由 bluedroid_pm 驱动提供，name=bluedroid_pm，最终落到
-# board-mocha.c 里的 shutdown_gpio = TEGRA_GPIO_PR1（BT_REG_ON）。
+# uim powers the BT/FM core of the BCM4354 by writing
+#     /sys/class/rfkill/rfkill0/state        (u:object_r:sysfs_bluetooth_writable)
+# That rfkill comes from the bluedroid_pm driver (name=bluedroid_pm) and ends up at
+# shutdown_gpio = TEGRA_GPIO_PR1 (BT_REG_ON) in board-mocha.c.
 #
-# 实测：PR1 为低电平（/sys/kernel/debug/gpio 里 "gpio-137 (shutdown_gpio) out lo"）
-# 时，芯片 BT 核完全不上电，往 /dev/ttyTHS2 发 HCI Reset 四条 ttyTHS 全无响应；
-# 把 state 写成 1 之后立刻收到
-#     04 0e 04 01 03 0c 00        （HCI Reset 的 Command Complete）
-# 也就是说没有这条写权限，FM（和蓝牙）永远起不来。
+# Measured: with PR1 low ("gpio-137 (shutdown_gpio) out lo" in
+# /sys/kernel/debug/gpio) the BT core has no power and an HCI Reset on /dev/ttyTHS2
+# gets no answer from any of the four ttyTHS; after writing state=1 the answer
+# arrives immediately
+#     04 0e 04 01 03 0c 00        (Command Complete for HCI Reset)
+# i.e. without this write permission FM (and Bluetooth) can never come up.
 #
-# 原来的 sysfs:file 规则覆盖不到 sysfs_bluetooth_writable 这个属性类型，
-# permissive 下靠放行才偶然能跑，enforcing 会直接失败。
+# The old sysfs:file rule did not cover the sysfs_bluetooth_writable attribute type,
+# so permissive mode let it slip through and enforcing would fail outright.
 allow uim sysfs_bluetooth_writable:file rw_file_perms;
 
-# 蓝牙串口：bt_vendor.conf 里 UartPort = /dev/ttyTHS2
+# Bluetooth UART: UartPort = /dev/ttyTHS2 in bt_vendor.conf
 allow uim tty_device:chr_file rw_file_perms;
 
-# ==== 属性访问（2026-11-16，纯净镜像实测后补）====
+# ==== Property access (2026-11-16, added after testing on a clean image) ====
 #
-# 补上 tty_device 标签、sysfs_bluetooth_writable 之后重新抓 avc，uim 只剩
-# 下面两类属性读取仍被拒（permissive 下不阻塞，但 enforcing 会直接失败）：
+# After adding the tty_device label and sysfs_bluetooth_writable, the only avc
+# denials left for uim were the two property reads below (harmless in permissive,
+# fatal when enforcing):
 #
 #   avc: denied { read } name="u:object_r:default_prop:s0"
 #       scontext=u:r:uim:s0 tcontext=u:object_r:default_prop:s0 tclass=file
 #   avc: denied { read } name="u:object_r:exported_bluetooth_prop:s0"
 #       scontext=u:r:uim:s0 tcontext=u:object_r:exported_bluetooth_prop:s0 tclass=file
 #
-# uim 在初始化时要查蓝牙相关配置（芯片型号、bdaddr 路径等），走的是通用
-# 属性通道，所以会碰到没被细分类型的 default_prop；另外 bt_vendor.conf 的
-# 解析过程会读 exported_bluetooth_prop（如 ro.bt.xxx）。
-# 用 get_prop 宏而不是裸 allow，是为了拿到 AOSP 规定的 get_prop 权限集合。
+# During init uim looks up Bluetooth configuration (chip model, bdaddr path) over the
+# generic property channel, which is why it touches the untyped default_prop, and
+# parsing bt_vendor.conf reads exported_bluetooth_prop (ro.bt.xxx and such).
+# get_prop rather than a bare allow, so the AOSP get_prop permission set is used.
 get_prop(uim, default_prop)
 get_prop(uim, exported_bluetooth_prop)
 
-# libnetutils / socket 相关（uim 链接了 libnetutils）
+# libnetutils / socket (uim links against libnetutils)
 allow uim self:capability { net_admin net_raw };
 allow uim self:{ rawip_socket tcp_socket udp_socket } { create ioctl read write getattr setopt };

@@ -19,35 +19,40 @@ on boot
 
     # TBD: Remove the below line that give permissions for scaling_governor
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-    # 新 power HAL 的相机提示会在相机运行期间压低频率上限（CameraHints 写
-    # scaling_max_freq），所以这个文件也要交给 system 可写。
+    # The new power HAL's camera hints cap the frequency while the camera runs
+    # (CameraHints writes scaling_max_freq), so this node must be system-writable.
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
     chown system system /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
 
-    # GPU floor：内核其实有 /sys/kernel/tegra_gpu/gpu_floor_rate（之前源码 grep
-    # 没搜到是因为节点名是运行时拼出来的），power HAL 的 GpuFloor 要写它。
-    # 本树强制 GPU 合成，SurfaceFlinger 会持续上报 EXPENSIVE_RENDERING，
-    # floor 生效后 GPU 抬到 252MHz 合成不再从 72MHz 爬坡；不放开权限的话
-    # HAL 每次尝试都 EACCES，一次开机刷 1500+ 行错误日志。
+    # GPU floor: the kernel does have /sys/kernel/tegra_gpu/gpu_floor_rate (an
+    # earlier source grep missed it because the node name is built at run time) and
+    # the power HAL's GpuFloor has to write it. This tree forces GPU composition, so
+    # SurfaceFlinger keeps reporting EXPENSIVE_RENDERING; with the floor in place the
+    # GPU stays at 252 MHz instead of ramping up from 72 MHz. Without the permission
+    # the HAL gets EACCES on every attempt and one boot logs 1500+ error lines.
     chown system system /sys/kernel/tegra_gpu/gpu_floor_rate
     chmod 0664 /sys/kernel/tegra_gpu/gpu_floor_rate
 
-    # CPU 调速器：interactive
-    # （内核 defconfig 里默认调速器是 userspace，不显式设置等于频率不会动。）
+    # CPU governor: interactive
+    # (the defconfig default is userspace, so without setting it explicitly the
+    # frequency never moves.)
     #
-    # 【2026-11-21 修正】原来这里写的是：
+    # [2026-11-21 fix] This used to write:
     #     interactive/awake_ideal_freq   1326000
     #     interactive/boost_freq         1428000
     #     interactive/touch_poke_freq    1326000
     #     interactive/input_boost_duration 45000
-    # 这四个节点**只有 smartmax 有**（kernel/drivers/cpufreq/cpufreq_smartmax.c
-    # 的 smartmax_attributes[]），interactive 的 sysfs 里根本不存在
-    # （见 cpufreq_interactive.c 的 gov_sys_pol_attr_rw 列表）。所以这四行每次
-    # 开机都是 write 失败，等于**一点调优都没生效**，interactive 跑的是内核默认：
+    # Those four nodes exist **only for smartmax** (smartmax_attributes[] in
+    # kernel/drivers/cpufreq/cpufreq_smartmax.c), not in interactive's sysfs (see
+    # the gov_sys_pol_attr_rw list in cpufreq_interactive.c). So all four writes
+    # failed on every boot and **none of the tuning applied**; interactive ran the
+    # kernel defaults:
     #     target_loads 90 / go_hispeed_load 99 / min_sample_time 30ms
-    # go_hispeed_load=99 意味着负载不到 99% 就不往 hispeed 以上冲，滑动、转场
-    # 这种 50~70% 单核负载的动画就一直吊在低频上 —— 这就是"卡卡的"直接来源。
-    # 下面改成写 interactive 真实存在的节点，取值同 19.1 树 balanced 档的验证值。
+    # With go_hispeed_load=99 the frequency only rises above hispeed past 99% load,
+    # so scrolling and transitions - 50-70% on one core - stayed pinned at low
+    # frequency, which is exactly where the "it stutters" came from.
+    # Below it writes the nodes interactive really has, with the values verified in
+    # the 19.1 tree's balanced profile.
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor interactive
     write /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq 1428000
     write /sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load 90
@@ -58,15 +63,16 @@ on boot
     write /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay 40000
     write /sys/devices/system/cpu/cpufreq/interactive/io_is_busy 1
 
-    # 【2026-11-21 修正】把调速器节点交给 system，NVIDIA 的 power HAL
-    # （/system/vendor/bin/hw/android.hardware.power@1.0-service，日志 tag
-    # powerHAL::common，已监听 atmel-maxtouch）才能按场景调频。这些节点由内核
-    # 以 0644 root:root 创建，HAL 以 system 身份运行，原来每次开机都只能打：
+    # [2026-11-21 fix] Hand the governor nodes to system so NVIDIA's power HAL
+    # (/system/vendor/bin/hw/android.hardware.power@1.0-service, log tag
+    # powerHAL::common, already listening on atmel-maxtouch) can scale by scenario.
+    # The kernel creates these nodes 0644 root:root and the HAL runs as system, so
+    # every boot used to log only:
     #     E powerHAL::common: Error opening .../interactive/hispeed_freq: Permission denied
-    #     （target_loads / above_hispeed_delay / timer_rate / boost_factor 同样失败）
-    # 于是触控升频和它的整套 governor profile 全部失效。这里放开权限交还给 HAL。
-    # 注意：A14 的 init chown/chmod **不支持通配符**（system/core/init/builtins.cpp
-    # 的 do_chown/do_chmod 直接 lchown/fchmodat 字面路径），必须逐个列。
+    #     (target_loads / above_hispeed_delay / timer_rate / boost_factor failed too)
+    # so touch boosting and its whole governor profile were dead. Hand them back.
+    # Note: init chown/chmod on A14 **does not accept wildcards** (do_chown/do_chmod
+    # in system/core/init/builtins.cpp lchown/fchmodat the literal path), list each.
     chown system system /sys/devices/system/cpu/cpufreq/interactive/hispeed_freq
     chown system system /sys/devices/system/cpu/cpufreq/interactive/target_loads
     chown system system /sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay
@@ -94,8 +100,8 @@ on boot
     chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_is_busy
     chmod 0664 /sys/devices/system/cpu/cpufreq/interactive/io_busy_threshold
 
-    # smartmax 同样的放开，方便以后 setprop 切过去做对比测试（节点见
-    # cpufreq_smartmax.c 的 smartmax_attributes[]）。
+    # smartmax is opened up the same way so it can be switched to later for
+    # comparison (nodes: smartmax_attributes[] in cpufreq_smartmax.c).
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/awake_ideal_freq
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/boost_freq
     chown system system /sys/devices/system/cpu/cpufreq/smartmax/touch_poke_freq
@@ -125,17 +131,19 @@ on boot
 
     write /sys/module/workqueue/parameters/power_efficient 1
 
-    # 【2026-11-23 CPU 优化】zram 压缩流数 1 -> 4（Cortex-A15 四核）。
-    # 注意：**这里不能写 sysfs**。max_comp_streams_store 在 init_done 之后
-    # 只允许减少不允许增加，实测 `echo 4 > max_comp_streams` 返回 EINVAL、
-    # 读回仍是 1，并在 dmesg 打出 "Cannot change max compression streams"。
-    # 真正生效的位置在内核默认值：
+    # [2026-11-23 CPU tuning] zram compression streams 1 -> 4 (Cortex-A15 quad-core).
+    # Note: **sysfs cannot be used here**. max_comp_streams_store only allows
+    # decreasing after init_done, so `echo 4 > max_comp_streams` returns EINVAL,
+    # reads back 1 and dmesg says "Cannot change max compression streams".
+    # The value that matters is the kernel default:
     #   drivers/block/zram/zram_drv.c  zram_add() / zram_reset_device()
     #   zram->max_comp_streams = 4;
-    # 单流时内存压力下的换出压缩只占 1 个核，另 3 核空转，压缩延迟直接
-    # 表现为前台视频/渲染掉帧；4 流可并行压缩（总 CPU 不变，抖动显著降低）。
-    # 压缩算法已是 lz4（CONFIG_ZRAM_LZ4_COMPRESS=y），实测压缩比 3.25:1，
-    # 1.5GB zram 容量足够，不需要扩容——扩大会鼓励内核多换出，反而增加 CPU 负担。
+    # With one stream, swap-out under memory pressure uses one core while three idle,
+    # and the compression latency shows up as dropped frames in foreground video and
+    # rendering; four streams compress in parallel (same total CPU, much less jitter).
+    # The algorithm is already lz4 (CONFIG_ZRAM_LZ4_COMPRESS=y) with a measured 3.25:1
+    # ratio, so 1.5 GB of zram is enough - growing it would only encourage the kernel
+    # to swap more and cost CPU.
 
     # Little VM tweaks
     # swappiness 100: the only swap device is 1GB of zram, so pushing anonymous
@@ -148,11 +156,13 @@ on boot
     # in the allocating thread (the UI thread), which shows up as frame spikes.
     # 8MB costs little and keeps reclaim off the fast path.
     #
-    # [2026-11-23 提到 16MB] 短视频压测实测：刷快手极速版时系统 MemFree 长期
-    # 0-20MB（多次采到 0），此时内核回收 libglcore 的 file-backed JIT 页
-    # （/data/data/<pkg>/cache/.glXXXXXX，mmap 后 unlink，属可回收页），
-    # 驱动仍持有函数指针 → _glDrawArrays 跳 0 地址 SIGSEGV。
-    # 提高水位让 kswapd 更早介入、少走 direct reclaim 的极端回收。
+    # [2026-11-23 raised to 16 MB] Short-video stress test: while scrolling Kuaishou
+    # Lite, MemFree sat at 0-20 MB for long stretches (0 sampled repeatedly). At that
+    # point the kernel reclaims libglcore's file-backed JIT pages
+    # (/data/data/<pkg>/cache/.glXXXXXX, mmap'ed then unlinked, reclaimable) while the
+    # driver still holds the function pointers, so _glDrawArrays jumps to address 0
+    # and SIGSEGVs. A higher watermark lets kswapd step in earlier and avoids the
+    # direct-reclaim extreme.
     write /proc/sys/vm/min_free_kbytes 16384
     
     # Prepare CPU/EMC scaling based on DT
@@ -187,10 +197,11 @@ service conn_wifi /system/vendor/bin/conn_init -op
     seclabel u:r:conn_wifi:s0
     oneshot
 
-# 【格式修正 2026-11-17】段关键字统一顶格、去掉行尾空格。init 解析器会裁掉
-# 首尾空白，原写法实际也能解析，这里只是规范化，方便用 grep '^service ' 扫描。
-# 注意：这个服务是被 `on boot` 里的 `exec_start init-btloader-sh` 拉起的，
-# exec_start 走 Service::ExecStart()，不受 disabled 影响（builtins.cpp:269）。
+# [format fix 2026-11-17] Section keywords are flush left and trailing spaces are
+# gone. The init parser trims whitespace either way, this is just normalisation so
+# `grep '^service '` works. Note: this service is started by `exec_start
+# init-btloader-sh` in `on boot`, and exec_start goes through Service::ExecStart(),
+# which ignores the disabled flag (builtins.cpp:269).
 service init-btloader-sh /system/bin/init.btloader.sh
     class main
     user root

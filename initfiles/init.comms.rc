@@ -20,9 +20,11 @@ on boot
     chown bluetooth bluetooth /sys/class/rfkill/rfkill0/type
 
     # bluetooth MAC address programming
-    # 【2026-11-17 修正】原来这行是 `chown bluetooth bluetooth ro.bt.bdaddr_path`，
-    # 把属性名当文件路径传给 chown，每次开机必报 no such file。属性本身无法 chown，
-    # 真正需要可写的是 bt 地址文件，权限由 bt_vendor 自己处理，这里直接去掉。
+    # [2026-11-17 fix] This used to be `chown bluetooth bluetooth ro.bt.bdaddr_path`,
+    # i.e. a property name passed to chown as a path, which failed with "no such
+    # file" on every boot. A property cannot be chowned; the file that needs to be
+    # writable is the BT address file and bt_vendor handles its permissions, so the
+    # line is simply gone.
     chown bluetooth bluetooth /system/etc/bluetooth
 
     # P2P device
@@ -49,11 +51,12 @@ service dns_masq /system/bin/dnsmasq --no-daemon --no-resolv --no-poll --dhcp-op
     disabled
     oneshot
 
-# 修复说明：新增 uim 服务。brcm-uim-sysfs 是 Broadcom 蓝牙/FM 共享传输的
-# 用户态初始化模块（UIM），拥有 ttyTHS2 串口，通过 /sys/devices/platform/bcm_ldisc/
-# sysfs 通道与蓝牙芯片（BCM4354）通信，FM 功能依赖它建立 HCI 通道（BOARD_BRCM_HCI_NUM=26）。
-# 原先缺失此服务，导致 FM 无法与蓝牙芯片通信。参考
-# Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S 的 init.comms.rc。
+# Fix: add the uim service. brcm-uim-sysfs is the user-space initialisation module
+# (UIM) for the Broadcom Bluetooth/FM shared transport: it owns the ttyTHS2 UART,
+# talks to the BCM4354 over the /sys/devices/platform/bcm_ldisc/ sysfs channel and FM
+# depends on it to bring up the HCI channel (BOARD_BRCM_HCI_NUM=26). The service was
+# missing, so FM could not talk to the Bluetooth chip. Same as
+# Dargons10/Device-Xiaomi-Mocha-Nexus9EGL-S init.comms.rc.
 # Owns ttyTHS2 for the Broadcom Bluetooth/FM shared transport.
 service uim /vendor/bin/brcm-uim-sysfs
     class late_start

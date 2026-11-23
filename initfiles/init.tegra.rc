@@ -10,19 +10,18 @@ import /vendor/etc/init/hw/init.comms.rc
 
 # This yields each tegra wdt expiration to be at 30 secs and fourth expiration for reboot at 120 secs.
 #
-# 修复说明（开机速度，2026-11-16）：
-# 加上 oneshot 是必须的。原来这个 service 没有 oneshot，而本机 /dev/watchdog 并不存在
-# （dt 里 wdt0 节点存在、CONFIG_TEGRA_WATCHDOG=y，但 tegra_wdt_probe 实际没成功注册
-#  字符设备，内核也从未打印过 "WDT heartbeat enabled on probe"，说明 probe 早退失败了），
-# 于是 watchdogd 每次启动都在
-#     E watchdogd: Failed to open /dev/watchdog: No such file or directory
-# 之后以 status 1 退出，init 再按默认 5 秒退避无限重启。开机日志里实测重启了 9 次
-# （11-15 21:16:38 → 21:17:14 整段开机期间一直循环），每次都要 fork、建进程组、
-# 打一堆错误日志。
-#
-# 用 oneshot 后：开机只尝试一次，失败就安静结束，不再循环。
-# 而且这不会牺牲看门狗保护——真正的硬件看门狗如果将来被 probe 起来，/dev/watchdog
-# 就会出现，那时把 oneshot 去掉即可恢复常驻喂狗。
+# Fix (boot time, 2026-11-16):
+# oneshot is required here. This service had none, and /dev/watchdog does not exist
+# on this device (the dt has a wdt0 node and CONFIG_TEGRA_WATCHDOG=y, but
+# tegra_wdt_probe never registers the character device and the kernel never logs
+# "WDT heartbeat enabled on probe", so probe bailed out early). watchdogd therefore
+# failed on every start, exited with status 1, and init restarted it forever with the
+# default 5 s backoff: the boot log shows 9 restarts (11-15 21:16:38 through
+# 21:17:14, i.e. the whole boot), each forking, creating a process group and logging
+# a pile of errors.
+# With oneshot it is tried once at boot and then ends quietly. This loses no watchdog
+# protection: if a real hardware watchdog ever probes successfully /dev/watchdog will
+# exist, and dropping oneshot then makes it resident again.
 service watchdogd /system/bin/watchdogd 10 20
     class core
     user root
@@ -42,17 +41,19 @@ on early-init
     mount debugfs debugfs /sys/kernel/debug mode=0755
 
 on init
-    # 修复说明（相机）：这里原本是
+    # Camera fix: this used to be
     #     mkdir /dev/camera 0755 media camera
-    # 会把 /dev/camera 建成一个**空目录**（本文件是从原厂/Nexus 9 设备树继承来的，
-    # 那一代 NVIDIA 相机 HAL 确实往 /dev/camera/ 目录里放设备节点）。
-    # 但本设备实际使用的 blob（camera.vendor.tegra.so）里 NvcImager_Open 是直接
-    # open("/dev/camera") 当字符设备用的，撞上目录就报：
+    # which created /dev/camera as an **empty directory** (this file came from the
+    # vendor/Nexus 9 device tree, where that generation of the NVIDIA camera HAL did
+    # put device nodes inside /dev/camera/). But the blob this device really uses
+    # (camera.vendor.tegra.so) has NvcImager_Open calling open("/dev/camera") as a
+    # character device, and hits the directory with:
     #     NvOsDebugPrintf: NvcImager_Open: Can not open camera device
     #                      /dev/camera: Is a directory
-    # 结果 get_number_of_cameras() 返回 0，相机设备数 = 0。
-    # 内核实际提供的节点名是 /dev/camera.pcl（chr 10:53，见 ueventd.tn8.rc），
-    # 所以这里不再建目录，改在 post-fs-data 阶段做符号链接（见文件末尾）。
+    # so get_number_of_cameras() returns 0, i.e. no cameras at all.
+    # The kernel's node is /dev/camera.pcl (chr 10:53, see ueventd.tn8.rc), so the
+    # directory is gone and a symlink is made in post-fs-data instead (see the end of
+    # this file).
     mkdir /mnt/media_rw/sdcard1 0700 media_rw media_rw
 
     # Support legacy paths
@@ -78,12 +79,12 @@ on init
     setprop ro.hardware.keystore tegra
 
 on post-fs-data
-    # 相机修复：NVIDIA 相机 blob 里 NvcImager_Open 硬编码打开 "/dev/camera"，
-    # 而 Tegra 内核注册的节点名是 /dev/camera.pcl（chr 10:53）。原设备树在
-    # "on init" 里 mkdir /dev/camera 把它建成了目录，导致 blob 报
-    # "Is a directory" 并让 get_number_of_cameras() 返回 0。
-    # 这里改成符号链接，放到 post-fs-data 是因为此时 ueventd 已经根据内核 uevent
-    # 创建好 /dev/camera.pcl 了。
+    # Camera fix: NvcImager_Open in the NVIDIA camera blob hard-codes "/dev/camera"
+    # while the Tegra kernel registers /dev/camera.pcl (chr 10:53). The device tree
+    # used to mkdir /dev/camera in "on init", which made the blob log "Is a directory"
+    # and get_number_of_cameras() return 0. It is a symlink now, created in
+    # post-fs-data because by then ueventd has already created /dev/camera.pcl from the
+    # kernel uevent.
     symlink /dev/camera.pcl /dev/camera
     mkdir /mnt/factory 0771 system system
     mkdir /mnt/factory/wifi 0770 system system
@@ -126,8 +127,9 @@ on post-fs-data
     # backlight
     chown system system /sys/class/backlight/lcd-backlight/brightness
 
-    # 开机日志：清掉上次的现场再拉起 logger（服务定义见文件末尾）。
-    # 顺序很重要 —— 先 rm 再 start，否则会把新日志删掉。
+    # Boot log: clear the previous run's file, then start the logger (the service is
+    # defined at the end of this file). Order matters - remove first, otherwise the
+    # new log is deleted.
     rm /cache/boot_log.txt
     start logger
 
@@ -279,13 +281,16 @@ service bugreport /system/bin/dumpstate -d -p -B -z -o /data/user_de/0/com.andro
 import /vendor/etc/init/hw/init.ussrd.rc
 
 # Logcat in cache folder while is in bootanimation
-# 【2026-11-17 修正】原来没有轮转参数，开机阶段把所有 buffer 全量写 /cache/boot_log.txt，
-# 实测能涨到 345MB，把只有 353MB 的 /cache 撑满，导致 TWRP 安装 OTA 时
-# "No space left on device" 失败。这里限制单文件 4MB、保留 2 个，上限 8MB。
-# 【2026-11-18 修正】这个服务原来带 `disabled` + `oneshot`，等于**从来没运行过**
-# （init 不会自动拉起 disabled 的服务，且全树也没有 start logger），所以开机日志
-# 一直是空的 —— 之前排查"开机动画循环"时没有现场可看就是这个原因。
-# 现在去掉这两个关键字：随 class main 自启并常驻，配合 -r/-n 自动轮转，上限 8MB。
+# [2026-11-17 fix] There used to be no rotation: the whole buffer was written to
+# /cache/boot_log.txt during boot and measured up to 345 MB, filling the 353 MB
+# /cache so a TWRP OTA install failed with "No space left on device". Now one file is
+# capped at 4 MB with 2 kept, 8 MB in total.
+# [2026-11-18 fix] The service also carried `disabled` + `oneshot`, so it **never ran**
+# (init does not start disabled services by itself and nothing in the tree started
+# logger), which is why the boot log was always empty - the reason there was no
+# evidence to look at when chasing the boot animation loop.
+# Both keywords are gone: it starts with class main, stays resident and rotates with
+# -r/-n, 8 MB in total.
 service logger /system/bin/logcat -b all -D -r 4096 -n 2 -f /cache/boot_log.txt
     class main
     user root

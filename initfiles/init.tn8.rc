@@ -58,14 +58,15 @@ on fs
     swapon_all /vendor/etc/fstab.tn8
 
 on property:sys.boot_completed=1
-    # 必须最先执行：强制 GPU 合成，否则 HWC 的 glc_set / NvGrDecompressBuffer
-    # 路径会把 composer 拖死，init 计入 updatable 崩溃后 userspace reboot 死循环
-    # （2026-11-19 卡开机动画的根因，详见 init.renderer.sh 头部说明）。
+    # Must run first: force GPU composition, otherwise the HWC glc_set /
+    # NvGrDecompressBuffer path hangs the composer, init counts it as an updatable
+    # crash and the device loops in userspace reboot (root cause of the boot-loop on
+    # 2026-11-19, see the header of init.renderer.sh).
     start vendor.init_renderer
     write /sys/class/tty/ttyS0/console_write_enable 0
     write /sys/block/mmcblk0/queue/read_ahead_kb 512
     write /sys/block/mmcblk0/queue/iostats 1
-    # 开机向导兜底（老 userdata 里 SettingsProvider 的默认值不再生效时）
+    # Setup-wizard fallback (for old userdata where the SettingsProvider defaults no longer apply)
     start mocha_provision
 
 on boot
@@ -81,36 +82,38 @@ on post-fs
 on property:apexd.status=ready
     mount none /system/etc/swcodec/ld.config.txt /apex/com.android.media.swcodec/etc/ld.config.txt bind
 
-# 【init 修正 2026-11-17】`pm disable com.android.messaging` 原来挂在
-# `on property:ro.radio.noril=yes` 上，而且 system.prop 里写的是 yes、这里拿
-# =true 去匹配，所以从来没执行过。但即便把值改对也没用：init 在队列里跑完
-# `init` 触发器之后会立刻 QueueAllPropertyActions()（init.cpp:1105），此时
-# 属性早已由 PropertyLoadBootDefaults() 载入，动作会在开机最早期就执行，
-# 那时 system_server / PackageManagerService 还没起来，pm 必然失败。
-# 所以改由 mocha_provision 脚本在 boot_completed 之后统一处理，见下面的服务。
+# [init fix 2026-11-17] `pm disable com.android.messaging` used to hang off
+# `on property:ro.radio.noril=yes`, and system.prop sets yes while this matched
+# against =true, so it never ran. Fixing the value would not help either: after the
+# queue runs the `init` trigger, init immediately calls QueueAllPropertyActions()
+# (init.cpp:1105) and by then PropertyLoadBootDefaults() has loaded the properties,
+# so the action runs at the very start of boot when system_server /
+# PackageManagerService are not up yet and pm must fail.
+# mocha_provision handles it after boot_completed instead, see the service below.
 
-# 【开机向导跳过 2026-11-17】根因有两层：
-#   1) 真正的"已初始化"标志是 Settings.Secure.user_setup_complete，
-#      LineageOS SetupWizard 只看它（SetupWizardUtils.java:181）。原实现只写了
-#      global.device_provisioned，所以向导永远不退。
-#   2) 写在 `on property:sys.boot_completed=1` 的 exec 与向导启动是同一时刻，
-#      存在竞态，第二次开机（DB 已存在）也补不回来。
-# 根治办法是让 SettingsProvider 建库时直接写入默认值，见
-# overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml。
-# 上面的 start mocha_provision 只作为兜底（老 userdata 里 DB 已存在、
-# 默认值不再生效的场景）。
+# [setup wizard skip 2026-11-17] There were two root causes:
+#   1) the real "provisioned" flag is Settings.Secure.user_setup_complete, and
+#      LineageOS SetupWizard only looks at that (SetupWizardUtils.java:181). The old
+#      code only wrote global.device_provisioned, so the wizard never went away.
+#   2) an exec in `on property:sys.boot_completed=1` races with the wizard start, and
+#      on the second boot (DB already present) it cannot fix anything either.
+# The real fix writes the defaults when SettingsProvider creates its database, see
+# overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml.
+# The start mocha_provision above is only a fallback (old userdata with an existing
+# DB where the defaults no longer apply).
 
-# 兜底服务：把设备标记为"已完成初始化"并停用无 RIL 时无用的短信应用。
-# 详见 /vendor/bin/mocha_provision.sh。
-# 强制 GPU 合成：SurfaceFlinger 的 raw transaction 1008 就是
-# "Toggle forced GPU composition"。A14 里这个 code 仍然是活的，删掉它就会
-# 回到 HWC 合成，然后 composer 卡死 → userspace reboot 死循环。
+# Fallback service: mark the device as provisioned and disable the SMS app, which
+# is useless without a RIL. See /vendor/bin/mocha_provision.sh.
+# Forced GPU composition: SurfaceFlinger's raw transaction 1008 is "Toggle forced
+# GPU composition". That code is still live on A14; removing it returns to HWC
+# composition and then the composer hangs -> userspace reboot loop.
 service vendor.init_renderer /vendor/bin/init.renderer.sh
     user root
     oneshot
 
-# user shell 是刻意的：uid 2000 与 adb shell 相同，settings / pm 的权限行为
-# 已经在真机上验证过；换成 system(1000) 反而需要额外确认权限。
+# user shell is deliberate: uid 2000 is the same as adb shell, and the permission
+# behaviour of settings / pm is verified on the device; switching to system(1000)
+# would need extra permission debugging.
 service mocha_provision /system/bin/sh /vendor/bin/mocha_provision.sh
     user shell
     group shell

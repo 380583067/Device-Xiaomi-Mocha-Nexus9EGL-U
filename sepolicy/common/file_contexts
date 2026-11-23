@@ -68,22 +68,24 @@
 #/dev/ozwpan				u:object_r:ozmo_device:s0
 # phs
 #/dev/socket/phsd			u:object_r:phsd_socket:s0
-# 双 wifi（原厂固件带第二路 wpa_supplicant socket）
+# Dual WiFi (the vendor firmware provides a second wpa_supplicant socket)
 /dev/socket/wpa_xlan[0-9]		u:object_r:wpa_socket:s0
-# 旧 modem 客户端策略使用的 Qualcomm QMUX socket 端点
+# Qualcomm QMUX socket endpoint used by the legacy modem client policy
 /dev/socket/qmux_[^/]+(/.*)?		u:object_r:qmuxd_socket:s0
-# /dev/tegra_dc 显示控制器节点
-# 之前注释掉，节点落在 device 类型上，composer 每次 ioctl 都被记 32 条 denied。
-# 类型 tegradc_device 与 surfaceflinger/system_server/system_app 的规则早就写好了，
-# 缺的只是这一行标签。
+# /dev/tegra_dc display controller node
+# This was commented out before, so the node landed on the device type and the
+# composer collected 32 denials per ioctl. The tegradc_device type and the rules for
+# surfaceflinger/system_server/system_app were already there; only this label was
+# missing.
 /dev/tegra_dc_.*			u:object_r:tegradc_device:s0
-# misc 分区：misctrl 读它（system 策略里已有 allow misctrl misc_block_device）。
+# misc partition: misctrl reads it (system policy already allows misctrl misc_block_device).
 /dev/block/platform/sdhci-tegra\.3/by-name/MSC	u:object_r:misc_block_device:s0
 /dev/block/mmcblk0p10				u:object_r:misc_block_device:s0
-# rpmb 块设备
+# rpmb block device
 #/dev/block/platform/sdhci-tegra\.3/mmcblk0rpmb		u:object_r:rpmb_block_device:s0
-# setup_fs emmc：TN8 分区名与 AOSP 默认名不同，必须逐个映射，
-# 否则 init 无法给 userdata / cache / boot / recovery / metadata 打标签
+# setup_fs emmc: TN8 partition names differ from the AOSP defaults, so every one
+# must be mapped, otherwise init cannot label userdata / cache / boot / recovery /
+# metadata.
 /dev/block/platform/sdhci-tegra(.*)/by-name/UDA		u:object_r:userdata_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/CAC		u:object_r:cache_block_device:s0
 #/dev/block/platform/sdhci-tegra(.*)/by-name/UCB		u:object_r:usercalib_block_device:s0
@@ -92,8 +94,8 @@
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/SOS		u:object_r:recovery_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/MDA		u:object_r:metadata_block_device:s0
-# A/B 分区名映射（本机实际不分 A/B，保留是为了与上游 file_contexts 对齐；
-# 注意 SOS 在 TN8 上是 recovery，不是 AOSP 的 boot）
+# A/B partition name mapping (this device is not A/B; kept to stay aligned with the
+# upstream file_contexts; note that SOS is recovery on TN8, not AOSP's boot).
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX-A		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/LNX-B		u:object_r:boot_block_device:s0
 /dev/block/platform/sdhci-tegra(.*)/by-name/SOS-A		u:object_r:boot_block_device:s0
@@ -186,11 +188,12 @@
 # update_js_touch_fw
 #/system/bin/update_js_touch_fw.sh	u:object_r:update_js_touch_fw_exec:s0
 # phs
-# 2026-11-21: 打开这行。之前注释掉，ussrd 二进制落成 vendor_file，init 执行时
-# 被拒 execute，且 init_daemon_domain(ussrd) 的域转换永远不生效。
-# 必须写成 (vendor|system/vendor)：这台机器 system-as-root，/vendor 只是指向
-# /system/vendor 的软链，运行时真实路径是 /system/vendor/bin/...，只写 /vendor
-# 匹配不上（实测标签没生效）。
+# 2026-11-21: uncommented. It was commented out before, so the ussrd binary landed
+# on vendor_file, init was denied execute and the init_daemon_domain(ussrd) domain
+# transition never happened.
+# It has to be (vendor|system/vendor): this device is system-as-root and /vendor is a
+# symlink to /system/vendor, so the real run-time path is /system/vendor/bin/..., and
+# /vendor alone does not match (measured: the label never applied).
 /(vendor|system/vendor)/bin/ussrd		u:object_r:ussrd_exec:s0
 /(vendor|system/vendor)/bin/conn_init	u:object_r:conn_wifi_exec:s0
 /system/bin/ussr_setup.sh		u:object_r:ussr_setup_exec:s0
