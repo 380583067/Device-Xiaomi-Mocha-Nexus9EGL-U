@@ -356,11 +356,27 @@ PRODUCT_COPY_FILES += \
 # Enable nvidia framework enhancements if available
 -include vendor/lineage/product/nvidia.mk
 
-# ccodec value (see frameworks/av/media/codec2/sfplugin/Codec2InfoBuilder.cpp):
-# 0=disable C2 entirely, 1=only c2.android.* audio is preferred, 2=all c2.android.*
-# first with the others last, 3=c2.android.* first and the rest default, 4=every
-# component keeps its own rank. This tree uses 4 and orders the components with the
-# rank properties below; the reasoning and the full history are in that block.
+# Codec selection: debug.stagefright.ccodec=0 disables Codec2 entirely, so all
+# software decoding runs through OMX.google.* inside media.codec, using ACodec's
+# SoftwareRenderer (patched for this board's YV12 layout). Both this and the
+# Codec2 path played 1080p H.264 cleanly once patched; Codec2 must stay OFF for
+# a harder reason:
+#
+#   media.swcodec hosts c2.android.* and its decoder threads map the output
+#   gralloc buffers through tegra's NvGrLock. When a player's process dies
+#   mid-playback - MX Player does this by design, racing two engines in
+#   short-lived child processes - NvGrLock ends up waiting on an internal
+#   mutex that no live thread owns. Every later decoder in that process then
+#   blocks in NvGrLock forever (17 stuck component loopers measured), the
+#   components' release() never returns, MediaPlayerService::getCodecList
+#   stops answering, and every NEW media process - MX itself, Glimpse, VLC,
+#   anything - hangs at MediaCodecList init until media.swcodec and
+#   mediaserver are killed. Killing both restores a working stack with no
+#   further damage, but with ccodec=4 the wedge returns on the next player
+#   that exits mid-decode. Verified across repeated runs 2026-11-24.
+#
+# History of the Codec2 era (kept because the c2-poolmask property below is
+# still honoured if ccodec is ever raised again):
 #
 # c2-poolmask must include BUFFERQUEUE: 0xF0000 = ION|GRALLOC|BUFFERQUEUE|BLOB.
 # BLOB-only (0x80000) left the decoder output blocks without a bqId, so under BLAST
@@ -368,14 +384,7 @@ PRODUCT_COPY_FILES += \
 # but no picture - it also wedged mediaserver's NPDecoder, taking every MediaPlayer
 # down with it.
 #
-# Prerequisite: the frameworks/av legacy-gralloc patches for C2AllocatorGralloc
-# (lock() fallback when lockYCbCr is missing, YV12 as Y/V/U planes, HW_TEXTURE only
-# for CPU_WRITE+YUV). Without them C2 software decode fails start() or swaps red and
-# green. Measured 720p at 29.3-29.5 fps, colour-identical per frame.
-# OMX first, Codec2 second, and every implementation kept registered.
-#
-# ccodec=4 means each component keeps its own rank. The ranking that follows is
-# then decided by two properties OmxInfoBuilder reads directly
+# The ccodec=4 ranking era used two properties OmxInfoBuilder reads directly
 # (frameworks/av/media/libstagefright/OmxInfoBuilder.cpp:141):
 #
 #   omx_default_rank           default for hardware OMX, 0x100
@@ -388,10 +397,15 @@ PRODUCT_COPY_FILES += \
 #   OMX.google video (100) -> c2.android (512) -> OMX.Nvidia (768)
 #   OMX.google audio (16, its own property) stays first for audio.
 #
-# A warning if this is ever "fixed" through media_codecs.xml instead: the rank
-# attribute there is parsed with sscanf("%u%c"), i.e. decimal only. rank="0x300"
-# silently fails to parse and the component keeps its default rank - which is
+# A warning if the ranking is ever "fixed" through media_codecs.xml instead: the
+# rank attribute there is parsed with sscanf("%u%c"), i.e. decimal only.
+# rank="0x300" silently fails to parse and the component keeps its default rank -
 # exactly how the first attempt at this ended up changing nothing.
+PRODUCT_PROPERTY_OVERRIDES += \
+    debug.stagefright.c2-poolmask=0xF0000 \
+    debug.stagefright.ccodec=0 \
+    debug.stagefright.omx_default_rank=768 \
+    debug.stagefright.omx_default_rank.sw-other=100
 PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0xF0000 \
     debug.stagefright.ccodec=4 \
