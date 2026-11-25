@@ -28,6 +28,8 @@ package_extract_file("install/firmware-update/tos.img", "/dev/block/platform/sdh
 package_extract_file("install/firmware-update/misc.img", "/dev/block/platform/sdhci-tegra.3/by-name/MSC");
 # Flash USP (blob) Partition
 package_extract_file("install/firmware-update/blob", "/dev/block/platform/sdhci-tegra.3/by-name/USP");
+# Flash TWRP recovery (SOS partition, 20 MiB - TWRP image is 20,043,776 bytes)
+package_extract_file("install/firmware-update/twrp.img", "/dev/block/platform/sdhci-tegra.3/by-name/SOS");
 ''')
 
 def IncrementalOTA_InstallEnd(info):
@@ -38,4 +40,6 @@ package_extract_file("install/firmware-update/tos.img", "/dev/block/platform/sdh
 package_extract_file("install/firmware-update/misc.img", "/dev/block/platform/sdhci-tegra.3/by-name/MSC");
 # Flash USP (blob) Partition
 package_extract_file("install/firmware-update/blob", "/dev/block/platform/sdhci-tegra.3/by-name/USP");
+# Flash TWRP recovery (SOS partition, 20 MiB - TWRP image is 20,043,776 bytes)
+package_extract_file("install/firmware-update/twrp.img", "/dev/block/platform/sdhci-tegra.3/by-name/SOS");
 ''')

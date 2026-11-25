@@ -111,6 +111,17 @@ service charger_led /system/bin/sh /system/bin/charger_led.sh
 on charger
     start charger_led
 
+    # [2026-11-25 keep-awake] Offline charging used to autosuspend once the
+    # animation blanked the panel: the device went into suspend, the power key
+    # did not bring it back (the panel stayed dark until a full re-wake), so the
+    # user had to long-press power to get the charging screen again. Hold a
+    # kernel wakelock for the whole charger session instead: CPU0 stays online
+    # (a single core, powersave governor, set below) and input events are
+    # handled immediately, so a short power-key press simply re-kicks the
+    # animation. Charging is not affected and the screen can still blank.
+    write /sys/power/autosleep off
+    write /sys/power/wake_lock charger_keepawake
+
     # Charger mode runs only early-init/init/charger, and `on charger` starts
     # nothing but class charger. servicemanager, hwservicemanager and
     # vndservicemanager all belong to class core, so none of them came up - and
