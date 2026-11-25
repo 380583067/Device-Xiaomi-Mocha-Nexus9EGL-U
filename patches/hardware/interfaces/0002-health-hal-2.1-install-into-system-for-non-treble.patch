@@ -1,5 +1,5 @@
 diff --git a/health/2.1/default/Android.bp b/health/2.1/default/Android.bp
-index b7bcea5..efb5ef2 100644
+index b7bcea5..5c29185 100644
 --- a/health/2.1/default/Android.bp
 +++ b/health/2.1/default/Android.bp
 @@ -53,8 +53,10 @@ cc_library_shared {
@@ -24,6 +24,24 @@ index b7bcea5..efb5ef2 100644
      defaults: ["android.hardware.health@2.1-impl-defaults"],
      init_rc: ["android.hardware.health@2.1-service.rc"],
  
+@@ -80,9 +82,14 @@ cc_binary {
+         "service.cpp",
+     ],
+ 
+-    vintf_fragments: [
+-        "android.hardware.health@2.1.xml"
+-    ],
++    // [mocha non-Treble 2026-11-25] No vintf_fragments here: once the module is
++    // installed into system, the fragment would land in
++    // /system/etc/vintf/manifest/, which only accepts *framework* manifest
++    // fragments. A type="device" fragment there makes every
++    // getFrameworkHalManifest call fail with "Cannot add a device manifest to a
++    // framework manifest", which stalls boot in the boot animation. The HAL is
++    // declared in the device manifest (device/xiaomi/mocha/manifest.xml)
++    // instead, which is the device manifest itself.
+ 
+     overrides: [
+         "healthd",
 diff --git a/health/2.1/default/android.hardware.health@2.1-service.rc b/health/2.1/default/android.hardware.health@2.1-service.rc
 index 8728257..10c4ede 100644
 --- a/health/2.1/default/android.hardware.health@2.1-service.rc
