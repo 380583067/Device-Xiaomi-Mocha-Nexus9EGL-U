@@ -1,0 +1,37 @@
+diff --git a/health/2.1/default/Android.bp b/health/2.1/default/Android.bp
+index b7bcea5..efb5ef2 100644
+--- a/health/2.1/default/Android.bp
++++ b/health/2.1/default/Android.bp
+@@ -53,8 +53,10 @@ cc_library_shared {
+     name: "android.hardware.health@2.1-impl",
+     stem: "android.hardware.health@2.0-impl-2.1",
+ 
+-    // Only vendor and recovery variants are allowed, not core.
+-    vendor: true,
++    // [mocha non-Treble 2026-11-25] This ROM has no vendor image: vendor:true
++    // modules are built but never installed, so charger never found the health
++    // HAL and drew nothing (LED-only offline charging). Install into system,
++    // where the platform actually looks for it here.
+     recovery_available: true,
+ 
+     defaults: ["android.hardware.health@2.1-impl-defaults"],
+@@ -72,7 +74,7 @@ cc_library_shared {
+ // so there is no need to implement your own.
+ cc_binary {
+     name: "android.hardware.health@2.1-service",
+-    vendor: true,
++    // [mocha non-Treble 2026-11-25] see the note on android.hardware.health@2.1-impl
+     defaults: ["android.hardware.health@2.1-impl-defaults"],
+     init_rc: ["android.hardware.health@2.1-service.rc"],
+ 
+diff --git a/health/2.1/default/android.hardware.health@2.1-service.rc b/health/2.1/default/android.hardware.health@2.1-service.rc
+index 8728257..10c4ede 100644
+--- a/health/2.1/default/android.hardware.health@2.1-service.rc
++++ b/health/2.1/default/android.hardware.health@2.1-service.rc
+@@ -1,4 +1,5 @@
+-service health-hal-2-1 /vendor/bin/hw/android.hardware.health@2.1-service
++# [mocha non-Treble 2026-11-25] installed in system, not vendor
++service health-hal-2-1 /system/bin/hw/android.hardware.health@2.1-service
+     class hal charger
+     user system
+     group system

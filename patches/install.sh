@@ -76,3 +76,4 @@ if (( install_failed != 0 )); then
 fi
 
 printf '\nPatch installation complete.\n'
+pl_rebuild_hint

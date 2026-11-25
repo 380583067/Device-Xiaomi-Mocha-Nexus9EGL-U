@@ -1,14 +1,7 @@
-// mocha gralloc YUV lock capability probe (temporary debug tool, not shipped)
+// mocha V4L2 frame grabber (temporary debug tool, not shipped)
 cc_binary {
-    name: "yv12locktest",
-    srcs: ["yv12locktest.cpp"],
-    shared_libs: [
-        "libui",
-        "libutils",
-        "liblog",
-        "libcutils",
-        "libnativewindow",
-    ],
+    name: "v4l2grab",
+    srcs: ["v4l2grab.c"],
     cflags: ["-Wno-unused-parameter"],
     vendor: false,
 }

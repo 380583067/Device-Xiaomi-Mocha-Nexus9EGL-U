@@ -164,3 +164,52 @@ pl_is_applied() {
 pl_applies() {
     git -C "$(pl_repo_path "$1")" apply --check "$1" >/dev/null 2>&1
 }
+
+# Per-category patch counts for the selection, one line each, stable order.
+pl_category_summary() {
+    local patch rel repo category
+    local -A counts=()
+    for patch in "${PL_PATCHES[@]}"; do
+        rel="${patch#"$PL_ROOT"/}"
+        repo="${rel%/*}"
+        category="$(pl_category_of "$repo" "$rel")"
+        counts[$category]=$(( ${counts[$category]:-0} + 1 ))
+    done
+    local category_name
+    for category_name in $(printf '%s\n' "${!counts[@]}" | sort); do
+        printf '  %-8s %d\n' "$category_name" "${counts[$category_name]}"
+    done
+}
+
+# What has to be rebuilt after touching each category. Only the categories that
+# are actually in the current selection are printed, so `--category camera`
+# does not tell the user to rebuild the whole tree.
+pl_rebuild_hint() {
+    local patch rel repo category
+    local -A hints=(
+        [camera]="m -j22 camera.tegra   # then reinstall /system/lib/hw/camera.tegra.so"
+        [media]="m -j22 libstagefright libstagefright_omx"
+        [display]="m -j22 libsurfaceflinger libbinder"
+        [wifi]="m -j22 libwifi-hal-bcm"
+        [power]="m -j22 charger android.hardware.health@2.1-service"
+        [system]="m -j22   # framework/base and package changes need a full system image"
+        [build]="m -j16 otapackage   # build-system edits only take effect on a full build"
+        [other]="m -j16 otapackage"
+    )
+    local -A wanted=()
+    for patch in "${PL_PATCHES[@]}"; do
+        rel="${patch#"$PL_ROOT"/}"
+        repo="${rel%/*}"
+        wanted["$(pl_category_of "$repo" "$rel")"]=1
+    done
+
+    local printed=0 category_name
+    for category_name in $(printf '%s\n' "${!wanted[@]}" | sort); do
+        if (( printed == 0 )); then
+            printf '\nRebuild what these categories touch:\n'
+            printed=1
+        fi
+        printf '  %-8s %s\n' "$category_name" "${hints[$category_name]:-${hints[other]}}"
+    done
+    (( printed )) && printf '\n'
+}

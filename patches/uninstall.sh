@@ -64,3 +64,4 @@ if (( uninstall_failed != 0 )); then
 fi
 
 printf '\nPatch removal complete. Unrelated source changes were left untouched.\n'
+pl_rebuild_hint

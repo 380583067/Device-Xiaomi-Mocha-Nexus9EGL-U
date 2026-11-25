@@ -78,4 +78,7 @@ if (( errors != 0 )); then
     exit 1
 fi
 
-printf '\nChecked %d patch(es). The source worktrees and real Git indexes were not changed.\n' "$patch_count"
+printf '\nChecked %d patch(es) across these categories:\n' "$patch_count"
+pl_category_summary
+printf '\nThe source worktrees and real Git indexes were not changed.\n'
+printf 'Install them with: %s/install.sh [--category <name>]\n' "$SCRIPT_DIR"
