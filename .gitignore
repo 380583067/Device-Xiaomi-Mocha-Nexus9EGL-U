@@ -1,0 +1,9 @@
+# Python bytecode caches produced by the helper scripts in this tree
+# (camera/depcheck.py and friends). Never commit these: they are tied to the
+# interpreter version of whoever ran them.
+__pycache__/
+*.pyc
+
+# Editor and OS noise
+*.swp
+.DS_Store
