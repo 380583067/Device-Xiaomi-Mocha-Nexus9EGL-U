@@ -179,6 +179,19 @@ struct mocha_camera_device_t {
     uint8_t af_mode;
     uint8_t af_trigger;
     bool af_trigger_handled;
+    /* [2026-11-25] Previous AF_TRIGGER value, so a fresh AF_TRIGGER_START (a tap to
+     * focus, or the app asking again) is noticed even when af_trigger_handled is
+     * already true from the session's initial sweep. */
+    uint8_t af_last_trigger;
+
+    /* [2026-11-25 photo orientation] ANDROID_JPEG_ORIENTATION from the latest
+     * request, in degrees clockwise. Camera2 leaves the whole rotation job to the
+     * HAL: the app only states how far the finished image must be rotated to look
+     * upright, and OpenCamera (like every other camera2 app) then trusts the file.
+     * Without an EXIF Orientation tag the saved photos stay sideways - that was the
+     * "photo needs a 90 degree turn" report. 0 means "not received yet". */
+    int32_t jpeg_orientation;
+    bool jpeg_orientation_set;
 };
 
 /* Encode one RGBA frame as a JPEG inside the BLOB stream buffer, with the 8-byte
@@ -255,6 +268,12 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
     }
 
     if (!dev->jpeg_encoder) dev->jpeg_encoder = new mocha::JpegEncoder();
+    /* [2026-11-25 photo orientation] Use what the app asked for; if this app never
+     * sets ANDROID_JPEG_ORIENTATION fall back to the sensor's own mounting angle,
+     * which is the same number when the device is held in its natural orientation. */
+    dev->jpeg_encoder->setOrientation(dev->jpeg_orientation_set
+            ? dev->jpeg_orientation
+            : MochaCameraHAL::kCameras[dev->camera_id].orientation);
     size_t jpegSize = 0;
     int ret = dev->jpeg_encoder->encodeRGBA(rgba, (int)w, (int)h, 90,
                                            (uint8_t*)vaddr, payloadCapacity, &jpegSize);
@@ -1023,6 +1042,9 @@ static int camera_device_init(const hw_module_t *module, hw_device_t **device) {
     dev->af_mode = ANDROID_CONTROL_AF_MODE_AUTO;
     dev->af_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
     dev->af_trigger_handled = false;
+    dev->af_last_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
+    dev->jpeg_orientation = 0;
+    dev->jpeg_orientation_set = false;
 
     *device = &dev->common;
     
@@ -1215,8 +1237,9 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     camera3_stream_t* rgbaStream = nullptr;
     for (uint32_t i = 0; i < config->num_streams; i++) {
         camera3_stream_t *stream = config->streams[i];
-        ALOGI("Stream %d: type=%d, width=%d, height=%d, format=%d",
-              i, stream->stream_type, stream->width, stream->height, stream->format);
+        ALOGI("Stream %d: type=%d, width=%d, height=%d, format=%d, usage=%#x",
+              i, stream->stream_type, stream->width, stream->height, stream->format,
+              stream->usage);
         
         if (stream->width == 0 || stream->height == 0) {
             ALOGE("Invalid stream dimensions");
@@ -1291,38 +1314,14 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
     ALOGI("Pipeline resolution: %ux%u (from %ux%u stream)",
           pipeW, pipeH, pipelineStream->width, pipelineStream->height);
 
-    // Early exit if same resolution - avoids costly STREAMOFF/STREAMON cycle
-    if (dev->last_config_width == pipeW &&
-        dev->last_config_height == pipeH &&
-        dev->streams_configured && dev->pipeline) {
-        mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
-        if (p->getState() == mocha::PIPELINE_STREAMING) {
-            ALOGI("configureStreams: same %ux%u capture as last - no-op reinit",
-                  pipeW, pipeH);
-            return 0;
-        }
-        // NOTE: removed PIPELINE_OPENED early exit - sensor can get into bad state,
-        // need full reconfigure to power cycle it
-        ALOGI("configureStreams: same resolution but pipeline not streaming, reconfiguring");
-    }
-
-    // Error-complete any in-flight requests before reconfiguring
-    if (dev->inflight_tracker && dev->inflight_tracker->count() > 0) {
-        ALOGI("configureStreams: draining %zu in-flight requests", dev->inflight_tracker->count());
-        std::vector<uint32_t> frames = dev->inflight_tracker->drainAll();
-        for (uint32_t frameNum : frames) {
-            camera3_capture_result_t result;
-            memset(&result, 0, sizeof(result));
-            result.frame_number = frameNum;
-            result.result = nullptr;
-            result.num_output_buffers = 0;
-            result.output_buffers = nullptr;
-            result.partial_result = 0;
-            dev->callback_ops->process_capture_result(dev->callback_ops, &result);
-            ALOGI("Drained in-flight frame %u", frameNum);
-        }
-    }
-
+    /* [2026-11-25 front-camera video was black] Normalise the output streams BEFORE
+     * the same-resolution early exit. Switching back to a resolution the device was
+     * already streaming at (front camera: preview 720p -> record 720p) took the fast
+     * path, which returned without ever rewriting IMPLEMENTATION_DEFINED to RGBA_8888.
+     * The capture target then stayed PRIV, the fan-out saw format 0x22 -> 0x21 and
+     * bailed out as unsupported, and the encoder read a buffer nothing had written:
+     * a black video. Back camera avoided it only because its recording resolution
+     * differed from the preview one and took the slow path. */
     /* Clear the encoder stream registration before every configure to avoid a stale pointer from the last session. */
     for (int k = 0; k < 4; k++) gEncoderStreams[k] = nullptr;
     /* [2026-11-22 still capture] Every output stream gets
@@ -1396,6 +1395,38 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
             }
         }
     }
+    // Early exit if same resolution - avoids costly STREAMOFF/STREAMON cycle
+    if (dev->last_config_width == pipeW &&
+        dev->last_config_height == pipeH &&
+        dev->streams_configured && dev->pipeline) {
+        mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
+        if (p->getState() == mocha::PIPELINE_STREAMING) {
+            ALOGI("configureStreams: same %ux%u capture as last - no-op reinit",
+                  pipeW, pipeH);
+            return 0;
+        }
+        // NOTE: removed PIPELINE_OPENED early exit - sensor can get into bad state,
+        // need full reconfigure to power cycle it
+        ALOGI("configureStreams: same resolution but pipeline not streaming, reconfiguring");
+    }
+
+    // Error-complete any in-flight requests before reconfiguring
+    if (dev->inflight_tracker && dev->inflight_tracker->count() > 0) {
+        ALOGI("configureStreams: draining %zu in-flight requests", dev->inflight_tracker->count());
+        std::vector<uint32_t> frames = dev->inflight_tracker->drainAll();
+        for (uint32_t frameNum : frames) {
+            camera3_capture_result_t result;
+            memset(&result, 0, sizeof(result));
+            result.frame_number = frameNum;
+            result.result = nullptr;
+            result.num_output_buffers = 0;
+            result.output_buffers = nullptr;
+            result.partial_result = 0;
+            dev->callback_ops->process_capture_result(dev->callback_ops, &result);
+            ALOGI("Drained in-flight frame %u", frameNum);
+        }
+    }
+
     /* Pipeline creation and configuration live in openPipelineAt() (high-resolution capture reuses it). */
     int ret = openPipelineAt(dev, pipeW, pipeH);
     if (ret != 0) {
@@ -1763,6 +1794,8 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
 /* Write a whole RGBA frame into a YUV output stream: prefer the real plane layout
  * from lockYCbCr, and fall back to lock() with an assumed YV12 (Y + V + U) layout
  * when that is unsupported. [2026-11-22] Shared by multi-stream writes of one frame. */
+static void logYPlaneStats(const struct android_ycbcr* ycbcr, int w, int h, const char* how);
+
 static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
                              const uint8_t* rgba, int sw, int sh) {
     if (!dst || !dst->buffer || !dst->stream || !rgba) return false;
@@ -1774,6 +1807,8 @@ static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
     if (ret == 0 && ycbcr.y) {
         rgbaToYuv420Scaled(rgba, sw, sh,
                            (int)dst->stream->width, (int)dst->stream->height, &ycbcr);
+        logYPlaneStats(&ycbcr, (int)dst->stream->width, (int)dst->stream->height,
+                       "writeYuvFromRgba/lockYCbCr");
         android::GraphicBufferMapper::get().unlock(*dst->buffer);
         return true;
     }
@@ -1786,27 +1821,102 @@ static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
     }
     const int w = (int)dst->stream->width;
     const int h = (int)dst->stream->height;
-    const size_t ySize = (size_t)w * h;
+    /* [2026-11-25 720p recording came out black] gralloc pads YV12/YUV420 rows, and the
+     * padding is not the same at every width: 1920-wide frame rows happened to come
+     * back with stride == width, but 1280-wide ones are padded, so packing the planes
+     * at `w` shifted every row and the encoder decoded an almost entirely black frame
+     * (mean luma 1.3/255). Read the real pitch from the handle. */
+    const int yStride = surfaceStride(*dst->buffer, w);
+    const int cStride = yStride / 2;
+    const size_t ySize = (size_t)yStride * h;
+    const size_t cSize = (size_t)cStride * (h / 2);
     memset(&ycbcr, 0, sizeof(ycbcr));
-    ycbcr.ystride = (size_t)w;
-    ycbcr.cstride = (size_t)w / 2;
+    ycbcr.ystride = (size_t)yStride;
+    ycbcr.cstride = (size_t)cStride;
     ycbcr.chroma_step = 1;
     ycbcr.y = static_cast<uint8_t*>(vaddr);
+    /* YV12: V plane, then U plane. */
     ycbcr.cr = static_cast<uint8_t*>(vaddr) + ySize;
-    ycbcr.cb = static_cast<uint8_t*>(vaddr) + ySize + ySize / 4;
+    ycbcr.cb = static_cast<uint8_t*>(vaddr) + ySize + cSize;
     rgbaToYuv420Scaled(rgba, sw, sh, w, h, &ycbcr);
+    logYPlaneStats(&ycbcr, w, h, "writeYuvFromRgba/fallback");
     android::GraphicBufferMapper::get().unlock(*dst->buffer);
     return true;
 }
 
+
+/* [2026-11-25 720p recording came out black] Cheap proof of whether the RGBA->YUV
+ * conversion actually landed in the encoder surface: sample the Y plane we just
+ * wrote and print its range. "written" with a sane average means the HAL side is
+ * fine and the loss is downstream; an all-zero average means the write missed. */
+static void logYPlaneStats(const struct android_ycbcr* ycbcr, int w, int h, const char* how)
+{
+    /* Written to a file as well as logcat: during recording logcat rotates in about a
+     * second (the frame pipeline logs heavily), which threw away every diagnostic we
+     * added earlier. A capped file survives. */
+    static int statsCount = 0;
+    if (!ycbcr || !ycbcr->y || statsCount >= 60) return;
+    statsCount++;
+    const uint8_t* y = (const uint8_t*)ycbcr->y;
+    int minv = 255, maxv = 0;
+    long long sum = 0;
+    int samples = 0;
+    for (int yy = 0; yy < h; yy += 8) {
+        const uint8_t* row = y + (size_t)yy * ycbcr->ystride;
+        for (int xx = 0; xx < w; xx += 8) {
+            int v = row[xx];
+            if (v < minv) minv = v;
+            if (v > maxv) maxv = v;
+            sum += v;
+            samples++;
+        }
+    }
+    ALOGI("Y plane after %s: %dx%d ystride=%zu cstride=%zu step=%zu min=%d avg=%lld max=%d",
+          how, w, h, (size_t)ycbcr->ystride, (size_t)ycbcr->cstride,
+          (size_t)ycbcr->chroma_step, minv, samples ? sum / samples : -1, maxv);
+    FILE* f = fopen("/data/local/tmp/yuvstats.txt", "a");
+    if (f) {
+        fprintf(f, "%s: %dx%d ystride=%zu cstride=%zu step=%zu y=%p cb=%p cr=%p min=%d avg=%lld max=%d\n",
+                how, w, h, (size_t)ycbcr->ystride, (size_t)ycbcr->cstride,
+                (size_t)ycbcr->chroma_step, (void*)ycbcr->y, (void*)ycbcr->cb,
+                (void*)ycbcr->cr, minv, samples ? sum / samples : -1, maxv);
+        fclose(f);
+    }
+}
+
 static void copyFrameBetweenBuffers(
         const camera3_stream_buffer_t* src, const camera3_stream_buffer_t* dst) {
+    /* [2026-11-25] Unconditional entry trace (first few calls) - every earlier
+     * diagnostic in this function was one-shot, so a session that never reached the
+     * function at all looked identical to a session that worked. */
+    {
+        static int enterCount = 0;
+        if (enterCount < 4) {
+            enterCount++;
+            ALOGI("copyFrameBetweenBuffers: src=%p/%d dst=%p/%d (buf %p -> %p) srcStride=%d",
+                  (void*)src, src && src->stream ? src->stream->format : -1,
+                  (void*)dst, dst && dst->stream ? dst->stream->format : -1,
+                  src ? (void*)src->buffer : nullptr,
+                  dst ? (void*)dst->buffer : nullptr,
+                  src && src->stream ? surfaceStride(*src->buffer, (int)src->stream->width) : -1);
+        }
+    }
     if (!src || !dst || !src->buffer || !dst->buffer) return;
-    const bool srcRgba = (src->stream->format == HAL_PIXEL_FORMAT_RGBA_8888);
-    /* [2026-11-18 plan 1] The encoder stream format is IMPLEMENTATION_DEFINED (not
-     * rewritten), so the internal marker still routes it to the YUV target and the
-     * NV12/YV12 write path. */
+    /* [2026-11-25] IMPLEMENTATION_DEFINED counts as RGBA here: that is what
+     * writeRgbaToSurface() puts in it, so a fan-out from such a buffer can be
+     * converted to YUV like any other RGBA source. */
+    const bool srcRgba = (src->stream->format == HAL_PIXEL_FORMAT_RGBA_8888) ||
+                         (src->stream->format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED);
+    /* [2026-11-25 front-camera video was completely black] The encoder surface is not
+     * always YCbCr_420_888: MediaCodec happily allocates YV12 as well, and OpenCamera's
+     * recording session asked for exactly that (stream dump: 1280x720 format=33). YV12
+     * was missing from this test, so the copy fell through to the "unsupported format"
+     * branch and returned without touching the destination - the encoder then read a
+     * never-written (all zero) buffer and every recorded frame came out black. Treat
+     * YV12 as a YUV target too; the write path already has a plane-packing fallback for
+     * it because lockYCbCr is unavailable on this gralloc. */
     const bool dstYuv  = (dst->stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888) ||
+                         (dst->stream->format == HAL_PIXEL_FORMAT_YV12) ||
                          isEncoderStream(dst->stream);
     if (src->stream->format != dst->stream->format && !(srcRgba && dstYuv)) {
         ALOGW("copyFrameBetweenBuffers: unsupported format %d -> %d",
@@ -1866,6 +1976,8 @@ static void copyFrameBetweenBuffers(
                                (int)src->stream->width, (int)src->stream->height,
                                (int)dst->stream->width, (int)dst->stream->height,
                                &ycbcr);
+            logYPlaneStats(&ycbcr, (int)dst->stream->width, (int)dst->stream->height,
+                           "lockYCbCr path");
             android::GraphicBufferMapper::get().unlock(*dst->buffer);
         } else {
             /* Fallback: gralloc cannot lockYCbCr this stream. Assume YV12 internally
@@ -1879,23 +1991,36 @@ static void copyFrameBetweenBuffers(
             if (lockRet == 0 && yuvVaddr) {
                 const int w = (int)dst->stream->width;
                 const int h = (int)dst->stream->height;
-                const size_t ySize = (size_t)w * h;
+                /* [2026-11-25 front-camera video was black] Use the allocation's real
+                 * pitch instead of assuming stride == w. gralloc pads YV12 rows on this
+                 * device, and the front camera records at 1280x720: packing the planes
+                 * at a 1280 pitch while the allocator had reserved a wider row shifted
+                 * every subsequent row, so the encoder received a frame whose luma was
+                 * almost entirely zero (measured mean luma 1.5/255 with only a corner
+                 * visible). The 1920-wide back-camera streams happened to be laid out
+                 * the way the old code assumed, which is why only the front was black. */
+                const int yStride = surfaceStride(*dst->buffer, w);
+                const int cStride = yStride / 2;
+                const size_t ySize = (size_t)yStride * h;
+                const size_t cSize = (size_t)cStride * (h / 2);
                 memset(&ycbcr, 0, sizeof(ycbcr));
-                ycbcr.ystride = (size_t)w;
-                ycbcr.cstride = (size_t)w / 2;
+                ycbcr.ystride = (size_t)yStride;
+                ycbcr.cstride = (size_t)cStride;
                 ycbcr.chroma_step = 1;
                 ycbcr.y = static_cast<uint8_t*>(yuvVaddr);
                 /* YV12: V plane first, then U, w*h/4 each */
                 ycbcr.cr = static_cast<uint8_t*>(yuvVaddr) + ySize;
-                ycbcr.cb = static_cast<uint8_t*>(yuvVaddr) + ySize + ySize / 4;
+                ycbcr.cb = static_cast<uint8_t*>(yuvVaddr) + ySize + cSize;
                 if (!fallbackLogged) {
                     fallbackLogged = true;
                     ALOGW("encoder YUV via lockYCbCr failed (%d), falling back "
-                          "to lock() with an assumed YV12 layout, stride=%d", ret, w);
+                          "to lock() with an assumed YV12 layout, ystride=%d (width %d), h=%d",
+                          ret, yStride, w, h);
                 }
                 rgbaToYuv420Scaled(static_cast<const uint8_t*>(srcVaddr),
                                    (int)src->stream->width, (int)src->stream->height,
                                    w, h, &ycbcr);
+                logYPlaneStats(&ycbcr, w, h, "fallback path");
                 android::GraphicBufferMapper::get().unlock(*dst->buffer);
             } else {
                 ALOGE("copyFrameBetweenBuffers: encoder buffer not lockable: "
@@ -2008,7 +2133,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         if (find_camera_metadata_entry(mutableSettings, ANDROID_LENS_FOCUS_DISTANCE, &entry) == 0 && entry.count > 0) {
             focusDist = entry.data.f[0];
         }
-        ALOGI("AF request: mode=%d trigger=%d focusDist=%.2f", dev->af_mode, dev->af_trigger, focusDist);
+
+        /* [2026-11-25 photo orientation] Camera2 hands the rotation to the HAL here.
+         * Record it and let writeJpegToBlob() turn it into an EXIF Orientation tag. */
+        if (find_camera_metadata_entry(mutableSettings, ANDROID_JPEG_ORIENTATION, &entry) == 0 && entry.count > 0) {
+            dev->jpeg_orientation = entry.data.i32[0];
+            dev->jpeg_orientation_set = true;
+        }
+        ALOGI("AF request: mode=%d trigger=%d focusDist=%.2f jpegOrient=%d", dev->af_mode, dev->af_trigger, focusDist, dev->jpeg_orientation);
 
         /* Digital zoom: honour both the classic SCALER_CROP_REGION and the
          * Android 12 CONTROL_ZOOM_RATIO. The active array is 16:9
@@ -2057,12 +2189,17 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
     if (dev->pipeline && dev->camera_id == 0) {
         mocha::CameraPipeline* p = static_cast<mocha::CameraPipeline*>(dev->pipeline);
         if (dev->af_mode == ANDROID_CONTROL_AF_MODE_AUTO ||
-            dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE) {
-            if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_START && !dev->af_trigger_handled) {
+            dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
+            dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+            if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_START &&
+                dev->af_last_trigger != ANDROID_CONTROL_AF_TRIGGER_START) {
+                /* A tap-to-focus (or the app re-requesting) must always be honoured, not
+                 * only before the session's first sweep. */
                 ALOGI("AF TRIGGER START received");
                 p->startAfScan();
                 dev->af_trigger_handled = true;
-            } else if (dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE &&
+            } else if ((dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
+                        dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO) &&
                        dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_IDLE &&
                        !dev->af_trigger_handled) {
                 /* [fix 2026-11-17] In CONTINUOUS_PICTURE mode the framework only sends
@@ -2071,8 +2208,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                  * Aperture never focused and the picture stayed blurry (the 10:05 log shows
                  * "AF request: mode=4 trigger=0" repeatedly and never an "AF: coarse"). Run
                  * one sweep in continuous mode too, triggered by later session or preview
-                 * restarts, so the user at least gets a focused frame. */
-                ALOGI("AF: CONTINUOUS_PICTURE, running initial scan");
+                 * restarts, so the user at least gets a focused frame.
+                 * [2026-11-25 video never focused] Recording asks for
+                 * CONTINUOUS_VIDEO (3), a mode this test did not know, so a recording
+                 * session never ran a single sweep and the whole clip was out of focus
+                 * whenever the lens was not already sitting on the subject. Handle it
+                 * like CONTINUOUS_PICTURE: one sweep per session, plus any tap-to-focus
+                 * the app sends as AF_TRIGGER_START. */
+                ALOGI("AF: continuous mode (picture/video), running initial scan");
                 p->startAfScan();
                 dev->af_trigger_handled = true;
             } else if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL) {
@@ -2081,6 +2224,7 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 dev->af_trigger_handled = false;
             }
         }
+        dev->af_last_trigger = dev->af_trigger;
     }
 
     /* [recording fix 2026-11-17] Prefer an RGBA stream as the capture source. While
@@ -2106,10 +2250,31 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
 
     /* acquire_fence is already waited for and closed at function entry (see the fence leak fix above). */
 
-    ALOGI("Processing capture: frame=%llu stream=%dx%d format=%d pipeline=%dx%d",
-          (unsigned long long)request->frame_number,
-          buf.stream->width, buf.stream->height, buf.stream->format,
-          dev->pipeline_width, dev->pipeline_height);
+    /* [2026-11-25] Log every 30th frame: one line per frame filled logcat within a
+     * second during recording and pushed the diagnostics we needed out of the buffer. */
+    if ((request->frame_number % 30) == 0) {
+        ALOGI("Processing capture: frame=%llu stream=%dx%d format=%d pipeline=%dx%d nbuf=%u",
+              (unsigned long long)request->frame_number,
+              buf.stream->width, buf.stream->height, buf.stream->format,
+              dev->pipeline_width, dev->pipeline_height, request->num_output_buffers);
+    }
+    /* [2026-11-25] One line per request listing every output stream, so a recording
+     * session shows at a glance whether the encoder stream arrives in the same request
+     * (fan-out) or as its own capture target. */
+    {
+        static int dumpCount = 0;
+        if (dumpCount < 6 && request->num_output_buffers > 1) {
+            dumpCount++;
+            for (uint32_t di = 0; di < request->num_output_buffers; di++) {
+                const camera3_stream_buffer_t *ob = &request->output_buffers[di];
+                ALOGI("  request buf %u: %dx%d format=%d%s", di,
+                      ob->stream ? ob->stream->width : -1,
+                      ob->stream ? ob->stream->height : -1,
+                      ob->stream ? ob->stream->format : -1,
+                      (ob == captureBuf) ? " (capture target)" : "");
+            }
+        }
+    }
 
  
     bool frameCaptured = false;
@@ -2175,6 +2340,14 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
          * after: the preview keeps its fast 30 fps size while the photo is a real 5 MP
          * frame, not an upscaled 1080p. */
         uint32_t restoreW = 0, restoreH = 0;
+        /* [2026-11-26 blurry stills, take 2] OpenCamera submits a photo as ONE request
+         * with a BLOB plus a preview buffer, so stills take THIS multi-stream branch,
+         * not the single-stream BLOB branch below (whose keepFocus restore never ran).
+         * openPipelineAt() powers the sensor down and back up, which also resets the
+         * VCM driver: the lens fell back to its rest position and every 8 MP shot was
+         * out of focus. Carry the focus position across BOTH rebuilds (up for the shot
+         * and back down for the preview). */
+        int keepFocusMs = -1;
         if (hasBlobStream) {
             uint32_t wantW = 0, wantH = 0, best = pipeW * pipeH;
             for (uint32_t i = 0; i < request->num_output_buffers; i++) {
@@ -2186,12 +2359,17 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             if (wantW && wantH) {
                 const int keepExp = pipeline->getExposure();
                 const int keepGain = pipeline->getGain();
+                keepFocusMs = pipeline->getFocusPosition();
                 if (openPipelineAt(dev, wantW, wantH, keepExp, keepGain) == 0) {
                     restoreW = pipeW; restoreH = pipeH;
                     pipeW = wantW; pipeH = wantH;
                     /* openPipelineAt() already deleted the old object, so the pointer must be fetched again. */
                     pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
                     ALOGI("still capture: pipeline switched to %ux%u for the shot", pipeW, pipeH);
+                    if (keepFocusMs >= 0) {
+                        ALOGI("still capture: restoring focus position %d (up)", keepFocusMs);
+                        pipeline->setFocus(keepFocusMs);
+                    }
                 } else {
                     ALOGE("still capture: switch to %ux%u failed, upscaling instead",
                           wantW, wantH);
@@ -2268,8 +2446,16 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         if (restoreW && restoreH) {
             if (openPipelineAt(dev, restoreW, restoreH) != 0)
                 ALOGE("still capture: restore to %ux%u failed", restoreW, restoreH);
-            else
+            else {
                 ALOGI("still capture: pipeline restored to %ux%u", restoreW, restoreH);
+                /* The preview pipeline is a fresh object: put the lens back where AF
+                 * left it instead of letting it sit at the driver's stream-start
+                 * default until the next sweep. */
+                if (keepFocusMs >= 0) {
+                    ALOGI("still capture: restoring focus position %d (down)", keepFocusMs);
+                    static_cast<mocha::CameraPipeline*>(dev->pipeline)->setFocus(keepFocusMs);
+                }
+            }
         }
     } else if (dev->pipeline && dev->streams_configured) {
     // Capture a frame from the pipeline (single-stream zero-copy direct write)
@@ -2314,6 +2500,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                  * writeJpegToBlob() locks by image geometry and skips the trailer, same as
                  * the multi-stream path. */
                 const uint32_t keepW = dev->pipeline_width, keepH = dev->pipeline_height;
+                /* [2026-11-25 blurry stills] Rebuilding the pipeline powers the sensor
+                 * down and back up, and nothing re-applies the VCM position afterwards,
+                 * so the lens came back at its rest position (infinity) and an 8 MP shot
+                 * of anything closer than a few metres was out of focus - exactly the
+                 * "preview is sharp, the saved photo is blurry" report. Carry the focus
+                 * position across the rebuild and restore it on the way back. */
+                const int keepFocus = pipeline->getFocusPosition();
                 bool switched = false;
                 if (blobW * blobH > keepW * keepH) {
                     const int keepExp0 = pipeline->getExposure();
@@ -2322,6 +2515,10 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                         switched = true;
                         pipeline = static_cast<mocha::CameraPipeline*>(dev->pipeline);
                         ALOGI("still capture: pipeline switched to %ux%u for the shot", blobW, blobH);
+                        if (keepFocus >= 0) {
+                            ALOGI("still capture: restoring focus position %d", keepFocus);
+                            pipeline->setFocus(keepFocus);
+                        }
                         for (int warm = 0; warm < 5; warm++)
                             (void)pipeline->captureFrameRgba(dev->temp_rgba, blobW, blobH);
                     } else {
@@ -2330,8 +2527,13 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 }
                 int captureRet = pipeline->captureFrameRgba(dev->temp_rgba, blobW, blobH);
                 if (switched) {
-                    if (openPipelineAt(dev, keepW, keepH) != 0)
+                    if (openPipelineAt(dev, keepW, keepH) != 0) {
                         ALOGE("still capture: restore to %ux%u failed", keepW, keepH);
+                    } else if (keepFocus >= 0) {
+                        /* The preview pipeline also has a fresh pipeline; put the lens back
+                         * where AF left it instead of letting it snap to rest. */
+                        static_cast<mocha::CameraPipeline*>(dev->pipeline)->setFocus(keepFocus);
+                    }
                 }
                 if (captureRet == 0) {
                     camera3_stream_buffer_t blobBuf;
@@ -2345,39 +2547,32 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 }
             }
         } else if (buf.stream->format == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
-                   buf.stream->format == HAL_PIXEL_FORMAT_YV12) {
-            struct android_ycbcr ycbcr;
-            memset(&ycbcr, 0, sizeof(ycbcr));
-            const android::Rect yuvRect((int)buf.stream->width, (int)buf.stream->height);
-            int ret = android::GraphicBufferMapper::get().lockYCbCr(handle,
-                               GRALLOC_USAGE_SW_WRITE_OFTEN, yuvRect, &ycbcr);
-            if (ret == 0 && ycbcr.y) {
-                /* Render at the pipeline resolution (with the zoom crop
-                 * applied), then convert/scale into the YUV planes. Same
-                 * conversion the encoder fan-out always used. */
-                uint32_t rgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
-                if (!dev->temp_rgba || dev->temp_rgba_size < rgbaSize) {
-                    if (dev->temp_rgba) free(dev->temp_rgba);
-                    dev->temp_rgba = (uint8_t*)malloc(rgbaSize);
-                    dev->temp_rgba_size = rgbaSize;
-                }
-                int captureRet = -ENOMEM;
-                if (dev->temp_rgba) {
-                    captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
-                            dev->pipeline_width, dev->pipeline_height);
-                    if (captureRet == 0) {
-                        rgbaToYuv420Scaled(dev->temp_rgba,
-                                           (int)dev->pipeline_width, (int)dev->pipeline_height,
-                                           (int)buf.stream->width, (int)buf.stream->height,
-                                           &ycbcr);
-                    }
-                }
+                   buf.stream->format == HAL_PIXEL_FORMAT_YV12 ||
+                   isEncoderStream(buf.stream)) {
+            /* [2026-11-25 720p recording came out black] At 1280x720 the framework
+             * submits the encoder stream as its own request (one buffer per request,
+             * unlike 1080p where preview+video share a request), so this branch - not
+             * the fan-out - is the one that fills the video surface. It used to call
+             * lockYCbCr directly and simply give up when that failed; at 720p the vendor
+             * gralloc refuses lockYCbCr on the encoder surface, so nothing was ever
+             * written and the clip decoded to black (mean luma 1.3/255). Go through
+             * writeYuvFromRgba(), which falls back to packing YV12 by hand with the
+             * handle's real stride. */
+            const uint32_t yuvRgbaSize = dev->pipeline_width * dev->pipeline_height * 4;
+            if (!dev->temp_rgba || dev->temp_rgba_size < yuvRgbaSize) {
+                if (dev->temp_rgba) free(dev->temp_rgba);
+                dev->temp_rgba = (uint8_t*)malloc(yuvRgbaSize);
+                dev->temp_rgba_size = yuvRgbaSize;
+            }
+            if (dev->temp_rgba) {
+                int captureRet = pipeline->captureFrameRgba(dev->temp_rgba,
+                        dev->pipeline_width, dev->pipeline_height);
                 if (captureRet == 0) {
-                    frameCaptured = true;
+                    frameCaptured = writeYuvFromRgba(&buf, dev->temp_rgba,
+                            (int)dev->pipeline_width, (int)dev->pipeline_height);
+                } else {
+                    ALOGW("yuv stream: captureFrameRgba failed %d", captureRet);
                 }
-                /* [2026-11-22 recording -38] On captureRet == -EAGAIN do not unlock and return
-                 * -EAGAIN (fatal error mapping); use the shared error path at the end. */
-                android::GraphicBufferMapper::get().unlock(handle);
             }
         } else {
             /* Preview (RGBA/IMPLEMENTATION_DEFINED): capture into a packed buffer first, then
@@ -2409,7 +2604,9 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
     struct timespec ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     long elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000 + (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000;
-    ALOGI("Frame %u processing time: %ld ms", frameNum, elapsed_ms);
+    if ((frameNum % 30) == 0) {
+        ALOGI("Frame %u processing time: %ld ms", frameNum, elapsed_ms);
+    }
 
     // Determine if frame was flushed during capture
     bool frameFlushed = false;

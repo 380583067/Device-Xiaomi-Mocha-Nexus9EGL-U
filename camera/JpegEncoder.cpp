@@ -16,6 +16,47 @@ JpegEncoder::JpegEncoder() : mInitialized(false) {}
 
 JpegEncoder::~JpegEncoder() {}
 
+/* [2026-11-25 photo orientation] Build an EXIF APP1 segment carrying only the
+ * Orientation tag. Camera2 apps do not rotate stills themselves - they pass
+ * ANDROID_JPEG_ORIENTATION and expect the HAL to make the file come out upright.
+ * This HAL encoded the raw sensor frame with no metadata at all, so every photo was
+ * saved sideways and the user had to turn it by hand.
+ *
+ * EXIF Orientation is not "rotate the data by N"; it describes the transform a
+ * decoder has to apply, so the degrees-clockwise-to-upright value maps to:
+ *   90 -> 6 (rotate 90 CW), 180 -> 3 (rotate 180), 270 -> 8 (rotate 270 CW).
+ * The tag itself lives in a little-endian TIFF header with one IFD0 entry. */
+static int exifOrientationTag(int degrees)
+{
+    int d = ((degrees % 360) + 360) % 360;
+    switch (d) {
+        case 90:  return 6;
+        case 180: return 3;
+        case 270: return 8;
+        default:  return 0;   /* 0 -> tag 1 (normal), nothing to write */
+    }
+}
+
+static void writeExifOrientation(j_compress_ptr cinfo, int degrees)
+{
+    const int tag = exifOrientationTag(degrees);
+    if (tag == 0) return;
+
+    /* "Exif\0\0" + TIFF header (II, 42, IFD0 at offset 8) + one 12-byte IFD entry
+     * (tag 0x0112 Orientation, type 3 SHORT, count 1, value) + next-IFD offset 0. */
+    unsigned char app1[6 + 8 + 2 + 12 + 4] = {
+        'E','x','i','f',0,0,
+        'I','I', 0x2A,0x00, 0x08,0x00,0x00,0x00,     /* TIFF header, IFD0 @8 */
+        0x01,0x00,                                    /* one entry */
+        0x12,0x01,                                    /* 0x0112 Orientation */
+        0x03,0x00,                                    /* type SHORT */
+        0x01,0x00,0x00,0x00,                          /* count 1 */
+        (unsigned char)(tag & 0xFF), 0x00, 0x00,0x00, /* value + pad */
+        0x00,0x00,0x00,0x00,                          /* no next IFD */
+    };
+    jpeg_write_marker(cinfo, JPEG_APP0 + 1, app1, (unsigned int)sizeof(app1));
+}
+
 /* libjpeg destination manager that writes to a fixed-size buffer */
 struct jpeg_dest_mgr {
     struct jpeg_destination_mgr pub;
@@ -66,6 +107,10 @@ int JpegEncoder::encodeRGBA(const uint8_t* rgba, int width, int height, int qual
     jpeg_set_quality(&cinfo, quality, TRUE);
 
     jpeg_start_compress(&cinfo, TRUE);
+
+    /* Must come after start_compress so the marker lands right behind SOI, and
+     * before the first scanline. */
+    writeExifOrientation(&cinfo, mOrientation);
 
     row_stride = width * 4;
 
