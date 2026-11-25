@@ -1122,20 +1122,20 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
      * camera 0 (IMX179) uses SRGGB10 -> RGGB (pat 3); camera 1 (OV5693)
      * uses SBGGR10 -> BGGR (pat 2). Sharing one value gave the front
      * camera a strong green cast (G/B channels swapped). */
-    pipelineConfig.bayerPattern = (dev->camera_id == 0) ? 3 : 1;
+    pipelineConfig.bayerPattern = (dev->camera_id == 0) ? 3 : 2;
     pipelineConfig.offset_x = 0;
     pipelineConfig.offset_y = 0;
     pipelineConfig.flipV = false;  // IMX179 mount normal; framework handles rotation
 
     pipelineConfig.enableISP = true;
 
-     /* [black screen fix 2026-11-16] blackLevel is in the 8-bit scale of the
-      * raw10_to_8bit output (the code subtracts after v>>2). IMX179's 10-bit black
-      * level is typically 64 in the 10-bit domain, which is 64/4=16 in 8-bit. The
-      * previous round put the 10-bit 64 here, and since a night frame averages 239
-      * (10-bit) = 59 (8-bit) < 64, the saturating subtraction clamped everything to 0
-      * and the whole preview went black (AE luma=0.00). Use 16. */
-     pipelineConfig.blackLevel = 16;
+     /* [2026-11-25 per-sensor black level] The two sensors do not share a pedestal.
+      * Measured on dark frames (10-bit raw): IMX179 sits at ~64 (=> 16 in the 8-bit
+      * scale this table uses), while the OV5693 sub-lattices are B~50 / G~60 / R~60.
+      * Subtracting a flat 16 removed G and R completely but left the blue channel
+      * over-subtracted, which is what turned the front camera shadows green (blue
+      * crushed, green untouched). Stop at the lowest pedestal instead. */
+     pipelineConfig.blackLevel = (dev->camera_id == 0) ? 16 : 12;
      pipelineConfig.wbGain[0] = 1.0f;  // R gain
      pipelineConfig.wbGain[1] = 1.0f;  // G gain
      pipelineConfig.wbGain[2] = 1.0f;  // B gain

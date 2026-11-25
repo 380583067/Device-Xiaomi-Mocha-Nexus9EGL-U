@@ -356,10 +356,20 @@ void DemosaicNEON::process(const uint8_t* bayerInput, uint8_t* rgbOutput) {
     raw10_to_8bit(bayerInput, mBayerBuf, w * h, mParams.blackLevel);
     const uint8_t* b8 = mBayerBuf;
 
+    /* pos_color[pat] = { type(even row, even col), type(even row, odd col),
+     *                    type(odd row, even col),  type(odd row, odd col) }
+     * type: 0 = R site, 1 = G site whose horizontal neighbours are R,
+     *       2 = G site whose horizontal neighbours are B, 3 = B site.
+     *
+     * [2026-11-25 BGGR fix] The table used to label GRBG as GBRG, repeated RGGB
+     * for both GRBG and RGGB, and had no correct BGGR row at all, so the front
+     * OV5693 (SBGGR10) was demosaiced as if it were RGGB: R and B swapped,
+     * which is the "front camera is green" cast. Rebuilt from the definitions
+     * above; the RGGB row (used by the working back camera) is unchanged. */
     static const uint8_t pos_color[4][4] = {
-        {1, 0, 3, 2}, /* pat 0 = GBRG */
-        {0, 1, 2, 3}, /* pat 1 = GRBG */
-        {2, 3, 0, 1}, /* pat 2 = BGGR */
+        {2, 3, 0, 1}, /* pat 0 = GBRG */
+        {1, 0, 3, 2}, /* pat 1 = GRBG */
+        {3, 2, 1, 0}, /* pat 2 = BGGR */
         {0, 1, 2, 3}, /* pat 3 = RGGB */
     };
 

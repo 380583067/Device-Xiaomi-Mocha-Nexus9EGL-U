@@ -1120,12 +1120,20 @@ void CameraPipeline::startAfScan() {
 
     int bestEnergy = 0;
     int bestPos = 400;
-    const int coarseStep = 50;
-    const int fineStep = 10;
+    /* [2026-11-25 AF range] The AD5823 actuator has 1024 positions (0 = infinity,
+     * 1023 = closest focus, see AD5823_ACTUATOR_RANGE). The sweep used to stop at
+     * 640, so anything closer than ~40 cm never reached its focus peak and the
+     * preview stayed blurry no matter how well the scan went. Cover the full
+     * travel instead: 17 coarse steps of 64 plus a +/-64 fine pass around the
+     * winner. */
+    const int kPosMin = 0;
+    const int kPosMax = 1023;
+    const int coarseStep = 64;
+    const int fineStep = 8;
     const int settleMs = 60;
 
-    /* ---- Coarse sweep: 140 → 640 ---- */
-    for (int pos = 140; pos <= 640; pos += coarseStep) {
+    /* ---- Coarse sweep: full actuator range ---- */
+    for (int pos = kPosMin; pos <= kPosMax; pos += coarseStep) {
         setFocus(pos);
         usleep(settleMs * 1000);
         int energy = captureForAf();
@@ -1142,9 +1150,9 @@ void CameraPipeline::startAfScan() {
 
     /* ---- Fine sweep around best ---- */
     int fineStart = bestPos - coarseStep;
-    if (fineStart < 140) fineStart = 140;
+    if (fineStart < kPosMin) fineStart = kPosMin;
     int fineEnd = bestPos + coarseStep;
-    if (fineEnd > 640) fineEnd = 640;
+    if (fineEnd > kPosMax) fineEnd = kPosMax;
 
     for (int pos = fineStart; pos <= fineEnd; pos += fineStep) {
         if (pos == bestPos) continue; // already measured
