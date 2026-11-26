@@ -33,7 +33,10 @@ static int exifOrientationTag(int degrees)
         case 90:  return 6;
         case 180: return 3;
         case 270: return 8;
-        default:  return 0;   /* 0 -> tag 1 (normal), nothing to write */
+        /* [2026-11-26] 0 used to mean "write nothing", so landscape stills shipped
+         * without any Orientation tag at all and strict EXIF parsers reported an
+         * invalid/missing value. 0 degrees clockwise is EXIF tag 1 ("normal"). */
+        default:  return 1;
     }
 }
 

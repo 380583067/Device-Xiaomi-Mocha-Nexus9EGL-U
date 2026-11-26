@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <thread>
+#include <atomic>
 
 
 
@@ -83,7 +85,11 @@ public:
     int setFocus(int position);
     int getFocusPosition() const { return mFocusPosition; }
     int getAfState() const { return mAfState; }
-    void startAfScan();
+    /* [2026-11-26 tap-to-focus regions] The sweep may be limited to a window in
+     * pipeline pixels (0/0/0/0 = whole frame). The scan runs on a worker thread:
+     * the old synchronous version froze the preview for the whole 2-3 s sweep on
+     * the process_capture_request() thread, which looked like "tap does nothing". */
+    void startAfScan(int rx = 0, int ry = 0, int rw = 0, int rh = 0);
     void cancelAf();
 
 private:
@@ -95,7 +101,10 @@ private:
     int captureFrameDirect(uint8_t* outputBuffer, uint32_t outputFormat);
     int captureForAf();       // Capture a frame during AF sweep, returns sobel energy
     int sobelEnergy(const uint8_t* rgb, int w, int h) const;
-    int sobelEnergyNw(const uint8_t* rgb, int w, int h) const; // 8px-wide NEON-style (C reference)
+    /* [2026-11-26 tap-to-focus regions] x0/y0/x1/y1 limit the measurement window
+     * (caller clamps; x1<=x0 falls back to the full frame). */
+    int sobelEnergyNw(const uint8_t* rgb, int w, int h,
+                      int x0, int y0, int x1, int y1) const;
 
 private:
     int processBayerToYuv(const uint8_t* bayerData, uint8_t* output, uint32_t outputFormat);
@@ -132,6 +141,15 @@ private:
 
     int mFocusPosition;
     int mAfState;
+
+    /* [2026-11-26 async AF] Worker-thread sweep state. mAfAbort makes an existing
+     * sweep stop early when a new region is requested, the session closes or the
+     * object is destroyed; mAfThreadActive guards join() ownership. */
+    void afScanLoop();
+    std::thread mAfThread;
+    std::atomic<bool> mAfThreadActive{false};
+    std::atomic<bool> mAfAbort{false};
+    int mAfRegX, mAfRegY, mAfRegW, mAfRegH;
 };
 
 } // namespace mocha

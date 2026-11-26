@@ -183,6 +183,12 @@ struct mocha_camera_device_t {
      * focus, or the app asking again) is noticed even when af_trigger_handled is
      * already true from the session's initial sweep. */
     uint8_t af_last_trigger;
+    /* [2026-11-26 tap-to-focus regions] ANDROID_CONTROL_AF_REGIONS of the latest
+     * request, converted to pipeline pixels (x, y, w, h). All zero = scan the
+     * whole frame. Without this the HAL always swept on the full frame, so the
+     * focus landed wherever contrast happened to be highest (usually the frame
+     * centre) and tapping a near object focused the background instead. */
+    int af_region[4];
 
     /* [2026-11-25 photo orientation] ANDROID_JPEG_ORIENTATION from the latest
      * request, in degrees clockwise. Camera2 leaves the whole rotation job to the
@@ -890,7 +896,12 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
     add_camera_metadata_entry(metadata, ANDROID_LENS_INFO_AVAILABLE_FILTER_DENSITIES, filter_densities, sizeof(filter_densities)/sizeof(float));
 
     // Max 3A regions
-    int32_t max_3a_regions[] = { 1, 1, 0 };  // AE, AWB, AF
+    /* [2026-11-26 tap-to-focus regions] AF used to be 0, which told apps (OpenCamera
+     * included) that AF metering regions were unsupported: they kept sending an empty
+     * AF_REGIONS ([0,0,0,0,w=0]) and tap-to-focus could only sweep the whole frame,
+     * locking onto whatever had the most contrast - usually the background. The HAL
+     * parses the region now, so declare it. */
+    int32_t max_3a_regions[] = { 1, 1, 1 };  // AE, AWB, AF
     add_camera_metadata_entry(metadata, ANDROID_CONTROL_MAX_REGIONS, max_3a_regions, sizeof(max_3a_regions)/sizeof(int32_t));
 
     // Request max num output streams
@@ -1043,6 +1054,8 @@ static int camera_device_init(const hw_module_t *module, hw_device_t **device) {
     dev->af_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
     dev->af_trigger_handled = false;
     dev->af_last_trigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
+    dev->af_region[0] = dev->af_region[1] = 0;
+    dev->af_region[2] = dev->af_region[3] = 0;
     dev->jpeg_orientation = 0;
     dev->jpeg_orientation_set = false;
 
@@ -1299,6 +1312,40 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
      * by kMaxArea. A 4:3 preview (1440x1080) is therefore captured at 1440x1080: the
      * sensor already delivers a centred 1:1 crop, so the output side need not rescale,
      * which saves one large rescale and looks sharper. */
+    /* [2026-11-26 preview smoothness] A preview-only session (a single RGBA stream,
+     * no encoder, no BLOB) used to pin the pipeline to the preview size. At 1080p the
+     * CPU ISP (demosaic + WB/gamma + RGBA) only managed ~14 fps and the viewfinder
+     * stuttered. Cap preview-only sessions at 720p: the surface is upscaled by the
+     * existing nearest-neighbour write path, stills still switch to their own 8 MP
+     * pipeline for the shot, and recording keeps the encoder-stream size because the
+     * encoder stream is never a "preview-only" stream. */
+    {
+        uint32_t rgbaOutStreams = 0;
+        bool hasEncoder = false;
+        for (uint32_t i = 0; i < config->num_streams; i++) {
+            const camera3_stream_t* s = config->streams[i];
+            if (!s || s->stream_type != CAMERA3_STREAM_OUTPUT) continue;
+            /* isEncoderStream() cannot be used here: gEncoderStreams is filled
+             * later in this function, and this check runs before that. The
+             * framework marks the encoder input with a usage bit instead.
+             * A BLOB stream does NOT count as a reason to stay big: photo apps
+             * configure preview + BLOB for their whole session, but stills
+             * switch to their own pipeline anyway (hasBlobStream branch), so
+             * the BLOB must not keep the idle preview at 1080p. */
+            if ((s->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) != 0) {
+                hasEncoder = true;
+                break;
+            }
+            if (s->format == HAL_PIXEL_FORMAT_BLOB) continue;
+            if (s->format == HAL_PIXEL_FORMAT_RGBA_8888 ||
+                s->format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED)
+                rgbaOutStreams++;
+        }
+        if (!hasEncoder && rgbaOutStreams >= 1 && pipeW * pipeH > 1280u * 720u) {
+            pipeW = 1280; pipeH = 720;
+            ALOGI("preview capture capped to 720p for smoothness (still/encoder sessions unaffected)");
+        }
+    }
     /* [2026-11-22] Debug aid: persist.mocha.cam.pipew/pipeh pin the capture size so a
      * sensor mode can be validated for stable frames without a rebuild. */
     {
@@ -1623,6 +1670,18 @@ static camera_metadata_t* build_result_metadata(uint32_t frameNumber, int64_t ti
     /* ANDROID_CONTROL_AF_TRIGGER */
     uint8_t resultAfTrigger = ANDROID_CONTROL_AF_TRIGGER_IDLE;
     add_camera_metadata_entry(metadata, ANDROID_CONTROL_AF_TRIGGER, &resultAfTrigger, 1);
+
+    /* [2026-11-26 async AF] Report the sweep state machine (0=INACTIVE, 1=MOVING,
+     * 4=FOCUSED_LOCKED). The framework and apps like OpenCamera wait for
+     * FOCUSED_LOCKED before showing the focus confirmation; without this entry
+     * AF_STATE was missing from results entirely, so a tap-to-focus never looked
+     * "done" even though the lens had locked. */
+    uint8_t afStateVal = (afState == 1) ? (uint8_t)ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN
+                       : (afState == 4) ? (uint8_t)ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED
+                       : (afState == 2) ? (uint8_t)ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED
+                       : (afState == 3) ? (uint8_t)ANDROID_CONTROL_AF_STATE_PASSIVE_UNFOCUSED
+                       : (uint8_t)ANDROID_CONTROL_AF_STATE_INACTIVE;
+    add_camera_metadata_entry(metadata, ANDROID_CONTROL_AF_STATE, &afStateVal, 1);
 
     /* ANDROID_REQUEST_ID */
     int32_t requestId = (int32_t)frameNumber;
@@ -2179,6 +2238,60 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
             p->setCrop(px, py, pw2, ph2);
             gAppliedCrop[0] = cx; gAppliedCrop[1] = cy;
             gAppliedCrop[2] = cw; gAppliedCrop[3] = ch;
+
+            /* [2026-11-26 tap-to-focus regions] ANDROID_CONTROL_AF_REGIONS packs
+             * 5 int32 per region (x0, y0, x1, y2, weight) in ACTIVE ARRAY pixels.
+             * Take the first region with a non-zero weight and map it onto the
+             * pipeline frame the same way the crop is mapped. Apps that never
+             * set regions simply leave af_region at zero = full-frame sweep. */
+            if (find_camera_metadata_entry(mutableSettings, ANDROID_CONTROL_AF_REGIONS, &entry) == 0 &&
+                entry.count >= 5) {
+                /* Diagnostic: dump the region every time it changes, so a
+                 * "region ignored" report can be triaged from logcat alone. */
+                static int sAfRegionsLast[4] = {-1, -1, -1, -1};
+                if (entry.count >= 5 &&
+                    (sAfRegionsLast[0] != entry.data.i32[0] ||
+                     sAfRegionsLast[1] != entry.data.i32[1] ||
+                     sAfRegionsLast[2] != entry.data.i32[2] ||
+                     sAfRegionsLast[3] != entry.data.i32[3])) {
+                    sAfRegionsLast[0] = entry.data.i32[0];
+                    sAfRegionsLast[1] = entry.data.i32[1];
+                    sAfRegionsLast[2] = entry.data.i32[2];
+                    sAfRegionsLast[3] = entry.data.i32[3];
+                    ALOGI("AF_REGIONS raw: count=%u first=[%d,%d -> %d,%d w=%d]",
+                          entry.count, entry.data.i32[0], entry.data.i32[1],
+                          entry.data.i32[2], entry.data.i32[3], entry.data.i32[4]);
+                }
+                bool haveRegion = false;
+                for (uint32_t i = 0; i + 4 < entry.count; i += 5) {
+                    if (entry.data.i32[i + 4] <= 0) continue;
+                    int ax0 = entry.data.i32[i],     ay0 = entry.data.i32[i + 1];
+                    int ax1 = entry.data.i32[i + 2], ay1 = entry.data.i32[i + 3];
+                    if (ax1 <= ax0 || ay1 <= ay0) continue;
+                    if (ax0 < 0) ax0 = 0;
+                    if (ay0 < 0) ay0 = 0;
+                    if (ax1 > actW) ax1 = actW;
+                    if (ay1 > actH) ay1 = actH;
+                    if (ax1 - ax0 < 16 || ay1 - ay0 < 16) continue;
+                    int rx = (int)((int64_t)ax0 * dev->pipeline_width / actW);
+                    int ry = (int)((int64_t)ay0 * dev->pipeline_height / actH);
+                    int rw = (int)((int64_t)(ax1 - ax0) * dev->pipeline_width / actW);
+                    int rh = (int)((int64_t)(ay1 - ay0) * dev->pipeline_height / actH);
+                    dev->af_region[0] = rx;
+                    dev->af_region[1] = ry;
+                    dev->af_region[2] = rw;
+                    dev->af_region[3] = rh;
+                    haveRegion = true;
+                    break;
+                }
+                if (!haveRegion) {
+                    dev->af_region[0] = dev->af_region[1] = 0;
+                    dev->af_region[2] = dev->af_region[3] = 0;
+                }
+            } else {
+                dev->af_region[0] = dev->af_region[1] = 0;
+                dev->af_region[2] = dev->af_region[3] = 0;
+            }
         }
     }
 
@@ -2195,8 +2308,11 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 dev->af_last_trigger != ANDROID_CONTROL_AF_TRIGGER_START) {
                 /* A tap-to-focus (or the app re-requesting) must always be honoured, not
                  * only before the session's first sweep. */
-                ALOGI("AF TRIGGER START received");
-                p->startAfScan();
+                ALOGI("AF TRIGGER START received, region=[%d,%d %dx%d]",
+                      dev->af_region[0], dev->af_region[1],
+                      dev->af_region[2], dev->af_region[3]);
+                p->startAfScan(dev->af_region[0], dev->af_region[1],
+                               dev->af_region[2], dev->af_region[3]);
                 dev->af_trigger_handled = true;
             } else if ((dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE ||
                         dev->af_mode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO) &&
@@ -2216,7 +2332,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                  * like CONTINUOUS_PICTURE: one sweep per session, plus any tap-to-focus
                  * the app sends as AF_TRIGGER_START. */
                 ALOGI("AF: continuous mode (picture/video), running initial scan");
-                p->startAfScan();
+                p->startAfScan(dev->af_region[0], dev->af_region[1],
+                               dev->af_region[2], dev->af_region[3]);
                 dev->af_trigger_handled = true;
             } else if (dev->af_trigger == ANDROID_CONTROL_AF_TRIGGER_CANCEL) {
                 ALOGI("AF TRIGGER CANCEL received");
@@ -2384,14 +2501,9 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         }
         /* [2026-11-22] Right after a sensor mode switch AE/AWB reconverge from
          * defaults and capturing immediately gives a dark, green-tinted frame (measured
-         * at 8 MP). Drop a few frames for 3A before capturing. */
-        if (restoreW && dev->temp_rgba) {
-            for (int warm = 0; warm < 5; warm++)
-                (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
-        }
-        /* [2026-11-22] Right after a sensor mode switch AE/AWB reconverge from
-         * defaults and capturing immediately gives a dark, green-tinted frame (measured
-         * at 8 MP). Drop a few frames for 3A before capturing. */
+         * at 8 MP). Drop a few frames for 3A before capturing.
+         * [2026-11-26] This block used to be duplicated: ten full-size warm-up frames
+         * per shot instead of five, adding roughly a second of shutter lag. */
         if (restoreW && dev->temp_rgba) {
             for (int warm = 0; warm < 5; warm++)
                 (void)pipeline->captureFrameRgba(dev->temp_rgba, pipeW, pipeH);
@@ -2577,15 +2689,34 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
         } else {
             /* Preview (RGBA/IMPLEMENTATION_DEFINED): capture into a packed buffer first, then
              * write it out row by row using the surface's real stride (see the
-             * writeRgbaToSurface comment). */
+             * writeRgbaToSurface comment).
+             * [2026-11-26 preview smoothness] Preview-only sessions run the pipeline at
+             * 720p even when the surface is 1080p. Capture at the pipeline size and let
+             * writeRgbaToSurface() upscale with its nearest-neighbour path; the
+             * stride==width fast path still applies whenever the sizes match. */
             const uint32_t w = buf.stream->width, h = buf.stream->height;
-            const uint32_t need = w * h * 4;
-            if (!dev->temp_rgba || dev->temp_rgba_size < need) {
-                if (dev->temp_rgba) free(dev->temp_rgba);
-                dev->temp_rgba = (uint8_t*)malloc(need);
-                dev->temp_rgba_size = need;
+            const uint32_t pw = dev->pipeline_width, ph = dev->pipeline_height;
+            if (pw != w || ph != h) {
+                const uint32_t need = pw * ph * 4;
+                if (!dev->temp_rgba || dev->temp_rgba_size < need) {
+                    if (dev->temp_rgba) free(dev->temp_rgba);
+                    dev->temp_rgba = (uint8_t*)malloc(need);
+                    dev->temp_rgba_size = need;
+                }
+                if (dev->temp_rgba) {
+                    int captureRet = pipeline->captureFrameRgba(dev->temp_rgba, pw, ph);
+                    if (captureRet == 0) {
+                        frameCaptured = writeRgbaToSurface(dev, buf, dev->temp_rgba,
+                                                           pw, ph, nullptr);
+                    } else {
+                        ALOGW("preview: pipeline capture failed %d", captureRet);
+                    }
+                } else {
+                    ALOGE("preview: no scratch buffer for %ux%u", pw, ph);
+                }
+            } else {
+                frameCaptured = writeRgbaToSurface(dev, buf, nullptr, w, h, pipeline);
             }
-            frameCaptured = writeRgbaToSurface(dev, buf, nullptr, w, h, pipeline);
         }
 
         // Fan the captured frame out to every other output stream (preview + video).

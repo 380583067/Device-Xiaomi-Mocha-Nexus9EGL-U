@@ -36,7 +36,8 @@ CameraPipeline::CameraPipeline()
       mHasAwbInit(false),
       mLastGamma(0.0f),
       mFocusPosition(0),
-      mAfState(0) {
+      mAfState(0),
+      mAfRegX(0), mAfRegY(0), mAfRegW(0), mAfRegH(0) {
     for (int i = 0; i < 4; i++) {
         mBuffers[i].start = nullptr;
         mBuffers[i].length = 0;
@@ -96,6 +97,19 @@ int CameraPipeline::open(int cameraId) {
 
 int CameraPipeline::close() {
     stopStreaming();
+
+    /* [2026-11-26 async AF] A sweep may still be running on its worker thread and
+     * about to touch mBuffers / mFd that close() is tearing down. Ask it to stop
+     * and wait before freeing anything it can reach.
+     * [2026-11-26 crash fix] Always gate on joinable(), never on the active
+     * flag: the thread clears the flag slightly before it is actually reaped,
+     * and assigning a new std::thread to a still-joinable object calls
+     * std::terminate() (measured: second tap-to-focus crashed cameraserver). */
+    if (mAfThread.joinable()) {
+        mAfAbort = true;
+        mAfThread.join();
+    }
+    mAfThreadActive = false;
 
     for (int i = 0; i < mBufferCount; i++) {
         if (mBuffers[i].start && mBuffers[i].allocated) {
@@ -1013,17 +1027,21 @@ int CameraPipeline::sobelEnergy(const uint8_t* rgb, int w, int h) const {
  * 8-pixel-wide horizontal sobel using green channel.
  * Processes 8 adjacent output pixels at a time, summing partial gradients.
  * Same algorithm as sobelEnergy() but loop-unrolled for 8x regions.
+ * [2026-11-26 tap-to-focus regions] x0/y0/x1/y1 limit the measurement window
+ * (caller clamps them; full frame = 1/1/w-1/h-1).
  */
-int CameraPipeline::sobelEnergyNw(const uint8_t* rgb, int w, int h) const {
+int CameraPipeline::sobelEnergyNw(const uint8_t* rgb, int w, int h,
+                                  int x0, int y0, int x1, int y1) const {
     if (!rgb || w < 3 || h < 3) return 0;
+    if (x1 <= x0 || y1 <= y0) { x0 = 1; y0 = 1; x1 = w - 1; y1 = h - 1; }
     int total = 0;
     int stride = w * 3;
-    int x = 1;
+    int x;
     /* Process 8-wide chunks */
-    for (int y = 1; y < h - 1; y++) {
+    for (int y = y0; y < y1; y++) {
         const uint8_t* row = rgb + y * stride;
-        x = 1;
-        while (x + 8 < w - 1) {
+        x = x0;
+        while (x + 8 < x1) {
             int g0 = abs((int)row[(x+1)*3+1] - (int)row[(x-1)*3+1]);
             int g1 = abs((int)row[(x+2)*3+1] - (int)row[(x+0)*3+1]);
             int g2 = abs((int)row[(x+3)*3+1] - (int)row[(x+1)*3+1]);
@@ -1036,7 +1054,7 @@ int CameraPipeline::sobelEnergyNw(const uint8_t* rgb, int w, int h) const {
             x += 8;
         }
         /* Remainder */
-        for (; x < w - 1; x++) {
+        for (; x < x1; x++) {
             total += abs((int)row[(x+1)*3+1] - (int)row[(x-1)*3+1]);
         }
     }
@@ -1074,30 +1092,29 @@ int CameraPipeline::captureForAf() {
     if (mConfig.enableISP && mDemosaic && mColorConv) {
         /* Demosaic to mRgbBuffer */
         mDemosaic->process(frameBuffer, mRgbBuffer);
-        /* Apply AE — doAutoExposure reads green from mRgbBuffer */
-        if (mConfig.enableAE)
-            doAutoExposure(mRgbBuffer);
-        /* Apply AWB gains in-place */
-        if (mConfig.enableAWB) {
-            doAutoWhiteBalance(mRgbBuffer);
-        }
-        float rG = mConfig.enableAWB ? mAwbGains[0] : mConfig.wbGain[0];
-        float gG = mConfig.enableAWB ? mAwbGains[1] : mConfig.wbGain[1];
-        float bG = mConfig.enableAWB ? mAwbGains[2] : mConfig.wbGain[2];
-        int total = mConfig.width * mConfig.height;
-        for (int i = 0; i < total; i++) {
-            int off = i * 3;
-            int r = (int)(mRgbBuffer[off]   * rG);
-            int g = (int)(mRgbBuffer[off+1] * gG);
-            int b = (int)(mRgbBuffer[off+2] * bG);
-            mRgbBuffer[off]   = r > 255 ? 255 : (uint8_t)r;
-            mRgbBuffer[off+1] = g > 255 ? 255 : (uint8_t)g;
-            mRgbBuffer[off+2] = b > 255 ? 255 : (uint8_t)b;
-        }
-        applyGamma(mRgbBuffer, mConfig.width, mConfig.height, mConfig.gamma);
 
-        /* Measure Sobel energy on the green channel */
-        energy = sobelEnergyNw(mRgbBuffer, mConfig.width, mConfig.height);
+        /* [2026-11-26 async AF] The sweep no longer runs AE/AWB/gamma per step:
+         *  - AE keeps moving exposure/gain between sweep positions, which skews
+         *    the energy curve (darker frame = smaller gradient = fake peak);
+         *  - AWB and gamma are pure colour/curve ops, the Sobel energy only
+         *    depends on the green-channel gradient;
+         *  - skipping them cuts per-step cost so the whole sweep finishes in a
+         *    fraction of the old time. The AE the main loop runs keeps the
+         *    exposure where the preview converged, which is what the sweep
+         *    measures under. */
+        /* Measure Sobel energy on the green channel, limited to the AF region
+         * when a tap-to-focus window is set (0/0/0/0 = whole frame). */
+        int x0 = mAfRegX, y0 = mAfRegY;
+        int x1 = x0 + mAfRegW, y1 = y0 + mAfRegH;
+        if (x0 <= 0 && y0 <= 0 && mAfRegW <= 0 && mAfRegH <= 0) {
+            x0 = 1; y0 = 1; x1 = mConfig.width - 1; y1 = mConfig.height - 1;
+        }
+        if (x0 < 1) x0 = 1;
+        if (y0 < 1) y0 = 1;
+        if (x1 > mConfig.width - 1) x1 = mConfig.width - 1;
+        if (y1 > mConfig.height - 1) y1 = mConfig.height - 1;
+        if (x1 - x0 < 8 || y1 - y0 < 8) { x0 = 1; y0 = 1; x1 = mConfig.width - 1; y1 = mConfig.height - 1; }
+        energy = sobelEnergyNw(mRgbBuffer, mConfig.width, mConfig.height, x0, y0, x1, y1);
     }
 
     /* Return buffer to queue */
@@ -1108,16 +1125,46 @@ int CameraPipeline::captureForAf() {
     return energy;
 }
 
-void CameraPipeline::startAfScan() {
+void CameraPipeline::startAfScan(int rx, int ry, int rw, int rh) {
     if (mState != PIPELINE_STREAMING) {
         ALOGW("AF: cannot scan, not streaming");
         mAfState = 0;
         return;
     }
 
-    mAfState = 1; // MOVING
-    ALOGI("AF: starting contrast-detection scan");
+    /* [2026-11-26 async AF] A tap-to-focus while a sweep is running must restart
+     * with the new region: stop the old thread first, then launch a fresh one.
+     * startAfScan() stays non-blocking - the old synchronous version froze the
+     * preview for the whole sweep because it ran on the request thread.
+     * Gate on joinable(), not the active flag (see close(): the thread clears
+     * the flag just before it is reaped, and re-assigning a joinable
+     * std::thread is std::terminate()). */
+    if (mAfThread.joinable()) {
+        mAfAbort = true;
+        mAfThread.join();
+    }
+    mAfThreadActive = false;
 
+    /* Clamp the region to the pipeline frame; 0/0/0/0 or a degenerate window
+     * scans the whole frame. */
+    if (rw <= 0 || rh <= 0 || rx < 0 || ry < 0 ||
+        rx + rw > mConfig.width || ry + rh > mConfig.height ||
+        rw < 16 || rh < 16) {
+        rx = 0; ry = 0; rw = 0; rh = 0;
+    }
+    mAfRegX = rx; mAfRegY = ry; mAfRegW = rw; mAfRegH = rh;
+
+    mAfAbort = false;
+    mAfState = 1; // MOVING
+    if (rw && rh)
+        ALOGI("AF: starting contrast scan on region %dx%d@(%d,%d)", rw, rh, rx, ry);
+    else
+        ALOGI("AF: starting contrast-detection scan (full frame)");
+    mAfThreadActive = true;
+    mAfThread = std::thread(&CameraPipeline::afScanLoop, this);
+}
+
+void CameraPipeline::afScanLoop() {
     int bestEnergy = 0;
     int bestPos = 400;
     /* [2026-11-25 AF range] The AD5823 actuator has 1024 positions (0 = infinity,
@@ -1133,9 +1180,10 @@ void CameraPipeline::startAfScan() {
     const int settleMs = 60;
 
     /* ---- Coarse sweep: full actuator range ---- */
-    for (int pos = kPosMin; pos <= kPosMax; pos += coarseStep) {
+    for (int pos = kPosMin; pos <= kPosMax && !mAfAbort.load(); pos += coarseStep) {
         setFocus(pos);
         usleep(settleMs * 1000);
+        if (mState != PIPELINE_STREAMING) { mAfState = 0; mAfThreadActive = false; return; }
         int energy = captureForAf();
         if (energy < 0) {
             ALOGW("AF: capture error at pos %d: %d", pos, energy);
@@ -1154,10 +1202,11 @@ void CameraPipeline::startAfScan() {
     int fineEnd = bestPos + coarseStep;
     if (fineEnd > kPosMax) fineEnd = kPosMax;
 
-    for (int pos = fineStart; pos <= fineEnd; pos += fineStep) {
+    for (int pos = fineStart; pos <= fineEnd && !mAfAbort.load(); pos += fineStep) {
         if (pos == bestPos) continue; // already measured
         setFocus(pos);
         usleep(settleMs * 1000);
+        if (mState != PIPELINE_STREAMING) { mAfState = 0; mAfThreadActive = false; return; }
         int energy = captureForAf();
         if (energy < 0) continue;
         ALOGI("AF: fine pos=%d energy=%d", pos, energy);
@@ -1167,17 +1216,38 @@ void CameraPipeline::startAfScan() {
         }
     }
 
+    if (mAfAbort.load()) {
+        ALOGI("AF: sweep aborted");
+        mAfThreadActive = false;
+        return;
+    }
+
     /* ---- Lock to best position ---- */
     setFocus(bestPos);
     usleep(settleMs * 1000);
     mAfState = 4; // FOCUSED_LOCKED
-    ALOGI("AF: scan complete, lock at position=%d energy=%d", bestPos, bestEnergy);
+    if (mAfRegW && mAfRegH)
+        ALOGI("AF: scan complete (region %dx%d@(%d,%d)), lock at position=%d energy=%d",
+              mAfRegW, mAfRegH, mAfRegX, mAfRegY, bestPos, bestEnergy);
+    else
+        ALOGI("AF: scan complete, lock at position=%d energy=%d", bestPos, bestEnergy);
+    mAfThreadActive = false;
 }
 
 void CameraPipeline::cancelAf() {
-    setFocus(0);
+    /* [2026-11-26 async AF] Stop the worker sweep, but do NOT move the lens back
+     * to infinity: apps that tap-to-focus send AF_TRIGGER_CANCEL right before
+     * AF_TRIGGER_START (to abort any running scan), and parking the lens at 0 in
+     * between made every tap start its scan from the far end, which looked slow
+     * and wrong. Leaving the lens where it is costs nothing and the fresh sweep
+     * re-positions it within one step. */
+    if (mAfThread.joinable()) {
+        mAfAbort = true;
+        mAfThread.join();
+    }
+    mAfThreadActive = false;
     mAfState = 0; // INACTIVE
-    ALOGI("AF: cancelled, focus at infinity");
+    ALOGI("AF: scan cancelled, lens left in place");
 }
 
 } // namespace mocha
