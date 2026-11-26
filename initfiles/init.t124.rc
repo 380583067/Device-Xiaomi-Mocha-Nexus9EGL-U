@@ -233,3 +233,13 @@ on property:sys.boot_completed=1
 # gone by the time the HAL runs. The restorecon above is what actually keeps
 # the label correct, and it runs after the HAL has had its turn.
 
+
+# [HongGuo crash fix 2026-11-26] tmpfs over the cache directory of GL-heavy
+# apps: the NVIDIA GL driver JITs shaders into a cache file it unlinks
+# immediately, and the kernel drops those unrecoverable clean file-backed
+# pages under memory pressure - which is what killed every short-video app
+# (SIGSEGV SEGV_ACCERR in TRThread_0 / libglcore). On a tmpfs the same pages
+# are shmem: reclaim swaps them into zram instead, so the driver's pointers
+# stay valid. See mocha_app_cache_tmpfs.sh for the full analysis.
+on property:sys.boot_completed=1
+    exec_background - root root -- /system/bin/sh /system/bin/mocha_app_cache_tmpfs.sh
