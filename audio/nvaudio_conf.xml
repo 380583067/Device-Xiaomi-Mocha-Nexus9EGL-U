@@ -244,25 +244,19 @@
       </device>
       <device name="fm-tx">
         <path name="on">
-          <!-- [FM volume fix 2026-11-26] DAC1 <- IF4 only. The old route also
-               opened Stereo DAC MIX DAC L1/R1 + Mono DAC MIX DAC L1/R1, which
-               played FM directly through the codec at fixed volume alongside
-               the framework software bridge (and its "Stereo DAC" loopback fed
-               the direct feed back into itself) - the volume keys had no
-               effect. The output switches are intentionally left off here;
-               audio_hw.c's fm_set_codec_route() borrows DAC1 back to the CPU
-               via RxDP/DSP DL -> TxDC_DAC -> IF1 instead. -->
           <ctl name="DAC1 L Mux" val="IF4 DAC"/>
           <ctl name="DAC1 R Mux" val="IF4 DAC"/>
           <ctl name="DA STO ASRC Switch" val="clk_sysy_div_out"/>
           <ctl name="DAC1 MIXL DAC1 Switch" val="1"/>
           <ctl name="DAC1 MIXR DAC1 Switch" val="1"/>
+          <ctl name="Stereo DAC MIXL DAC L1 Switch" val="1"/>
+          <ctl name="Stereo DAC MIXR DAC R1 Switch" val="1"/>
+          <ctl name="Mono DAC MIXL DAC L1 Switch" val="1"/>
+          <ctl name="Mono DAC MIXR DAC R1 Switch" val="1"/>
           <ctl name="FM Switch" val="1"/>
         </path>
         <path name="off">
           <ctl name="FM Switch" val="0"/>
-          <ctl name="Stereo DAC MIXL DAC L1 Switch" val="0"/>
-          <ctl name="Stereo DAC MIXR DAC R1 Switch" val="0"/>
         </path>
       </device>
     </playback>
@@ -394,15 +388,7 @@
       </device>
       <device name="fm-rx">
         <path name="on">
-          <!-- [FM volume fix 2026-11-26] Borrow DAC1 (the FM data, muxed from
-               IF4) back up I2S1 digitally: IF1 ADC Mux = TxDC_DAC, with
-               audio_hw.c setting RxDP Mux = DAC1 + DSP DL Mux = DSP. The old
-               ADC 1_2 = "Stereo DAC" analogue loopback read the mixed output
-               (FM + media) and caused a feedback loop with the framework
-               software bridge. These analogue ADC switches stay configured
-               for the normal mic path but IF1_ADC1 is not selected while the
-               TxDC_DAC borrow is active. -->
-          <ctl name="IF1 ADC Mux" val="TxDC_DAC"/>
+          <ctl name="IF1 ADC Mux" val="IF1_ADC1"/>
           <ctl name="IF1 ADC1 IN2 Mux" val="IF1_ADC1_IN1"/>
           <ctl name="IF1 ADC1 IN1 Mux" val="IF_ADC1"/>
           <ctl name="DRC Switch" val="Disable"/>
