@@ -449,6 +449,26 @@ static uint32_t fm_out_devices = 0;    /* last media output routing seen */
  */
 static int fm_volume = 255;
 
+/*
+ * [FM speaker fix 2026-11-26, v2] Output override for the FM route, set by the
+ * FMRadio app through "fm_route=speaker|headset|auto" (adev_set_parameters).
+ *
+ * Without it the route follows fm_out_devices, the media output mask the HAL
+ * sees from AudioPolicyManager. On Android 14 that is unreliable for FM: the
+ * FMRadio app forces the output with AudioSystem.setForceUse(FOR_MEDIA,
+ * FORCE_SPEAKER), but MediaRouter's route restoration pulls the USAGE_MEDIA
+ * stream back to WIRED_HEADPHONE (observed: AudioFlinger "Output devices: 0x8
+ * AUDIO_DEVICE_OUT_WIRED_HEADPHONE" with the speaker selected; the HAL device
+ * events flip-flopped direct_analog and the speaker was audible for ~1 s only).
+ *
+ * The app therefore names the desired output directly; 0 means "auto" and
+ * keeps the legacy fm_out_devices behaviour.
+ */
+#define FM_ROUTE_AUTO    0
+#define FM_ROUTE_SPEAKER 1
+#define FM_ROUTE_HEADSET 2
+static int fm_route_override = FM_ROUTE_AUTO;
+
 /* forward declaration: out_set_parameters re-runs the FM route on routing changes */
 static void fm_set_codec_route(bool enable);
 
@@ -2568,9 +2588,17 @@ static void fm_set_codec_route(bool enable)
         /* Headphone takes the direct analogue feed (DAC1 -> HPO MIX DAC1,
          * switch managed by apply_route()); the speaker takes the app's
          * replay via its normal DAC2 route. On any other/unknown routing,
-         * fall back to the direct analogue mixes for both outputs. */
-        direct_analog = (fm_out_devices == 0) ||
-                        !(fm_out_devices & AUDIO_DEVICE_OUT_SPEAKER);
+         * fall back to the direct analogue mixes for both outputs.
+         * [FM speaker fix 2026-11-26] fm_route_override from the app wins
+         * over the (unreliable on A14) fm_out_devices mask; see the comment
+         * at fm_route_override. */
+        if (fm_route_override == FM_ROUTE_SPEAKER)
+            direct_analog = false;
+        else if (fm_route_override == FM_ROUTE_HEADSET)
+            direct_analog = true;
+        else
+            direct_analog = (fm_out_devices == 0) ||
+                            !(fm_out_devices & AUDIO_DEVICE_OUT_SPEAKER);
 
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
         if (ctl)
@@ -3025,6 +3053,26 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
             fm_volume = vol;
             if (fm_route_active)
                 fm_set_codec_route(true);
+            pthread_mutex_unlock(&adev->lock);
+        }
+
+        /* [FM speaker fix 2026-11-26, v2] The app names the FM output
+         * directly ("fm_route=speaker|headset|auto"); see fm_route_override
+         * for why the A14 media routing cannot be trusted for this. */
+        if (str_parms_get_str(parms, "fm_route", value, sizeof(value)) >= 0
+                && *value) {
+            int route = FM_ROUTE_AUTO;
+            if (strcmp(value, "speaker") == 0)
+                route = FM_ROUTE_SPEAKER;
+            else if (strcmp(value, "headset") == 0)
+                route = FM_ROUTE_HEADSET;
+            pthread_mutex_lock(&adev->lock);
+            if (route != fm_route_override) {
+                ALOGI("adev_set_parameters: fm_route=%s", value);
+                fm_route_override = route;
+                if (fm_route_active)
+                    fm_set_codec_route(true);
+            }
             pthread_mutex_unlock(&adev->lock);
         }
 
