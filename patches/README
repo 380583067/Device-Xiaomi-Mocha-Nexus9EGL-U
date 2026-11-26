@@ -23,9 +23,7 @@ Categories
 The directory layout is dictated by where a patch applies, so the functional
 grouping lives in `patches/categories` instead:
 
-  camera   hardware/interfaces/0001, frameworks/av/0005 (camera fences)
-  media    frameworks/av (decoding, ACodec, OMX encoder)
-  display  frameworks/native (binder interfaces, SurfaceFlinger)
+  camera   hardware/interfaces/0001 (camera fences)
   wifi     hardware/broadcom/wlan, packages/modules/{Wifi,Connectivity}
   system   frameworks/base, lineage-sdk, packages/apps, packages/modules,
            packages/services
@@ -34,9 +32,12 @@ grouping lives in `patches/categories` instead:
   build    build/make, system/core, system/sepolicy, prebuilts/gcc,
            vendor/lineage
 
-A full patch path in that file overrides the project prefix, which is how the
-cameraservice fence fix stays in `camera` even though it applies to
-`frameworks/av`. List the series with its grouping at any time:
+Frameworks/av and frameworks/native changes are NOT in this series any more:
+both projects are personal forks (see "Source tree dependencies" below) whose
+lineage-21.0-mocha branches carry the commits directly. A full patch path in
+`categories` overrides the project prefix for patches that share a project
+across categories (used for the two hardware/interfaces patches). List the
+series with its grouping at any time:
 
   patches/check.sh --list
 
@@ -53,7 +54,7 @@ Scripts
 All three take the same arguments and locate the Android root relative to their
 own path, so they can be run from anywhere:
 
-  --only <repo path>   one source project, e.g. --only frameworks/av
+  --only <repo path>   one source project, e.g. --only hardware/interfaces
   --category <name>    one category, e.g. --category camera
   --list               print the series grouped by category and exit
 
@@ -62,7 +63,6 @@ own path, so they can be run from anywhere:
 category invalidates, so a run tells you what to rebuild:
 
   camera   m -j22 camera.tegra
-  media    m -j22 libstagefright libstagefright_omx
   power    m -j22 charger android.hardware.health@2.1-service
   build    m -j16 otapackage
 
@@ -89,17 +89,22 @@ because that organisation is read-only for this account
 
   frameworks/av      -> 380583067/android_frameworks_av      lineage-21.0-mocha
   frameworks/native  -> 380583067/android_frameworks_native  lineage-21.0-mocha
+  packages/apps/FMRadio
+                     -> 380583067/android_packages_apps_FMRadio
+                                                        lineage-21.0-test
 
-Those branches contain exactly the patches below for the corresponding project:
+The av/native branches carry the former media/display/camera patch content as
+real commits (plus frameworks/av 3bfe7793eb, the NvMM-era display/decode
+compat for the legacy tegra stack, which never had a patch). The FMRadio fork
+currently matches upstream (the FM volume experiment was reverted); it is
+pinned so future app-side changes survive a repo sync.
 
-  frameworks/av      0001-0005
-  frameworks/native  0001
-
-If the manifest is switched back to `LineageOSUL/android_frameworks_{av,native}`
-at `lineage-21.0`, run `install.sh` after `repo sync` and the tree ends up in the
-same state. Keeping both in sync matters: the device tree assumes the changes
-are present either way, and with the forks pinned `install.sh` simply reports
-those patches as already applied.
+Because the av/native patches are gone from this series, `install.sh` no
+longer touches those projects; keep their branches in sync when adding new
+changes. If the manifest is ever switched back to
+`LineageOSUL/android_frameworks_{av,native}` at `lineage-21.0`, the media,
+display and cameraservice-fence changes must be re-added as patches here
+(their content is in the fork commits listed above).
 
 `build/make` is a third dependency that is not a fork: it is a shallow clone in
 detached HEAD, so its two patches cannot be committed there. They live here and
@@ -109,35 +114,12 @@ even though nothing is pushed anywhere for it.
 What the patches are for
 ------------------------
 
-camera (hardware/interfaces, frameworks/av/0005)
+camera (hardware/interfaces)
   0001  hwc2on1adapter: release the acquire fence handles it leaks on every
         passthrough camera buffer, otherwise cameraserver runs out of fds
-        (frameworks/av/0005 does the same on the cameraservice side)
-  0005  cameraservice: close acquire fence handles in the passthrough path
-
-media (frameworks/av)
-  0002  Codec2: make c2.android.* software video decode work on the legacy
-        Tegra gralloc0 (this is what makes any c2.android.* software video
-        decode possible, whatever `debug.stagefright.ccodec` is set to):
-        - add GRALLOC_USAGE_HW_TEXTURE only for CPU_WRITE + YUV allocations,
-          so SurfaceFlinger can sample the decoder output while BLOB/CSD
-          buffers stay untouched (HW_TEXTURE on those makes gralloc lock()
-          return -ENOSYS and codec start() throws)
-        - fall back to plain lock() when lockYCbCr() is missing, passing only
-          the SW access bits
-        - describe YV12 as planar Y/V/U instead of interleaved UV (the old
-          description swapped red and green on screen)
-  0003  ACodec: resolve empty vendor parameters (upstream LineageOS fix the
-        mocha tree was missing; without it getVendorParameters loops over an
-        empty key list and spams OMX failures)
-  0004  SoftVideoEncoderOMXComponent: lockYCbCr YV12 fallback
-
-display (frameworks/native)
-  0001  three display/binder compatibility changes bundled together:
-        legacy camera HIDL/AIDL interfaces in kDownstreamManualInterfaces,
-        format/size/usage logging when SurfaceFlinger blacks a layer out, and
-        persist.sf.force_gpu_composition (the Tegra HWC blob crashes the
-        composer during surface teardown; a userspace reboot loop follows)
+        (the cameraservice side lives in the frameworks/av fork, commit
+        686dda84e0 "cameraservice: close acquire fence handles in passthrough
+        mode")
 
 power (bootable/recovery)
   0001  charger-mode display fix. minui's fbdev backend flips its double buffer

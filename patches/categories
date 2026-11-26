@@ -10,11 +10,6 @@
 # for selective runs such as: check.sh --category camera
 
 camera    hardware/interfaces
-media     frameworks/av
-# The cameraservice fence fix lives in frameworks/av but belongs to the camera
-# work, so name it explicitly; a full patch path wins over a project prefix.
-camera    frameworks/av/0005-cameraservice-close-acquire-fence-handles-in-passthr.patch
-display   frameworks/native
 wifi      hardware/broadcom/wlan
 wifi      packages/modules/Wifi
 wifi      packages/modules/Connectivity
@@ -32,8 +27,8 @@ build     system/sepolicy
 build     prebuilts/gcc
 build     vendor/lineage
 
-# hwc2on1adapter 释放的是相机 passthrough 缓冲的 acquire fence（与
-# frameworks/av/0005 同一件事的两端），属于相机；health HAL 属于关机充电。
+# hwc2on1adapter 释放的是相机 passthrough 缓冲的 acquire fence（frameworks/av
+# fork 里 cameraservice 提交的另一端），属于相机；health HAL 属于关机充电。
 # 两者同在 hardware/interfaces 项目里，所以用完整补丁路径区分。
 camera    hardware/interfaces/0001-hwc2on1adapter-release-leaked-acquire-fence.patch
 # 关机充电要靠 health HAL 2.1 才能拿到电池数据；本设备非 Treble、没有 vendor
