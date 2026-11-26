@@ -46,3 +46,15 @@ r_dir_file(platform_app, sysfs_zram)
 
 # Access to change user photo using Nvcamera
 allow platform_app system_app_data_file:file { read write getattr};
+
+# SystemUI: NV GL stack writes its shader JIT cache (.gl files) inside its
+# own data dir and maps it with PROT_EXEC. Observed under enforcing:
+# denied { execute } for app_data_file (.gl), crashing SystemUI (black
+# screen). Verified there is no neverallow blocking this.
+allow platform_app app_data_file:file { r_file_perms map execute };
+# /dev/tegra-throughput: RenderThread r/w it every frame.
+allow platform_app tegra_throughput_device:chr_file rw_file_perms;
+
+# [enforcing bring-up 2026-11-26] SystemUI's NV GL stack reads the SoC id
+# (tegra_chip_id) like every other app (see priv_app.te).
+allow platform_app sysfs_tegra_info:file r_file_perms;

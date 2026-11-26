@@ -128,3 +128,14 @@ allow system_server keylayout_data_file:dir search;
 
 # allow system_server to control gpu power knobs
 allow system_server sysfs_gpu_power_knobs:file rw_file_perms;
+# [SELinux fix 2026-11-26] android.hardware.power.stats@1.0-service.mock has no
+# dedicated domain anywhere in plat/vendor policy, so it runs in the init
+# domain; PowerStatsService's binder call into it (and storaged's) was denied.
+allow system_server init:binder call;
+# /dev/tegra-throughput: PowerManagerService r/w it for performance scaling.
+allow system_server tegra_throughput_device:chr_file rw_file_perms;
+
+# [enforcing bring-up 2026-11-26] ConnectivityService's netd requests trigger
+# an implicit netdev-6 kernel module request; there is no module loader on
+# this device, so audit-silence it instead of allowing it.
+dontaudit system_server kernel:system module_request;

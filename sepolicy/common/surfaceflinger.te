@@ -77,3 +77,7 @@ allow surfaceflinger sysfs:dir { search };
 # /dev/nvhost-* and /dev/nvmap nodes use that type. There is no generic `dev`
 # SELinux type, so keep this access on the declared GPU and display node types.
 allow surfaceflinger sysfs:file { read open getattr };
+
+# [enforcing bring-up 2026-11-26] SurfaceFlinger probes /data/local/tmp
+# (shell_data_file) while enumerating vendor GL caches. Pure noise, silence it.
+dontaudit surfaceflinger shell_data_file:dir search;

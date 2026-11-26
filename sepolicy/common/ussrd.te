@@ -29,6 +29,11 @@ allow ussrd ussrd_service:service_manager add;
 
 # /dev/socket/phsd
 allow ussrd phsd_socket:unix_stream_socket rw_stream_socket_perms;
+# The phsd socket is declared in init.ussrd.rc ("socket phsd stream 0666"),
+# so init creates /dev/socket/phsd; with the node now labelled phsd_socket
+# (instead of the generic socket_device) init needs sock_file perms on the
+# dedicated type or socket creation fails under enforcing.
+allow init phsd_socket:sock_file create_file_perms;
 
 # R/W sysfs, /dev nodes
 allow ussrd sysfs_devices_system_cpu:file rw_file_perms;

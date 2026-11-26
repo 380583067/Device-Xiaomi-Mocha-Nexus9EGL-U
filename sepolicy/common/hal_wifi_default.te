@@ -1,0 +1,12 @@
+# [SELinux fix 2026-11-26] Wi-Fi HAL (android.hardware.wifi@1.0-service.legacy,
+# bcmdhd) policy for this device.
+#
+# 1) bcmdhd exposes its firmware path via a sysfs node that carries the generic
+#    sysfs label; the HAL writes the new firmware name into it on interface
+#    bring-up. Observed: denied { write } for name="firmware_path" sysfs:file.
+allow hal_wifi_default sysfs:file write;
+
+# 2) bcmdhd's nvram.txt lives on the system partition with the generic
+#    system_file label; without reading it the HAL crashes with SIGSEGV on
+#    every enable (Wi-Fi permanently unusable under enforcing).
+allow hal_wifi_default system_file:file r_file_perms;

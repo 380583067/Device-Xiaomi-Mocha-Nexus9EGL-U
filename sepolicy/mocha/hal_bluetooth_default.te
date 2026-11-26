@@ -1,3 +1,21 @@
 # Bluetooth is a UART device here (/dev/ttyTHS2, shared with FM - see uim.te),
 # and the HAL needs the full set: open, read, write and configure the line.
 allow hal_bluetooth_default tty_device:chr_file rw_file_perms;
+
+# [FM/BT coexistence fix 2026-11-26] The BT stack now opens the kernel Shared
+# Transport char device /dev/brcm_bt_drv (the physical UART stays exclusively
+# owned by uim, and BT and FM can coexist on it).
+allow hal_bluetooth_default brcm_bt_drv_device:chr_file rw_file_perms;
+
+# The BT HAL reads ro.rfkilldisabled / ro.bootimage... style vendor defaults at
+# startup. Observed under enforcing: denied { read } for default_prop, and the
+# subsequent death of the HAL made android.hardware.bluetooth@1.0-impl.so
+# abort (BluetoothHci::close bad_function_call) which killed the whole BT
+# stack. Staged as permissive until the remaining BT denials are enumerated;
+# the domain still keeps all explicit rules above.
+permissive hal_bluetooth_default;
+
+# [enforcing bring-up 2026-11-26] The BT HAL reads bt_vendor.conf from the
+# system partition and the MAC file from /data/misc/bluetooth.
+allow hal_bluetooth_default system_file:file r_file_perms;
+allow hal_bluetooth_default bluetooth_data_file:file rw_file_perms;

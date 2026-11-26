@@ -67,7 +67,7 @@ type coredump_data_file, file_type, data_file_type, core_data_file_type;
 type phsd_data, file_type, data_file_type, core_data_file_type;
 
 # /dev/socket/phsd
-type phsd_socket, file_type;
+type phsd_socket, file_type, mlstrustedobject;
 
 # /dev/socket/qmux_*. QMUX clients connect to the qmuxd domain.
 type qmuxd_socket, file_type;

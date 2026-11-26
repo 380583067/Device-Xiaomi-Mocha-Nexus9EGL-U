@@ -17,3 +17,11 @@ hal_server_domain(hal_drm_widevine, hal_drm)
 
 type hal_drm_widevine_exec, file_type, exec_type, vendor_file_type;
 init_daemon_domain(hal_drm_widevine)
+
+# [enforcing bring-up 2026-11-26] The Widevine HAL walks /data/vendor/mediadrm
+# to open its provisioned device certificates. Observed:
+# denied { search } for name="mediadrm" mediadrm_vendor_data_file:dir.
+# Also writes its L1 data blobs (e.g. "ay64.dat6") into that directory, so
+# full create/write perms are required, read-only denied with permissive=0.
+allow hal_drm_widevine mediadrm_vendor_data_file:dir r_dir_perms;
+allow hal_drm_widevine mediadrm_vendor_data_file:file create_file_perms;

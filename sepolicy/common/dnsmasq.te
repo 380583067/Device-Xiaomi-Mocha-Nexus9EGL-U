@@ -1,0 +1,11 @@
+# [enforcing bring-up 2026-11-26] With USB tethering active, dnsmasq probes
+# /proc/<pid>/maps of vendor processes and reads vendor libraries
+# (hwcomposer.tegra.so, libnvcap_video.so, libnvgr.so, libnvomxadaptor.so,
+# libsensors.lsm6db0.so) and the vendor "group" file, labeled vendor_file.
+# Observed under enforcing: denied { read } vendor_file:file permissive=0.
+r_dir_file(dnsmasq, vendor_file)
+
+# [enforcing bring-up 2026-11-26] dnsmasq triggers a kernel module
+# auto-request for the tether interface (kmod="netdev-rndis0"). This device
+# has no module loader; pure noise, same class as system_server netdev-6.
+dontaudit dnsmasq kernel:system module_request;

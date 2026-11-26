@@ -15,3 +15,7 @@ get_prop(toolbox, serialno_prop)
 
 # The MAC address script writes /data/misc/bluetooth/mocha_btmacaddr.txt.
 allow toolbox bluetooth_data_file:file rw_file_perms;
+
+# Shell tooling (getprop/cat piped through adb) writes back to init's pipe
+# fds. Observed: denied { write getattr } for init:fifo_file from toolbox.
+allow toolbox init:fifo_file { write getattr };

@@ -39,3 +39,8 @@ allow bluetooth bluetooth_log_file:dir { write search add_name };
 
 # Access storage_stub_file
 allow bluetooth storage_stub_file:dir getattr;
+
+# [enforcing bring-up 2026-11-26] With global enforcing the BT app died with
+# SIGABRT right after the BT HAL was denied and restarted (bt_stack_manage).
+# Staged permissive until its remaining denials are enumerated and fixed.
+permissive bluetooth;

@@ -30,6 +30,12 @@ type pmqos_device, dev_type;
 # Tegra graphics devices
 type tegradc_device, dev_type;
 
+# [FM/BT coexistence fix 2026-11-26] /dev/brcm_bt_drv: the kernel Broadcom
+# Shared Transport BT char device. The BT stack (libbt-vendor) opens it instead
+# of hogging /dev/ttyTHS2 directly, so BT and FM (fmdrv) can both register on
+# the same UART.
+type brcm_bt_drv_device, dev_type;
+
 # /dev/block/mmcblk0rpmb
 type rpmb_block_device, dev_type;
 
@@ -56,3 +62,8 @@ type rpx_block_device, dev_type;
 
 # /dev/cy8c-led-boot
 type cy8c_device, dev_type;
+
+# /dev/tegra-throughput (NVIDIA throughput/fps char device). By default it
+# keeps the generic "device" label; PowerManagerService (system_server),
+# Launcher3 (priv_app) and SystemUI (platform_app) r/w it every frame.
+type tegra_throughput_device, dev_type, mlstrustedobject;

@@ -67,7 +67,12 @@
 # Blake OTA path
 #/dev/ozwpan				u:object_r:ozmo_device:s0
 # phs
-#/dev/socket/phsd			u:object_r:phsd_socket:s0
+# Must stay labelled phsd_socket: allow_use_phs() grants clients
+# phsd_socket:sock_file write (via unix_socket_connect), which never matches
+# while the socket keeps the generic socket_device label. Under enforcing this
+# denied { write } for name="phsd" socket_device:sock_file to system_server,
+# priv_app (Launcher3) and system_app.
+/dev/socket/phsd			u:object_r:phsd_socket:s0
 # Dual WiFi (the vendor firmware provides a second wpa_supplicant socket)
 /dev/socket/wpa_xlan[0-9]		u:object_r:wpa_socket:s0
 # Qualcomm QMUX socket endpoint used by the legacy modem client policy
@@ -338,6 +343,7 @@
 # phs sysfs
 #/sys/devices/virtual/misc/tegra-throughput/fps			u:object_r:sysfs_throughput:s0
 #/sys/devices/virtual/misc/tegra-throughput/framecount		u:object_r:sysfs_throughput:s0
+/dev/tegra-throughput			u:object_r:tegra_throughput_device:s0
 # Jarvis sysfs
 #/sys/bus/hid/drivers/Jarvis/hid_miss_stats		u:object_r:sysfs_jarvis_stats:s0
 # Sound sysfs nodes
@@ -467,3 +473,22 @@
 # The right fix is to label it tty_device rather than widening uim's access to device,
 # so every existing serial policy in AOSP (bluetooth, rild, shell, ...) can be reused.
 /dev/ttyTHS[0-9]*	u:object_r:tty_device:s0
+
+# [FM/BT coexistence fix 2026-11-26] The kernel Broadcom Shared Transport BT
+# char device. The BT stack (libbt-vendor) opens it instead of /dev/ttyTHS2
+# directly; the physical UART stays exclusively owned by uim
+# (brcm-uim-sysfs). Separate label from tty_device for precise grants.
+/dev/brcm_bt_drv	u:object_r:brcm_bt_drv_device:s0
+# [SELinux fix 2026-11-26] The health HAL gets installed into /system/bin/hw on
+# mocha instead of /vendor/bin/hw, so the generic /(vendor|system/vendor)/bin/hw
+# rule never matched and the binary kept the plain system_file label - init then
+# spawned it without the domain transition and it ran in the init domain, where
+# its libbatterymonitor uevent reads were denied five times a second. Label it
+# directly so init transitions it into hal_health_default like every other HAL.
+/(system|system/system)/bin/hw/android\.hardware\.health@2\.1-service  u:object_r:hal_health_default_exec:s0
+# [SELinux fix 2026-11-26] Locally-built vendor HALs whose binary names carry a
+# newer HIDL version than the stock file_contexts rules match, so they stayed
+# labeled vendor_file, init spawned them without a domain transition and they
+# ran in the init domain (binder calls into them were denied).
+/(vendor|system/vendor)/bin/hw/android\.hardware\.drm@1\.3-service\.widevine     u:object_r:hal_drm_widevine_exec:s0
+/(vendor|system/vendor)/bin/hw/android\.hardware\.vibrator@1\.3-service\.mocha   u:object_r:hal_vibrator_default_exec:s0

@@ -34,3 +34,15 @@ allow priv_app asec_apk_file:file r_file_perms;
 allow priv_app system_app_data_file:dir getattr;
 # Read filesystem metadata from the device tree's declared factory mount type.
 allow priv_app factory_file:filesystem getattr;
+
+# /dev/tegra-throughput: Launcher3's RenderThread r/w it every frame.
+allow priv_app tegra_throughput_device:chr_file rw_file_perms;
+# Launcher3's RenderThread (GL stack) connects to the NV phsd power socket
+# just like the other allow_use_phs users. Observed: denied { write } for
+# name="phsd" socket_device:sock_file (socket now labelled phsd_socket).
+allow_use_phs(priv_app)
+
+# [enforcing bring-up 2026-11-26] The NV GL/HWC stack read by Launcher3's
+# RenderThread identifies the SoC through /sys/devices/soc0/...-style nodes
+# labelled sysfs_tegra_info. Observed: denied { read } for name="tegra_chip_id".
+allow priv_app sysfs_tegra_info:file r_file_perms;

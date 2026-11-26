@@ -28,3 +28,29 @@ allow cameraserver same_process_hal_file:file { execute getattr open read };
 r_dir_file(cameraserver, camera_config_file)
 
 get_prop(cameraserver, vendor_default_prop)
+
+# [enforcing bring-up 2026-11-26] The NV camera stack (libnvcamera / argus) is
+# driven by cameraserver, which opens the V4L2 capture node /dev/video0
+# directly. Observed under enforcing: denied { read write } for name="video0",
+# followed by "Camera 0: Error configuring streams: Function not implemented
+# (-38)" and the camera app failing to open.
+allow cameraserver video_device:chr_file rw_file_perms;
+
+# [enforcing bring-up 2026-11-26] cameraserver dlopens vendor libraries in
+# process: gralloc.tegra.so and camera.device@3.4-external-impl.so.
+# Observed under enforcing: denied { execute } for gralloc.tegra.so /
+# camera.device@3.4-external-impl.so, labeled vendor_file on /system/vendor.
+allow cameraserver vendor_file:file { getattr map read execute open };
+
+# [enforcing bring-up 2026-11-26] The NV camera request thread reads SoC info
+# from /sys/devices/system/cpu/soc0 and related Tegra sysfs parameters.
+# Observed under enforcing: denied { search } sysfs_tegra_info:dir
+# (soc0 / parameters) from "C3Dev-0-ReqQueu".
+allow cameraserver sysfs_tegra_info:dir r_dir_perms;
+allow cameraserver sysfs_tegra_info:file r_file_perms;
+
+# [enforcing bring-up 2026-11-26] Same request thread also walks the host1x
+# sysfs tree (NVIDIA graphics stack probing). Observed under enforcing:
+# denied { search } sysfs_host1x:dir from "C3Dev-0-ReqQueu".
+allow cameraserver sysfs_host1x:dir r_dir_perms;
+allow cameraserver sysfs_host1x:file r_file_perms;

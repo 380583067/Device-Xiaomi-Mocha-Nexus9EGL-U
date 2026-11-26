@@ -44,3 +44,34 @@ allow init seapp_contexts_file:file r_file_perms;
 # symbolise a tombstone).
 allow logd vendor_file:file r_file_perms;
 allow adbd vendor_file:file r_file_perms;
+
+# [enforcing bring-up 2026-11-26] The first global-enforcing boot crashed in a
+# loop: every process that touches the NV graphics stack failed to dlopen the
+# 2014 blobs. bootanimation aborted with "couldn't find an OpenGL ES
+# implementation" (dlopen needs execute, not just read), and system_server
+# aborted with "gralloc-mapper is missing" while loading gralloc.tegra.so and
+# executing android.hardware.sensors@1.0-impl.so inside its own process.
+allow bootanim vendor_file:file { r_file_perms map execute };
+allow bootanim self:process execmem;
+allow system_server vendor_file:file { r_file_perms map execute };
+
+# The same blob-read pattern showed up from these AOSP startup domains once
+# init-services and framework helpers ran with enforcing on.
+allow audioserver vendor_file:file r_file_perms;
+allow wificond vendor_file:file r_file_perms;
+allow sgdisk vendor_file:file r_file_perms;
+allow flags_health_check vendor_file:file r_file_perms;
+allow logpersist vendor_file:file r_file_perms;
+allow vold_prepare_subdirs vendor_file:file r_file_perms;
+
+# SecureElement reads its own oat cache (.art) inside its system-uid data dir.
+allow secure_element system_data_file:file r_file_perms;
+
+# system_server's android.ui thread polls /sys .../name nodes (generic sysfs
+# label) while enumerating devices.
+allow system_server sysfs:file r_file_perms;
+
+# [enforcing bring-up 2026-11-26] artd pre-reoptimizes apps and scans their
+# native deps, which include the NV blobs; wificond's render probe reads them
+# as well (see the domains above). artd was missing from the list.
+allow artd vendor_file:file r_file_perms;

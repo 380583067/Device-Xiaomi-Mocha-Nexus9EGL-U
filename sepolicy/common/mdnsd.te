@@ -1,0 +1,6 @@
+# [enforcing bring-up 2026-11-26] With USB tethering active, mdnsd probes
+# /proc/<pid>/maps of vendor processes and reads vendor libraries
+# (hwcomposer.tegra.so, libnvcap_video.so, libnvgr.so, libnvomxadaptor.so,
+# libsensors.lsm6db0.so), labeled vendor_file. Observed under enforcing:
+# denied { read } vendor_file:file permissive=0.
+r_dir_file(mdnsd, vendor_file)

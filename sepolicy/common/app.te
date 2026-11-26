@@ -18,9 +18,57 @@ allow { appdomain -isolated_app } ussrd_service:service_manager find;
 #allow appdomain sysfs_gpu:file r_file_perms;
 allow appdomain sysfs_mmc_host:dir search;
 
+# [enforcing bring-up 2026-11-26] Camera app (Aperture, untrusted_app) probes
+# the Tegra throughput counter node /dev/tegra-throughput and the host1x sysfs
+# tree via the NV GL stack during rendering.
+allow appdomain tegra_throughput_device:chr_file rw_file_perms;
+allow appdomain sysfs_host1x:dir search;
+allow appdomain sysfs_host1x:file r_file_perms;
+
 # Access external card
 #allow appdomain fuseblk:dir r_dir_perms;
 #allow appdomain fuseblk:file rw_file_perms;
 
 # Access to radio_data_file
 allow appdomain radio_data_file:dir getattr;
+# [SELinux fix 2026-11-26] NV vendor libraries live on the vendor partition
+# (libnvglsi.so, libnvgr.so, libnvcms.so, hwcomposer.tegra.so, libsensors.*,
+# ...). Apps dlopen them for GPU rendering (libEGL_tegra.so needs libnvglsi.so
+# and friends; without them libEGL aborts every app that renders with
+# "couldn't find an OpenGL ES implementation"), and SystemUI maps
+# hwcomposer.tegra.so. dlopen needs open/read/getattr + map, and mapping with
+# PROT_EXEC additionally needs execute. Observed: denied { read } for
+# libnvglsi.so (system_app, untrusted_app_30/HongGuo player) and denied { execute }
+# for libnvcms.so (untrusted_app_30), read libnvgr.so / libnvomxadaptor.so /
+# hwcomposer.tegra.so (platform_app/SystemUI).
+allow appdomain vendor_file:file { r_file_perms map execute };
+
+# [enforcing bring-up 2026-11-26] Every app with GPU rendering executes the NV
+# shader JIT cache (.gl* files) inside its own data dir. Observed: denied
+# { execute } for system_app_data_file (.glyBFUoc/.glno2kub, FMRadio) and the
+# same pattern for the other app domains; without it the app hangs on first
+# GPU render and "won't open". The cache label follows the app type:
+# app_data_file (regular apps), system_app_data_file (SystemUI/Settings/FMRadio
+# - seapp maps uid-1000 platform apps to it), privapp_data_file.
+allow appdomain { app_data_file system_app_data_file privapp_data_file }:file { r_file_perms map execute };
+# The NV GL/HWC stack probes the SoC identity (sysfs_tegra_info) and the
+# thermal guard directories.
+allow appdomain sysfs_tegra_info:dir search;
+allow appdomain sysfs_tegra_info:file r_file_perms;
+
+# [enforcing bring-up 2026-11-26] Hardware info apps (ru.andr7e.deviceinfohw
+# and similar) probe read-only hardware topology: sysfs driver/class listings,
+# /proc/asound, /proc/interrupts, /proc/version, /proc/partitions, /proc/scsi
+# and the mocha IMU sysfs tree. Read-only grants; MLS read-down is fine since
+# app categories dominate the (uncategorized) target labels.
+allow appdomain sysfs:dir r_dir_perms;
+allow appdomain sysfs:file r_file_perms;
+allow appdomain proc_asound:dir r_dir_perms;
+allow appdomain proc_asound:file r_file_perms;
+allow appdomain proc_iomem:file r_file_perms;
+allow appdomain selinuxfs:file r_file_perms;
+allow appdomain proc_interrupts:file r_file_perms;
+allow appdomain proc_version:file r_file_perms;
+allow appdomain proc:file r_file_perms;
+allow appdomain sysfs_mocha_imu:dir r_dir_perms;
+allow appdomain sysfs_mocha_imu:file r_file_perms;

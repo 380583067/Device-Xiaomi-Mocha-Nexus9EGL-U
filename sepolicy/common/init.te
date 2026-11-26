@@ -68,3 +68,11 @@ allow init vendor_file:file execute_no_trans;
 # cgroup_v2, and tmpfs permissions. Do not add broad sysfs writes or cgroup
 # file creation here: those permissions are prohibited by platform neverallows.
 
+
+# [enforcing bring-up 2026-11-26] mocha_provision.sh (init service) runs
+# /system/bin/settings from its shell to stamp the provision flags; under
+# enforcing every attempt was denied (72 execute_no_trans denials per boot).
+allow init system_file:file execute_no_trans;
+# The settings tool binder-calls system_server (SettingsProvider); observed
+# denied { call } / { transfer } init -> system_server.
+allow init system_server:binder { call transfer };

@@ -191,3 +191,24 @@ allow system_app vold:binder call;
 
 # SELinux
 allow system_app { apex_service system_suspend_control_service }:service_manager find;
+# [FM fix] The FMRadio app (system_app) opens /dev/radio0 (the V4L2 radio
+# device of the kernel v4l2_fm_driver) through libfmradio.v4l2-fm for tuning
+# and RDS, which needs the full open/read/write/ioctl set. Observed:
+# avc: denied { read open ioctl } for /dev/radio0.
+allow system_app radio_device:chr_file rw_file_perms;
+# [SELinux fix 2026-11-26] The NV camera daemon socket /dev/socket/phsd is
+# labeled socket_device (same as every legacy /dev/socket entry); the camera
+# app connects to it for photostat. Observed: denied { write } for
+# name="phsd" socket_device:sock_file. connectto on the peer socket domain
+# may still be needed and will surface as its own denial.
+allow system_app socket_device:sock_file write;
+# /dev/tegra-throughput: RenderThread r/w it every frame.
+allow system_app tegra_throughput_device:chr_file rw_file_perms;
+
+# [enforcing bring-up 2026-11-26] Settings' NV GL stack reads tegra_chip_id
+# like every other app (see priv_app.te).
+allow system_app sysfs_tegra_info:file r_file_perms;
+
+# [enforcing bring-up 2026-11-26] Settings' RenderThread walks /data/local/tmp
+# (shell_data_file) while probing NV GL caches.
+allow system_app shell_data_file:dir search;
