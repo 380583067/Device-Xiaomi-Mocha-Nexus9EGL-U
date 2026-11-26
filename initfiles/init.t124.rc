@@ -241,5 +241,10 @@ on property:sys.boot_completed=1
 # (SIGSEGV SEGV_ACCERR in TRThread_0 / libglcore). On a tmpfs the same pages
 # are shmem: reclaim swaps them into zram instead, so the driver's pointers
 # stay valid. See mocha_app_cache_tmpfs.sh for the full analysis.
-on property:sys.boot_completed=1
-    exec_background - root root -- /system/bin/sh /system/bin/mocha_app_cache_tmpfs.sh
+# Watch service: re-applies the cache tmpfs whenever the user-unlock CE
+# remount clears it (a boot_completed one-shot exec is not enough - the
+# remount happens after boot completes and wipes the mount).
+service mocha_cache_tmpfs /system/bin/sh /system/bin/mocha_app_cache_tmpfs.sh --watch
+    class late_start
+    user root
+    group root

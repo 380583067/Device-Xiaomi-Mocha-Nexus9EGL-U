@@ -37,3 +37,22 @@ for pkg in $PACKAGES; do
     [ -n "$uid" ] || continue
     mount -t tmpfs -o uid=$uid,gid=$gid,mode=0700 tmpfs "$dir"
 done
+
+# Watch mode: run as a persistent init service. The user-unlock CE remount
+# (/data_mirror/data_ce) clears the tmpfs mount a few minutes after boot, so
+# re-apply it whenever it disappears. The loop is nearly free (a grep and a
+# stat every 30 seconds).
+if [ "$1" = "--watch" ]; then
+    while true; do
+        sleep 30
+        for pkg in $PACKAGES; do
+            dir="/data/data/$pkg/cache"
+            [ -d "$dir" ] || continue
+            grep -q " $dir " /proc/mounts && continue
+            uid=$(stat -c %u "$dir" 2>/dev/null)
+            gid=$(stat -c %g "$dir" 2>/dev/null)
+            [ -n "$uid" ] || continue
+            mount -t tmpfs -o uid=$uid,gid=$gid,mode=0700 tmpfs "$dir"
+        done
+    done
+fi
