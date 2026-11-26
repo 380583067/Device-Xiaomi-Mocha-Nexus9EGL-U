@@ -275,6 +275,13 @@ BOARD_SEPOLICY_DIRS += \
     $(LOCAL_PATH)/sepolicy/lineage-common \
     $(LOCAL_PATH)/sepolicy/mocha
 
+# [enforcing bring-up 2026-11-26] Rules that must reference platform-private
+# types (dex2oat, and historically storaged) cannot live in BOARD_SEPOLICY_DIRS
+# (vendor policy): the build rejects unknown types. SYSTEM_EXT private policy
+# compiles together with the platform policy, where those types exist.
+SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS += \
+    $(LOCAL_PATH)/sepolicy/system_ext
+
 # SHIMS
 # Fix: map libnvomxadaptor.so -> libnvomxadaptor_shim.so. The NVIDIA hardware
 # OMX adaptor references the old ABI symbol GraphicBuffer(ANativeWindowBuffer*,

@@ -1,0 +1,13 @@
+# [enforcing bring-up 2026-11-26] odrefresh spawns dex2oat (platform-private
+# domain, declared in system/sepolicy/private) to rebuild the boot classpath
+# AOT images at boot. While dex2oat probes the /proc/<pid>/maps of vendor
+# processes it reads the vendor libraries mapped there (hwcomposer.tegra.so,
+# libnvcap_video.so, libnvgr.so, libnvomxadaptor.so, libsensors.lsm6db0.so),
+# labeled vendor_file. Observed under enforcing: denied { read }
+# vendor_file:file permissive=0.
+#
+# dex2oat is platform-private and vendor policy cannot reference it, so this
+# rule lives in the SYSTEM_EXT policy directory instead (same compilation as
+# the platform policy).
+allow dex2oat vendor_file:dir search;
+allow dex2oat vendor_file:file { getattr map read open };

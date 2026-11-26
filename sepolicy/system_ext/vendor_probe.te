@@ -1,0 +1,20 @@
+# [enforcing bring-up 2026-11-26] The fstab/verify helpers (blkid_untrusted,
+# fsck_untrusted — platform-private domains) walk /proc/<pid>/maps of vendor
+# processes at boot and read the vendor libraries mapped there
+# (hwcomposer.tegra.so, libnvcap_video.so, libnvgr.so, libnvomxadaptor.so,
+# libsensors.lsm6db0.so), labeled vendor_file. Observed under enforcing:
+# denied { read } vendor_file:file permissive=0. Same probing pattern as
+# dex2oat, mdnsd and dnsmasq; these domains are platform-private, so the
+# rules live in the SYSTEM_EXT policy directory.
+allow blkid_untrusted vendor_file:dir search;
+allow blkid_untrusted vendor_file:file { getattr map read open };
+allow fsck_untrusted vendor_file:dir search;
+allow fsck_untrusted vendor_file:file { getattr map read open };
+# [enforcing bring-up 2026-11-26] Same probing pattern from sdcardd
+# (platform-private): reads vendor libraries mapped in /proc/<pid>/maps.
+allow sdcardd vendor_file:dir search;
+allow sdcardd vendor_file:file { getattr map read open };
+# [enforcing bring-up 2026-11-26] Same probing pattern from sdcardd
+# (platform-private): reads vendor libraries mapped in /proc/<pid>/maps.
+allow sdcardd vendor_file:dir search;
+allow sdcardd vendor_file:file { getattr map read open };
