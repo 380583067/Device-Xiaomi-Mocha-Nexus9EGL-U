@@ -1179,6 +1179,22 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
      pipelineConfig.ccm[3] = 0.0f; pipelineConfig.ccm[4] = 1.0f; pipelineConfig.ccm[5] = 0.0f;
      pipelineConfig.ccm[6] = 0.0f; pipelineConfig.ccm[7] = 0.0f; pipelineConfig.ccm[8] = 1.0f;
      pipelineConfig.gamma = 0.55f;
+    /* [2026-11-26 front camera anti-alias] OV5693 720p subsamples the sensor
+     * window (x_inc=y_inc=2 + non-integer sensor scaler), which folds high
+     * frequencies into a 1-px diagonal checkerboard. Rear IMX179 reads native
+     * resolution and must not be touched. See aaHorizontal121. 1.0: the sensor
+     * readout already destroyed real 1-px horizontal detail by aliasing it into
+     * the checkerboard, so nothing useful is lost by filtering it fully
+     * (measured residual 0.7 = ~1300 FFT units, visibly dotted when zoomed). */
+    pipelineConfig.aaStrength = (dev->camera_id == 1) ? 1.0f : 0.0f;
+    /* [2026-11-26] Sensor spectral compensation, OFF (1.0): a 1.09 blue boost
+     * overshot — measured skin went ashy (highlights B/G 1.057 > R/G 0.953,
+     * cold grey instead of warm). The mid-band B/G 0.90-0.94 deficit did not
+     * extrapolate to highlights, which were already 0.97. Keep the knob for
+     * future tuning; the perceived green was fixed by the AWB clipped-pixel
+     * exclusion and the lower AE target instead. */
+    pipelineConfig.awbBoostR = 1.0f;
+    pipelineConfig.awbBoostB = 1.0f;
 
      // Auto Exposure y Auto White Balance
      pipelineConfig.enableAE = true;
@@ -1189,11 +1205,13 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
      * 0.20. Software gain also drops from 1.5 back to 1.0: that was added to brighten
      * dark scenes, but the sensor now has 2500 lines of exposure headroom and
      * multiplying by 1.5 only washes out the highlights.
-     * [2026-11-22 front camera too dark] 0.20 was tuned for the back IMX179 native
-     * sensitivity. The front OV5693 is clearly darker at the same target (the user
-     * called it "very dark"), so raise it to 0.32: 0.32 in linear becomes about 60/255
-     * after gamma(0.55), usable in the dark without clipping the highlights. */
-    pipelineConfig.targetLuma = (dev->camera_id == 1) ? 0.32f : 0.20f;
+     * [2026-11-22 front camera too dark -> obsolete] The 0.32 bump was tuned while
+     * the OV5693 exposure write was 1/16 of the intended value (v4l2 driver bug,
+     * fixed 2026-11-25 with the ct <<= 4 correction). With correct exposure units
+     * the compensation overshoots: measured selfie mean 0.49 post-gamma with the
+     * face highlights clipped, which the user read as "exposure wrong". 0.24 keeps
+     * skin near 55-60% of range without clipping. */
+    pipelineConfig.targetLuma = (dev->camera_id == 1) ? 0.24f : 0.20f;
     pipelineConfig.digitalGain = 1.0f;
     /* Rebuilding the pipeline for a high-resolution still inherits the converged exposure/gain (see the PipelineConfig comment). */
     pipelineConfig.initialExposure = inheritExposure;

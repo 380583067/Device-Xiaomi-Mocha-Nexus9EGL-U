@@ -2,6 +2,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+#include <arm_neon.h>
 #include <system/graphics.h>
 #include <cutils/log.h>
 #include <fcntl.h>
@@ -27,6 +29,8 @@ CameraPipeline::CameraPipeline()
       mRgbBufferSize(0),
       mRgbaFull(nullptr),
       mRgbaFullSize(0),
+      mAaTmp(nullptr),
+      mAaTmpSize(0),
       mCropX(0), mCropY(0), mCropW(0), mCropH(0),
       mStreaming(false),
       mBufferCount(0),
@@ -129,6 +133,11 @@ int CameraPipeline::close() {
         delete[] mRgbaFull;
         mRgbaFull = nullptr;
         mRgbaFullSize = 0;
+    }
+    if (mAaTmp) {
+        free(mAaTmp);
+        mAaTmp = nullptr;
+        mAaTmpSize = 0;
     }
 
     if (mFd >= 0) {
@@ -545,6 +554,110 @@ void CameraPipeline::doAutoExposure(const uint8_t* rgbBuffer) {
     }
 }
 
+/* [2026-11-26 front camera anti-alias] The OV5693 720p mode reads the 2624x1464
+ * window with x_inc=y_inc=2 subsampling (skipping, not binning) and the sensor
+ * scaler then interpolates the remaining 1.025x down to 1280x720. Subsampling
+ * aliases the sensor's highest spatial frequencies BOTH ways: columns alternate
+ * (vertical stripes) and rows alternate (horizontal stripes), which combine into
+ * the 1-px diagonal checkerboard measured before the fix (FFT (pi,pi) bin 67818
+ * on a flat grey hoodie vs 353 after; rear IMX179 native readout has none).
+ * The checkerboard and both stripe components sit at the horizontal/vertical/
+ * diagonal Nyquist; a separable [1 2 1]x[1 2 1] has H(pi)=0 on each axis, so
+ * one horizontal + one vertical pass zero them exactly. strength is 0..16
+ * fixed point: out = orig + strength/16 * (smoothed - orig). The readout already
+ * destroyed real 1-px detail by aliasing it, so full strength (16) is safe.
+ * NEON: lanes are bytes, so the halving-add trick works for both axes —
+ * horizontal uses byte-offset loads at -3/0/+3 (same channel of neighbour
+ * pixels), vertical uses row pointers. */
+static inline uint8_t aaHScalar(const uint8_t* row, int n, int x) {
+    int xl = (x >= 3) ? x - 3 : 0;
+    int xr = (x < n - 3) ? x + 3 : n - 1;
+    return (uint8_t)((row[xl] + 2 * row[x] + row[xr] + 2) >> 2);
+}
+
+static void aaSmoothH(const uint8_t* img, uint8_t* dst, int w, int h) {
+    const int n = w * 3;
+    for (int y = 0; y < h; y++) {
+        const uint8_t* row = img + (size_t)y * n;
+        uint8_t* out = dst + (size_t)y * n;
+        int x = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+        for (; x < 16 && x < n; x++) out[x] = aaHScalar(row, n, x);
+        for (; x + 19 <= n; x += 16) {
+            uint8x16_t vl = vld1q_u8(row + x - 3);
+            uint8x16_t vc = vld1q_u8(row + x);
+            uint8x16_t vr = vld1q_u8(row + x + 3);
+            vst1q_u8(out + x, vhaddq_u8(vhaddq_u8(vl, vr), vc));
+        }
+#endif
+        for (; x < n; x++) out[x] = aaHScalar(row, n, x);
+    }
+}
+
+static void aaSmoothV(const uint8_t* img, uint8_t* dst, int w, int h) {
+    const int n = w * 3;
+    for (int y = 0; y < h; y++) {
+        const uint8_t* up = img + (size_t)(y > 0 ? y - 1 : 0) * n;
+        const uint8_t* md = img + (size_t)y * n;
+        const uint8_t* dn = img + (size_t)(y < h - 1 ? y + 1 : h - 1) * n;
+        uint8_t* out = dst + (size_t)y * n;
+        int x = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+        for (; x < 16 && x < n; x++) out[x] = (uint8_t)((up[x] + 2 * md[x] + dn[x] + 2) >> 2);
+        for (; x + 16 <= n; x += 16) {
+            uint8x16_t vu = vld1q_u8(up + x);
+            uint8x16_t vm = vld1q_u8(md + x);
+            uint8x16_t vd = vld1q_u8(dn + x);
+            vst1q_u8(out + x, vhaddq_u8(vhaddq_u8(vu, vd), vm));
+        }
+#endif
+        for (; x < n; x++) out[x] = (uint8_t)((up[x] + 2 * md[x] + dn[x] + 2) >> 2);
+    }
+}
+
+static void aaBlendInPlace(uint8_t* img, const uint8_t* smooth, int total, int s16) {
+    if (s16 >= 16) { memcpy(img, smooth, (size_t)total); return; }
+    if (s16 <= 0) return;
+    int i = 0;
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+    const int16x8_t sv = vdupq_n_s16((int16_t)s16);
+    for (; i + 16 <= total; i += 16) {
+        uint8x16_t ov = vld1q_u8(img + i);
+        uint8x16_t sm = vld1q_u8(smooth + i);
+        int16x8_t ol = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(ov)));
+        int16x8_t oh = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(ov)));
+        int16x8_t sl = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(sm)));
+        int16x8_t sh = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(sm)));
+        int16x8_t dl = vqaddq_s16(ol, vshrq_n_s16(vmulq_s16(vsubq_s16(sl, ol), sv), 4));
+        int16x8_t dh = vqaddq_s16(oh, vshrq_n_s16(vmulq_s16(vsubq_s16(sh, oh), sv), 4));
+        vst1q_u8(img + i, vcombine_u8(vqmovun_s16(dl), vqmovun_s16(dh)));
+    }
+#endif
+    for (; i < total; i++) {
+        int v = img[i] + (((int)smooth[i] - (int)img[i]) * s16 >> 4);
+        img[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+}
+
+/* Runs both axes on img using mAaTmp as scratch. */
+void CameraPipeline::applyAntiAlias() {
+    const int w = mConfig.width, h = mConfig.height;
+    const int s16 = (int)(mConfig.aaStrength * 16.0f + 0.5f);
+    if (s16 <= 0 || w <= 0 || h <= 0) return;
+    const size_t need = (size_t)w * h * 3;
+    if (mAaTmpSize < need) {
+        uint8_t* p = (uint8_t*)realloc(mAaTmp, need);
+        if (!p) return;
+        mAaTmp = p;
+        mAaTmpSize = need;
+    }
+    const int total = w * h * 3;
+    aaSmoothH(mRgbBuffer, mAaTmp, w, h);
+    aaBlendInPlace(mRgbBuffer, mAaTmp, total, s16);
+    aaSmoothV(mRgbBuffer, mAaTmp, w, h);
+    aaBlendInPlace(mRgbBuffer, mAaTmp, total, s16);
+}
+
 void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     if (!rgbBuffer || !mConfig.enableAWB) return;
 
@@ -600,13 +713,25 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
 
         /* Pass 2: accumulate only the samples above the threshold. */
         uint64_t bR = 0, bG = 0, bB = 0;
-        uint32_t bN = 0;
+        uint32_t bN = 0, clipN = 0;
         for (int y = 0; y < h; y += step) {
             for (int x = 0; x < w; x += step) {
                 int off = (y * w + x) * 3;
                 int l = (rgbBuffer[off] * 299 + rgbBuffer[off+1] * 587 +
                          rgbBuffer[off+2] * 114) / 1000;
                 if (l >= brightThr) {
+                    /* [2026-11-26] Clipped pixels carry no colour: saturation
+                     * drives all three channels to 255 regardless of the
+                     * illuminant, so they read as neutral and drag the white
+                     * point towards gains of 1.0. Measured selfie: the true
+                     * grey hoodie sat at R/G=0.93 B/G=0.91 while the blown
+                     * window pixels read 0.997/0.993 and won the average,
+                     * leaving the whole frame green. Exclude them. */
+                    if (rgbBuffer[off] >= 250 || rgbBuffer[off+1] >= 250 ||
+                        rgbBuffer[off+2] >= 250) {
+                        clipN++;
+                        continue;
+                    }
                     bR += rgbBuffer[off];
                     bG += rgbBuffer[off+1];
                     bB += rgbBuffer[off+2];
@@ -627,7 +752,8 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
             avgR = (float)bR / bN;
             avgG = (float)bG / bN;
             avgB = (float)bB / bN;
-            ALOGI("AWB: using bright decile as white point (%u samples, thr=%d)", bN, brightThr);
+            ALOGI("AWB: using bright decile as white point (%u samples, thr=%d, %u clipped)",
+                  bN, brightThr, clipN);
         } else if (dark && bN >= 100) {
             /* Dark scene: the global mean is dominated by sensor noise, so even
              * a dim bright decile (avgG>=8) beats it. */
@@ -670,6 +796,12 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     }
     mAwbGains[1] = 1.0f;
     mAwbGains[3] = 1.0f;
+
+    /* [2026-11-26] OV5693 fixed blue-response compensation, applied to the
+     * OUTPUT gains only. The next frame's white-point statistics are measured
+     * before these gains, so the loop stays stable. */
+    if (mConfig.awbBoostR > 0.0f) mAwbGains[0] *= mConfig.awbBoostR;
+    if (mConfig.awbBoostB > 0.0f) mAwbGains[2] *= mConfig.awbBoostB;
 
     ALOGI("AWB: R/G=%.2f B/G=%.2f gains R=%.2f B=%.2f", avgR/avgG, avgB/avgG, mAwbGains[0], mAwbGains[2]);
 }
@@ -922,6 +1054,11 @@ int CameraPipeline::processBayerToYuv(const uint8_t* bayerData, uint8_t* output,
     if (!bayerData || !output || !mDemosaic || !mColorConv) return -EINVAL;
 
     mDemosaic->process(bayerData, mRgbBuffer);
+
+    /* [2026-11-26] Front-camera anti-alias before the 3A statistics so both the
+     * measurements and the picture see the same (aliasing-free) image. */
+    if (mConfig.aaStrength > 0.0f)
+        applyAntiAlias();
 
     /* AE update before applying gains */
     if (mConfig.enableAE)

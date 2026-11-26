@@ -38,6 +38,20 @@ struct PipelineConfig {
     bool enableAWB;
     float targetLuma;
     float digitalGain;  // software brightness boost (multiplicative on RGB)
+    /* [2026-11-26] Horizontal [1 2 1] anti-alias blend, 0..1. The OV5693 720p
+     * mode subsamples the sensor window (x_inc=y_inc=2) which aliases high
+     * frequencies into a 1-px diagonal checkerboard; a single horizontal pass
+     * zeroes that frequency (see aaSmoothH in CameraPipeline.cpp).
+     * 0 disables (rear camera, native-resolution readout, no aliasing). */
+    float aaStrength;
+    /* [2026-11-26] Fixed multipliers on the AWB gains at output time (the
+     * measurement feedback is pre-gain, so these cannot hunt). Compensates the
+     * OV5693's weak blue response: every measured front-camera scene came out
+     * with B/G 0.90-0.94 after a correct white-point correction (window sky,
+     * grey hoodie, wall), i.e. a constant yellow-green residue. 0/1.0 = no
+     * boost (rear camera, IMX179 verified R/G=B/G=1.00). */
+    float awbBoostR;
+    float awbBoostB;
     /* [2026-11-22] When the pipeline is rebuilt for a high-resolution still, carry
      * over the exposure/gain the previous instance already converged on: a fresh
      * instance starts at 800/60 and cannot converge in a dark scene from a few warm-up
@@ -110,6 +124,9 @@ private:
     int processBayerToYuv(const uint8_t* bayerData, uint8_t* output, uint32_t outputFormat);
     void doAutoExposure(const uint8_t* rgbBuffer);
     void doAutoWhiteBalance(const uint8_t* rgbBuffer);
+    /* [2026-11-26] Front-camera anti-alias: separable [1 2 1] on both axes,
+     * uses mAaTmp scratch. See the comment above aaSmoothH in the .cpp. */
+    void applyAntiAlias();
 
     int mFd;
     int mCameraId;
@@ -129,6 +146,8 @@ private:
     uint32_t mRgbBufferSize;
     uint8_t* mRgbaFull;       /* RGBA at pipeline resolution (full frame) */
     uint32_t mRgbaFullSize;
+    uint8_t* mAaTmp;          /* [2026-11-26] anti-alias smooth buffer (w*h*3) */
+    size_t mAaTmpSize;
     int mCropX, mCropY, mCropW, mCropH;
 
     int mCurrentExposure;
