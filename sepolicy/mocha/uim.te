@@ -84,3 +84,49 @@ get_prop(uim, exported_bluetooth_prop)
 # libnetutils / socket (uim links against libnetutils)
 allow uim self:capability { net_admin net_raw };
 allow uim self:{ rawip_socket tcp_socket udp_socket } { create ioctl read write getattr setopt };
+
+# ==== [enforcing bring-up 2026-11-26] the BT MAC and property channel ====
+#
+# Under enforcing these three were denied (and they break BR/EDR entirely,
+# which is why the pairing UI showed no names and every page timed out):
+#
+#   denied { search } bluetooth_data_file:dir    - /data/misc/bluetooth
+#   denied { read }   bluetooth_data_file:file   - mocha_btmacaddr.txt, the
+#           device MAC that uim pushes into the controller (sysfs bdaddr node);
+#           with the MAC missing/zero the controller's BR/EDR path never
+#           answers an inquiry response or a page
+#   denied { read }   bluetooth_prop:file        - persist.bluetooth.* lookups
+#   denied { write }  property_socket:sock_file  - setting bluetooth props
+#           through the property service
+#
+# Note the boot-order trap: these only fire once setenforce 1 runs after boot
+# (the board cmdline forces permissive and the test procedure enables
+# enforcing manually), which is why the morning, fully permissive, session
+# worked fine and the failure appeared "out of nowhere" tonight.
+allow uim bluetooth_data_file:dir search;
+allow uim bluetooth_data_file:file r_file_perms;
+get_prop(uim, bluetooth_prop)
+set_prop(uim, bluetooth_prop)
+
+# ==== [enforcing bring-up 2026-11-26] the BT MAC and property channel ====
+#
+# Under enforcing these three were denied (and they break BR/EDR entirely,
+# which is why the pairing UI showed no names and every page timed out):
+#
+#   denied { search } bluetooth_data_file:dir    - /data/misc/bluetooth
+#   denied { read }   bluetooth_data_file:file   - mocha_btmacaddr.txt, the
+#           device MAC that uim pushes into the controller (sysfs bdaddr node);
+#           with the MAC missing/zero the controller's BR/EDR path never
+#           answers an inquiry response or a page
+#   denied { read }   bluetooth_prop:file        - persist.bluetooth.* lookups
+#   denied { write }  property_socket:sock_file  - setting bluetooth props
+#           through the property service
+#
+# Note the boot-order trap: these only fire once setenforce 1 runs after boot
+# (the board cmdline forces permissive and the test procedure enables
+# enforcing manually), which is why the morning, fully permissive, session
+# worked fine and the failure appeared "out of nowhere" tonight.
+allow uim bluetooth_data_file:dir search;
+allow uim bluetooth_data_file:file r_file_perms;
+get_prop(uim, bluetooth_prop)
+set_prop(uim, bluetooth_prop)
