@@ -429,6 +429,29 @@ static int out_dump(const struct audio_stream *stream, int fd)
     return 0;
 }
 
+/*
+ * [FM speaker fix 2026-11-26] Track the FM state so the codec route can follow
+ * the media output device (see fm_set_codec_route below for the full path
+ * description). out_set_parameters() updates the stored routing and re-runs
+ * the FM route while an FM input stream is open, so toggling the FMRadio
+ * app's speaker switch re-routes live.
+ */
+static bool fm_route_active = false;   /* an FM input stream is open */
+static uint32_t fm_out_devices = 0;    /* last media output routing seen */
+/*
+ * [FM volume fix 2026-11-26] FM Playback Volume as requested by the framework
+ * (0..255, the tegra-rt5671 machine driver's "FM Playback Volume" control,
+ * 0.5 dB steps down to -127.5 dB). The FMRadio app forwards STREAM_MUSIC
+ * volume changes as "fm_volume=<n>" through adev_set_parameters(). It is only
+ * applied on the headphone direct path; on the speaker the app's own
+ * AudioTrack replay (routed through DAC2 by the normal speaker route) is the
+ * audible path and AudioFlinger's software volume already controls it.
+ */
+static int fm_volume = 255;
+
+/* forward declaration: out_set_parameters re-runs the FM route on routing changes */
+static void fm_set_codec_route(bool enable);
+
 static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 {
     ALOGV("+out_set_parameters(%p) '%s'", stream, kvpairs);
@@ -447,6 +470,16 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
     }
 
     stream_invoke_usecases(out->hw, kvpairs);
+
+    /* [FM speaker fix 2026-11-26] Follow the media routing live: when the
+     * FMRadio app switches to speaker (AudioSystem.FORCE_SPEAKER) or back,
+     * AudioFlinger re-routes the primary output and we steer the FM hardware
+     * path accordingly. */
+    if (ret >= 0 && v != 0 && !(v & AUDIO_DEVICE_BIT_IN)) {
+        fm_out_devices = v;
+        if (fm_route_active)
+            fm_set_codec_route(true);
+    }
 
     pthread_mutex_unlock(&adev->lock);
 
@@ -2448,10 +2481,45 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
  */
 #define FM_CODEC_CARD 1
 
+/*
+ * [FM volume fix 2026-11-26, v2] FM I2S enters the codec as "IF4 DAC" and can
+ * only reach the CPU through DAC1 (see fm_set_codec_route below). The FMRadio
+ * app captures it via AudioRecord(RADIO_TUNER) and replays it through its own
+ * AudioTrack; on the speaker that replay is the audible, volume-controlled
+ * path. On the headphone the direct analogue feed is the only option, and
+ * volume keys are mapped onto the machine driver's "FM Playback Volume"
+ * control through "fm_volume=<n>" (adev_set_parameters).
+ */
+/*
+ * [FM volume fix 2026-11-26, v2] The RT5671 topology leaves exactly one way to
+ * get the FM I2S (IF4) to the CPU: through DAC1. RxDP Mux = DAC1 sends DAC1
+ * into the DSP downlink, DSP DL Mux = Bypass forwards it to TxDC_DAC, and
+ * IF1 ADC Mux = TxDC_DAC loops it up I2S1 where the FMRadio app's
+ * AudioRecord(RADIO_TUNER) captures it. The app then replays it through its
+ * own AudioTrack on the primary output, where STREAM_MUSIC volume applies.
+ *
+ * Where the replay can be heard depends on the output, because the normal
+ * media routes use different DACs:
+ *  - speaker: DAC2 (DAC L2 Mux = IF1 DAC -> Mono DAC MIX DAC L2/R2 ->
+ *    MONOAmp -> TFA amps). DAC1 is free for the capture borrow, the replay is
+ *    audible with working volume keys, and the direct DAC1 mixes must stay
+ *    OFF or the fixed-volume feed doubles the audio.
+ *  - headphone: DAC1 is the ONLY stereo output path, so it cannot carry the
+ *    capture and the replay at the same time. The audible path is the direct
+ *    analogue one (DAC1 -> HPO MIX DAC1, switch owned by apply_route()) at
+ *    fixed codec level; STREAM_MUSIC volume has no effect there. Volume keys
+ *    are mapped instead onto the machine driver's "FM Playback Volume"
+ *    control, which jointly scales the HP amp, DAC1's digital volume and the
+ *    TFA speaker amps - that is what NVIDIA designed the control for.
+ *
+ * out_set_parameters() re-runs this while an FM input stream is open, so
+ * toggling the FMRadio app's speaker switch re-routes live.
+ */
 static void fm_set_codec_route(bool enable)
 {
     struct mixer *mixer;
     struct mixer_ctl *ctl;
+    bool direct_analog;
 
     mixer = mixer_open(FM_CODEC_CARD);
     if (!mixer) {
@@ -2463,37 +2531,76 @@ static void fm_set_codec_route(bool enable)
     if (enable) {
         /* Power the FM DAPM pin: the FM chip's I2S enters as the "FM" LINE
          * (machine driver) -> "FM Capture" (codec) -> "IF4 DAC". Without this
-         * pin switch the FM source is never powered, so no audio reaches DAC1.
-         */
+         * pin switch the FM source is never powered, so no audio reaches
+         * DAC1. */
         ctl = mixer_get_ctl_by_name(mixer, "FM Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 1);
-        /* DAC1 <- IF4 (FM chip I2S); enable headphone output mix. */
+        /* DAC1 <- IF4 (FM chip I2S); open the DAC1 input switch inside
+         * DAC1 MIX as well. */
         ctl = mixer_get_ctl_by_name(mixer, "DAC1 L Mux");
         if (ctl)
             mixer_ctl_set_enum_by_string(ctl, "IF4 DAC");
         ctl = mixer_get_ctl_by_name(mixer, "DAC1 R Mux");
         if (ctl)
             mixer_ctl_set_enum_by_string(ctl, "IF4 DAC");
-        /*
-         * [FM silence fix 2026-11-16] The DAC1 input switch on Stereo DAC MIX must be on.
-         * The full RT5671 DAPM path is DAC1 -> Stereo DAC MIX -> output; normal music
-         * playback turns the Stereo DAC MIX switch on through the regular HAL routing,
-         * but FM audio bypasses that routing, so both switches stay off, the link between
-         * DAC1 MIX and Stereo DAC MIX is broken and FM tunes fine yet stays silent.
-         */
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 MIXL DAC1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        ctl = mixer_get_ctl_by_name(mixer, "DAC1 MIXR DAC1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+
+        /* Capture borrow: DAC1 -> DSP downlink -> TxDC_DAC -> I2S1 uplink.
+         * DSP DL Mux MUST be "Bypass": the RxDP source only reaches TxDC_DAC
+         * through it (the previous build set "DSP", which selects the I2S DSP
+         * interface instead and captured silence). */
+        ctl = mixer_get_ctl_by_name(mixer, "RxDP Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "DAC1");
+        ctl = mixer_get_ctl_by_name(mixer, "DSP DL Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "Bypass");
+        ctl = mixer_get_ctl_by_name(mixer, "IF1 ADC Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "TxDC_DAC");
+
+        /* Headphone takes the direct analogue feed (DAC1 -> HPO MIX DAC1,
+         * switch managed by apply_route()); the speaker takes the app's
+         * replay via its normal DAC2 route. On any other/unknown routing,
+         * fall back to the direct analogue mixes for both outputs. */
+        direct_analog = (fm_out_devices == 0) ||
+                        !(fm_out_devices & AUDIO_DEVICE_OUT_SPEAKER);
+
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
         if (ctl)
-            mixer_ctl_set_value(ctl, 0, 1);
+            mixer_ctl_set_value(ctl, 0, direct_analog ? 1 : 0);
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXR DAC R1 Switch");
         if (ctl)
-            mixer_ctl_set_value(ctl, 0, 1);
-        ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
+            mixer_ctl_set_value(ctl, 0, direct_analog ? 1 : 0);
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXL DAC L1 Switch");
         if (ctl)
-            mixer_ctl_set_value(ctl, 0, 1);
-        ALOGI("fm_set_codec_route: FM -> IF4 DAC -> HPO enabled");
+            mixer_ctl_set_value(ctl, 0, direct_analog ? 1 : 0);
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXR DAC R1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, direct_analog ? 1 : 0);
+
+        /* Volume keys: only meaningful on the direct (headphone) path - the
+         * machine control scales the HP amp, DAC1 and the TFA amps. On the
+         * speaker-replay path AudioFlinger already applies STREAM_MUSIC
+         * volume to the app's AudioTrack, and the TFA amp scaling must stay
+         * at 0 dB. */
+        ctl = mixer_get_ctl_by_name(mixer, "FM Playback Volume");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, direct_analog ? fm_volume : 255);
+
+        ALOGI("fm_set_codec_route: FM -> IF4 DAC -> DAC1 borrow (RxDP -> DSP DL "
+              "Bypass -> TxDC_DAC -> IF1), direct_analog=%d, vol=%d",
+              direct_analog ? 1 : 0, direct_analog ? fm_volume : 255);
     } else {
-        /* Restore the default media path (DAC1 <- IF1, headphone mix off). */
+        /* Restore the default media path. DAC1 goes back to the playback
+         * I2S1 so normal music reaches the headphone again; the FM volume
+         * scaling must return to 0 dB or regular playback stays attenuated. */
         ctl = mixer_get_ctl_by_name(mixer, "FM Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
@@ -2503,17 +2610,33 @@ static void fm_set_codec_route(bool enable)
         ctl = mixer_get_ctl_by_name(mixer, "DAC1 R Mux");
         if (ctl)
             mixer_ctl_set_enum_by_string(ctl, "IF1 DAC");
-        /* When FM stops, disconnect the DAC1 input on Stereo DAC MIX again so the DAC1
-         * path returns to exclusive use by normal playback. */
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXL DAC L1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXR DAC R1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
-        ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
+        /* Mono DAC MIX DAC L1/R1 are the direct FM speaker feed only; the
+         * normal speaker route uses DAC2 (DAC L2/R2 switches), so they can go
+         * off unconditionally here. */
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXL DAC L1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXR DAC R1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "RxDP Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF2 DAC");
+        ctl = mixer_get_ctl_by_name(mixer, "DSP DL Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "DSP");
+        ctl = mixer_get_ctl_by_name(mixer, "IF1 ADC Mux");
+        if (ctl)
+            mixer_ctl_set_enum_by_string(ctl, "IF1_ADC1");
+        ctl = mixer_get_ctl_by_name(mixer, "FM Playback Volume");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 255);
         ALOGI("fm_set_codec_route: restored default media path");
     }
 
@@ -2556,8 +2679,10 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     devices &= AUDIO_DEVICE_IN_ALL;
     /* Route the FM tuner's hardware I2S output to the headphone codec. */
     in->is_fm = (devices & AUDIO_DEVICE_IN_FM_TUNER) != 0;
-    if (in->is_fm)
+    if (in->is_fm) {
+        fm_route_active = true;
         fm_set_codec_route(true);
+    }
 
     ret = do_init_in_common(&in->common, config, devices);
     if (ret < 0) {
@@ -2573,8 +2698,10 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     return 0;
 
 fail:
-    if (in && in->is_fm)
+    if (in && in->is_fm) {
+        fm_route_active = false;
         fm_set_codec_route(false);
+    }
     free(in);
     ALOGV("-adev_open_input_stream (%d)", ret);
     return ret;
@@ -2585,8 +2712,10 @@ static void adev_close_input_stream(struct audio_hw_device *dev,
 {
     struct stream_in_pcm *in = (struct stream_in_pcm *)stream;
     ALOGV("adev_close_input_stream(%p)", stream);
-    if (in->is_fm)
+    if (in->is_fm) {
+        fm_route_active = false;
         fm_set_codec_route(false);
+    }
     (in->common.close)(&stream->common);
 }
 
@@ -2879,6 +3008,26 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
     parms = str_parms_create_str(kvpairs);
     if (parms) {
         voice_trigger_set_params(adev, parms);
+
+        /* [FM volume fix 2026-11-26] The FMRadio app forwards STREAM_MUSIC
+         * volume changes as "fm_volume=<0..255>". Stored here and applied to
+         * the machine driver's "FM Playback Volume" control whenever the FM
+         * route runs on the headphone (direct analogue) path; see
+         * fm_set_codec_route(). */
+        if (str_parms_get_str(parms, "fm_volume", value, sizeof(value)) >= 0
+                && *value) {
+            int vol = atoi(value);
+            if (vol < 0)
+                vol = 0;
+            if (vol > 255)
+                vol = 255;
+            pthread_mutex_lock(&adev->lock);
+            fm_volume = vol;
+            if (fm_route_active)
+                fm_set_codec_route(true);
+            pthread_mutex_unlock(&adev->lock);
+        }
+
         str_parms_destroy(parms);
     }
 
