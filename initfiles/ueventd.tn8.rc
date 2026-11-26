@@ -88,6 +88,10 @@
 /sys/devices/platform/ozwpan/usb*	mode	0660	system	system
 /dev/ttyTHS1	0664	root	system
 /dev/ttyTHS2	0660	bluetooth	bluetooth
+# [FM/BT coexistence fix 2026-11-26] Kernel Broadcom Shared Transport BT char
+# device: the BT stack (libbt-vendor) reaches the chip through it, while the
+# physical UART /dev/ttyTHS2 stays exclusively owned by uim.
+/dev/brcm_bt_drv	0660	bluetooth	bluetooth
 # pmqos
 /dev/constraint_cpu_freq 0660 root system
 /dev/constraint_gpu_freq 0660 root system
