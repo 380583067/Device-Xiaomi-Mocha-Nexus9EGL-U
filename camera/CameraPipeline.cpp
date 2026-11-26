@@ -577,7 +577,7 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
      * and highlights); bright-scene global statistics are verified correct (back
      * camera R/G=1.00) and stay untouched. */
     bool dark = (avgG < 30.0f);
-    if (dark) {
+    {
         /* Pass 1: luma histogram over the sample grid, to find the brightest-decile threshold. */
         uint32_t hist[256];
         memset(hist, 0, sizeof(hist));
@@ -615,24 +615,34 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
             }
         }
 
-        /* The bright region needs enough samples and real signal (avgG>=8, below that
-         * it is the noise floor) before the reference is switched; otherwise keep the
-         * current gain and do not chase noise. */
-        if (bN >= 100) {
-            float bAvgR = (float)bR / bN;
+        /* [2026-11-26 white-point reference in bright scenes too] The grey-world
+         * global mean is only a valid white reference if the scene really is grey
+         * on average. A big warm surface (wooden desk) pulls the gains the other
+         * way and every actual white object in the frame comes out green/cold -
+         * measured: bright region R=169 G=178 B=184 on a desk scene, read as
+         * "the front camera looks green". The brightest decile is real white
+         * matter (speculars, white plastic), so prefer it whenever it is close
+         * to a full white exposure, dark scene or not. */
+        if (bN >= 100 && bG / bN >= 100.0f) {
+            avgR = (float)bR / bN;
+            avgG = (float)bG / bN;
+            avgB = (float)bB / bN;
+            ALOGI("AWB: using bright decile as white point (%u samples, thr=%d)", bN, brightThr);
+        } else if (dark && bN >= 100) {
+            /* Dark scene: the global mean is dominated by sensor noise, so even
+             * a dim bright decile (avgG>=8) beats it. */
             float bAvgG = (float)bG / bN;
-            float bAvgB = (float)bB / bN;
             if (bAvgG >= 8.0f) {
-                avgR = bAvgR;
+                avgR = (float)bR / bN;
                 avgG = bAvgG;
-                avgB = bAvgB;
+                avgB = (float)bB / bN;
                 ALOGI("AWB: using bright decile (%u samples, thr=%d)", bN, brightThr);
             } else {
                 ALOGI("AWB: dark scene, bright decile has no signal, keep gains");
                 return;
             }
         }
-        /* Not enough samples: fall back to the global average (previous behaviour). */
+        /* Not enough samples or a mid-luma scene: fall back to the global average. */
     }
 
     /* [2026-11-22 front camera green cast] All three channel means are tiny in the
