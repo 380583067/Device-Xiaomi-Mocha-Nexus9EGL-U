@@ -2491,6 +2491,21 @@ static void fm_set_codec_route(bool enable)
         ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 1);
+        /*
+         * [FM speaker fix 2026-11-26] Feed the speaker directly from DAC1 as
+         * well: the RT5671 MONO output (-> MONOAmp -> TFA speaker amps) is
+         * mixed from "Mono DAC MIX", whose DAC1 inputs are the L1/R1
+         * switches. Without these the FM feed only reaches the headphone and
+         * the speaker stays silent while FM is active. The feed is at a
+         * fixed codec level, scaled by the machine driver's FM Playback
+         * Volume control.
+         */
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXL DAC L1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXR DAC L1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 1);
         ALOGI("fm_set_codec_route: FM -> IF4 DAC -> HPO enabled");
     } else {
         /* Restore the default media path (DAC1 <- IF1, headphone mix off). */
@@ -2509,6 +2524,14 @@ static void fm_set_codec_route(bool enable)
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
         ctl = mixer_get_ctl_by_name(mixer, "Stereo DAC MIXR DAC R1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        /* [FM speaker fix 2026-11-26] Disconnect the DAC1 feed from the MONO
+         * (speaker) mix as well, so normal playback owns it exclusively. */
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXL DAC L1 Switch");
+        if (ctl)
+            mixer_ctl_set_value(ctl, 0, 0);
+        ctl = mixer_get_ctl_by_name(mixer, "Mono DAC MIXR DAC L1 Switch");
         if (ctl)
             mixer_ctl_set_value(ctl, 0, 0);
         ctl = mixer_get_ctl_by_name(mixer, "HPO MIX DAC1 Switch");
