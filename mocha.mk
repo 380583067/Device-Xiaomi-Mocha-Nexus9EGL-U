@@ -104,6 +104,11 @@ PRODUCT_PACKAGES += \
     android.hardware.bluetooth@1.0-service
 
 # TEGRA_BT
+# [BT scan fix 2026-11-26] Remote name requests fail with
+# HCI_ERR_PAGE_TIMEOUT on this platform (3.10 brcm shared transport),
+# leaving inquiry results unnamed; Android 14 Settings hides unnamed
+# devices, so the pairing UI showed an empty "Available devices" list.
+# Show them (with the MAC as label) until the paging issue is fixed.
 PRODUCT_PROPERTY_OVERRIDES += \
     bluetooth.profile.asha.central.enabled=true \
     bluetooth.profile.a2dp.source.enabled=true \
@@ -114,6 +119,7 @@ PRODUCT_PROPERTY_OVERRIDES += \
     bluetooth.profile.hfp.ag.enabled=true \
     bluetooth.profile.opp.enabled=true \
     bluetooth.profile.pan.nap.enabled=true \
+    persist.bluetooth.showdeviceswithoutnames=true \
     bluetooth.profile.pan.panu.enabled=true \
     bluetooth.profile.pbap.server.enabled=true \
     bluetooth.profile.map.server.enabled=true \
