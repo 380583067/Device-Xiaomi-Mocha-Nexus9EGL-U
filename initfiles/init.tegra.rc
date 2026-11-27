@@ -280,25 +280,12 @@ service bugreport /system/bin/dumpstate -d -p -B -z -o /data/user_de/0/com.andro
 # unified scaling setup
 import /vendor/etc/init/hw/init.ussrd.rc
 
-# Logcat in cache folder while is in bootanimation
-# [2026-11-17 fix] There used to be no rotation: the whole buffer was written to
-# /cache/boot_log.txt during boot and measured up to 345 MB, filling the 353 MB
-# /cache so a TWRP OTA install failed with "No space left on device". Now one file is
-# capped at 4 MB with 2 kept, 8 MB in total.
-# [2026-11-18 fix] The service also carried `disabled` + `oneshot`, so it **never ran**
-# (init does not start disabled services by itself and nothing in the tree started
-# logger), which is why the boot log was always empty - the reason there was no
-# evidence to look at when chasing the boot animation loop.
-# Both keywords are gone: it starts with class main, stays resident and rotates with
-# -r/-n, 8 MB in total.
-service logger /system/bin/logcat -b all -D -r 4096 -n 2 -f /cache/boot_log.txt
-    class main
-    user root
-    group root system
-
-on property:sys.boot_completed=1
-    # Stop the logger service
-    stop logger
+# [2026-11-27 release cleanup] The boot-phase logcat-to-/cache monitor
+# (service logger writing /cache/boot_log.txt, stopped at boot_completed)
+# was a debugging aid for the boot-animation loop chase and the
+# enforcing bring-up. Removed for the public release: it logged every
+# process continuously to a world-readable partition, and boot evidence
+# now comes from /sys/fs/pstore and TWRP-side captures when needed.
 
 # Userspace thermal guard: clamps scaling_max_freq before the kernel starts
 # throttling at 84 C (see the header of the script). late_start so it begins
