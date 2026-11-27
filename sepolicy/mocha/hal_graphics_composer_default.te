@@ -7,3 +7,10 @@ allow hal_graphics_composer_default tegradc_device:chr_file rw_file_perms;
 
 # The composer loads the GK20A/tegra firmware images from /system/etc/firmware.
 allow hal_graphics_composer_default system_file:file r_file_perms;
+
+# [2026-11-27 boot audit] the NVIDIA composer manages its own unix socket
+# "com.nvidia.cap" under /data (labeled system_data_file): it unlinks the
+# stale socket left by the previous boot before re-creating it, so it needs
+# the unlink path plus the directory and socket-file create side.
+allow hal_graphics_composer_default system_data_file:dir { search write add_name remove_name };
+allow hal_graphics_composer_default system_data_file:sock_file { create unlink };

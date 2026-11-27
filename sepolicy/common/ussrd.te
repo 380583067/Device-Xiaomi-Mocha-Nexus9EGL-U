@@ -124,3 +124,8 @@ allow ussrd kernel:system module_request;
 # every per-file access.
 allow ussrd sysfs_host1x:dir search;
 allow ussrd kernel:system module_request;
+
+# [2026-11-27 boot audit] ussrd writes sys.vrr.min-refr-per-ns, which is
+# system_prop-labeled in practice (the vrr_prop entry in property_contexts is
+# deliberately commented out; grant on the effective label).
+set_prop(ussrd, system_prop)

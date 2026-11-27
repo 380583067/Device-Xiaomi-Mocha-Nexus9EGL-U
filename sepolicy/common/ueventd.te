@@ -32,3 +32,6 @@ r_dir_file(ueventd, sysfs_mmc_host)
 allow ueventd sysfs_pci_device:file rw_file_perms;
 r_dir_file(ueventd, sysfs_pci_device)
 allow ueventd self:capability sys_nice;
+# [2026-11-27 boot audit] NVIDIA ueventd.rc reads
+# /proc/device-tree/firmware/android/compatible during coldboot.
+allow ueventd proc:file r_file_perms;

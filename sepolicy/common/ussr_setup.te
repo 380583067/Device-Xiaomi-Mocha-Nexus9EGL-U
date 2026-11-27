@@ -33,3 +33,8 @@ allow ussr_setup toolbox_exec:file rx_file_perms;
 allow ussr_setup sysfs_thermal:dir { setattr rw_dir_perms };
 allow ussr_setup sysfs_thermal:{file lnk_file} { setattr rw_file_perms };
 
+
+# [2026-11-27 boot audit] ussr_setup writes phs.therm.cpu_temp, which is
+# default_prop-labeled in practice (the thermal_prop entries in
+# property_contexts are deliberately commented out).
+set_prop(ussr_setup, default_prop)

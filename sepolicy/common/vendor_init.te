@@ -20,3 +20,16 @@ allow vendor_init apexd_prop:file read;
 
 # HWC permissions belong to common/hal_graphics_composer_default.te; do not
 # place HAL rules in the vendor_init domain policy.
+
+# [2026-11-27 boot audit 23:19] NVIDIA vendor_init accesses captured in
+# /cache/boot_log.txt during the permissive boot:
+# - reads sys.perf.profile and sets sys.esrd.powermon_path (both land on
+#   system_prop; the dedicated relabel entries in property_contexts are
+#   deliberately commented out, so grant on the effective label)
+# - sets ro.feature.stylus (default_prop)
+# - stat's the NVIDIA device nodes while processing init.rc chmod entries
+#   (/dev/nvmap gpu_device, /dev/tegra-throughput, /dev/tegra_dc_ctrl)
+get_prop(vendor_init, system_prop)
+set_prop(vendor_init, system_prop)
+set_prop(vendor_init, default_prop)
+allow vendor_init { gpu_device tegra_throughput_device tegradc_device }:chr_file getattr;
