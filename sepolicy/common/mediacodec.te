@@ -22,3 +22,19 @@ allow mediacodec power_service:service_manager find;
 allow mediacodec ussrd_service:service_manager find;
 allow mediacodec camera_device:chr_file rw_file_perms;
 allow_use_phs(mediacodec)
+
+# [enforcing bring-up 2026-11-27] The software codecs map graphic output
+# buffers through the graphics allocator HAL, whose AIDL service is
+# registered under the default vendor service context on this legacy-blob
+# platform. Observed under enforcing: denied { find } for
+# android.hardware.graphics.allocator.IAllocator/default. Read-only service
+# discovery; buffer access goes through the already-granted allocator paths.
+allow mediacodec default_android_vndservice:service_manager find;
+
+# [enforcing bring-up 2026-11-27] The software codecs map graphic output
+# buffers through the graphics allocator HAL, whose AIDL service is
+# registered under the default vendor service context on this legacy-blob
+# platform. Observed under enforcing: denied { find } for
+# android.hardware.graphics.allocator.IAllocator/default. Read-only service
+# discovery; buffer access goes through the already-granted allocator paths.
+allow mediacodec default_android_vndservice:service_manager find;
