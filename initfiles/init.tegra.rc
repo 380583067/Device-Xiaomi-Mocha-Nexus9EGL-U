@@ -257,20 +257,10 @@ on boot
 # TLK storage service
 import /vendor/etc/init/hw/init.tlk.rc
 
-on property:ro.debuggable=1
-    # EMC debug interface
-    chmod 0666 /sys/kernel/debug/tegra_emc/eack_state
-    # LSM6DB0 interface (Mocha specific)
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_accel.0/enable
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_accel.0/fifo_enable
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_accel.0/sampling_frequency
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_gyro.0/enable
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_gyro.0/fifo_enable
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_gyro.0/sampling_frequency
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_magn.0/enable
-    chmod 0660 /sys/devices/platform/tegra12-i2c.0/i2c-0/0-0008/lsm6db0_magn.0/sampling_frequency
+# [2026-11-27 release cleanup] the ro.debuggable=1 debug-node chmod block
+# (EMC debug interface + LSM6DB0 sensor nodes) was removed with the rest of
+# the debugging-era mechanisms; on user builds it never fired anyway.
 
-# bugreport is triggered by the VOLUME-DOWN and VOLUME-UP keys
 service bugreport /system/bin/dumpstate -d -p -B -z -o /data/user_de/0/com.android.shell/files/bugreports/bugreport
     class main
     disabled

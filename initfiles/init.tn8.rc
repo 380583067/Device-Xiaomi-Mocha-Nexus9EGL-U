@@ -66,8 +66,6 @@ on property:sys.boot_completed=1
     write /sys/class/tty/ttyS0/console_write_enable 0
     write /sys/block/mmcblk0/queue/read_ahead_kb 512
     write /sys/block/mmcblk0/queue/iostats 1
-    # Setup-wizard fallback (for old userdata where the SettingsProvider defaults no longer apply)
-    start mocha_provision
 
 on boot
     # change vm memory parameter
@@ -89,18 +87,10 @@ on property:apexd.status=ready
 # (init.cpp:1105) and by then PropertyLoadBootDefaults() has loaded the properties,
 # so the action runs at the very start of boot when system_server /
 # PackageManagerService are not up yet and pm must fail.
-# mocha_provision handles it after boot_completed instead, see the service below.
 
-# [setup wizard skip 2026-11-17] There were two root causes:
-#   1) the real "provisioned" flag is Settings.Secure.user_setup_complete, and
-#      LineageOS SetupWizard only looks at that (SetupWizardUtils.java:181). The old
-#      code only wrote global.device_provisioned, so the wizard never went away.
-#   2) an exec in `on property:sys.boot_completed=1` races with the wizard start, and
-#      on the second boot (DB already present) it cannot fix anything either.
-# The real fix writes the defaults when SettingsProvider creates its database, see
-# overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml.
-# The start mocha_provision above is only a fallback (old userdata with an existing
-# DB where the defaults no longer apply).
+# [2026-11-27 release cleanup] the setup-wizard skip machinery
+# (mocha_provision) was removed for the public release; a fresh install now
+# runs the standard LineageOS setup wizard.
 
 # Fallback service: mark the device as provisioned and disable the SMS app, which
 # is useless without a RIL. See /vendor/bin/mocha_provision.sh.
@@ -111,11 +101,3 @@ service vendor.init_renderer /vendor/bin/init.renderer.sh
     user root
     oneshot
 
-# user shell is deliberate: uid 2000 is the same as adb shell, and the permission
-# behaviour of settings / pm is verified on the device; switching to system(1000)
-# would need extra permission debugging.
-service mocha_provision /system/bin/sh /vendor/bin/mocha_provision.sh
-    user shell
-    group shell
-    disabled
-    oneshot

@@ -573,11 +573,8 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/init.renderer.sh:$(TARGET_COPY_OUT_VENDOR)/bin/init.renderer.sh \
     $(LOCAL_PATH)/initfiles/ussr_setup.sh:/system/bin/ussr_setup.sh
 
-# Setup-wizard skip script: run by the mocha_provision oneshot service in
-# init.tn8.rc once sys.boot_completed=1, it sets both device_provisioned and
-# user_setup_complete so the device does not sit in the setup wizard.
-PRODUCT_COPY_FILES += \
-    $(LOCAL_PATH)/initfiles/mocha_provision.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_provision.sh
+# [2026-11-27 release cleanup] the setup-wizard skip (mocha_provision) was
+# removed; see init.tn8.rc for the note.
 
 # Performance profiles (power.mocha.rc) and the userspace thermal guard.
 # The guard owns scaling_max_freq: profile ceiling from persist.mocha.perf_profile,
