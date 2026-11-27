@@ -3,7 +3,16 @@
 # With an empty /data/misc/adb/adb_keys, ro.adb.secure=1 makes adbd demand
 # authorisation and the host stays offline during the handshake. Setting it to true
 # allows unauthenticated root debugging. Must be defined before inheriting common.mk.
+#
+# [user build 2026-11-27] ro.adb.secure must be 1 on user builds - build/make
+# writes it and an unconditional WITH_ADB_INSECURE here produced a duplicate
+# sysprop assignment that failed post_process_props. The host's public key is
+# pre-seeded into /data/misc/adb/adb_keys (persists across TWRP installs),
+# so user builds authorise the workstation without on-screen confirmation.
+# Non-user variants keep the insecure setting for unauthenticated debugging.
+ifneq ($(TARGET_BUILD_VARIANT),user)
 WITH_ADB_INSECURE := true
+endif
 
 # Inherit device configuration for mocha.
 # Inherit some common lineage stuff.
