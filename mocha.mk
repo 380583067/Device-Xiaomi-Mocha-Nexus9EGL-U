@@ -539,12 +539,14 @@ PRODUCT_PACKAGES += \
 # (power.tegra.so)". The blob cannot be audited and its sysfs writes silently failed
 # before the DAC permissions were fixed; the new HAL also does frequency scaling and
 # adds performance profiles (power.mocha.rc), a GPU floor and camera hints.
-# power.stats@1.0-service.mock stays for now, there is no replacement yet.
-# The blob itself is gone from proprietary-files.txt and the vendor repo (that
-# wrapper service was its only user).
-PRODUCT_PACKAGES += \
-    android.hardware.power-service.mocha \
-    android.hardware.power.stats@1.0-service.mock
+# [2026-11-27 user build] android.hardware.power.stats@1.0-service.mock is REMOVED:
+# the AOSP mock module ships no sepolicy (real devices use real power.stats HALs),
+# and under a user build (enforcing from boot) init cannot legally start an
+# unlabelled vendor HAL service - hwservicemanager's lazy start fails, and
+# system_server blocked forever in PowerStatsService waiting for the never-starting
+# IPowerStats HAL until the watchdog killed it (boot hang at the animation).
+# PowerStatsService handles a missing HAL gracefully (standard path for devices
+# without power stats reporting).
 
 # Ramdisk
 PRODUCT_PACKAGES += \
