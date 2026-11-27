@@ -92,8 +92,6 @@ on property:apexd.status=ready
 # (mocha_provision) was removed for the public release; a fresh install now
 # runs the standard LineageOS setup wizard.
 
-# Fallback service: mark the device as provisioned and disable the SMS app, which
-# is useless without a RIL. See /vendor/bin/mocha_provision.sh.
 # Forced GPU composition: SurfaceFlinger's raw transaction 1008 is "Toggle forced
 # GPU composition". That code is still live on A14; removing it returns to HWC
 # composition and then the composer hangs -> userspace reboot loop.
