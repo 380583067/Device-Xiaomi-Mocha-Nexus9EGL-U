@@ -244,7 +244,7 @@ on property:sys.boot_completed=1
 # Watch service: re-applies the cache tmpfs whenever the user-unlock CE
 # remount clears it (a boot_completed one-shot exec is not enough - the
 # remount happens after boot completes and wipes the mount).
-service mocha_cache_tmpfs /system/bin/sh /system/bin/mocha_app_cache_tmpfs.sh --watch
+service mocha_cache_tmpfs /system/bin/mocha_cache_tmpfsd --watch
     class late_start
     user root
     group root

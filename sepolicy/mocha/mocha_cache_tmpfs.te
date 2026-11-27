@@ -1,0 +1,30 @@
+# mocha_cache_tmpfs - mounts a tmpfs over the cache directory of GL-heavy
+# apps (com.phoenix.read and friends) at boot and keeps it applied.
+#
+# Why: the NVIDIA GL driver JIT-compiles shaders into a cache file in the
+# app's cache dir, maps it twice and unlinks it; the kernel then drops those
+# unrecoverable clean file-backed pages under memory pressure and the app's
+# render thread dies with SIGSEGV SEGV_ACCERR (libglcore shader JIT). On a
+# tmpfs the same pages are shmem and swap into zram instead of being dropped.
+#
+# Why its own domain: the service runs as root but must reach into
+# app_data_file directories, which carry per-app MLS categories
+# (s0:c144,c256,c512,c768). The init domain has no categories and MLS read
+# constraints would deny every lookup, so this domain is mlstrustedsubject
+# and only gets the narrow rule set below.
+#
+# See initfiles/mocha_app_cache_tmpfs.sh for the full crash analysis.
+type mocha_cache_tmpfs, domain, mlstrustedsubject;
+type mocha_cache_tmpfs_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(mocha_cache_tmpfs)
+
+# Walk into /data/data/<pkg>/cache and stat it for the uid/gid.
+allow mocha_cache_tmpfs app_data_file:dir search;
+
+# Mount / unmount the tmpfs overlay, and re-create its root as the app
+# expects it (mode 0700, app uid/gid from the mount options).
+allow mocha_cache_tmpfs tmpfs:filesystem { mount remount unmount };
+allow mocha_cache_tmpfs tmpfs:dir { search mounton create getattr setattr };
+allow mocha_cache_tmpfs tmpfs:file { create getattr setattr open read write unlink };
+allow mocha_cache_tmpfs self:capability { dac_override sys_admin };

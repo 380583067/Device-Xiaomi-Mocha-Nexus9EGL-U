@@ -7,3 +7,6 @@
 /data/sns_lsm6db0_pipes(/.*)?		u:object_r:mocha_sns_pipes:s0
 # ussrd/phsd runtime directory (see common/ussrd.te).
 /data/misc/phs(/.*)?			u:object_r:mocha_phs_data_file:s0
+# [HongGuo crash fix 2026-11-26] dedicated domain for the app-cache tmpfs
+# watcher (see mocha_cache_tmpfs.te - MLS-trusted to reach app_data_file).
+/system/bin/mocha_cache_tmpfsd            u:object_r:mocha_cache_tmpfs_exec:s0

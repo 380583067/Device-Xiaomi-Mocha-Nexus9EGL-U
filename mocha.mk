@@ -95,7 +95,7 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/bluetooth/bt_vendor.conf:system/etc/bluetooth/bt_vendor.conf \
     $(LOCAL_PATH)/initfiles/init.btloader.sh:system/bin/init.btloader.sh \
-    $(LOCAL_PATH)/initfiles/mocha_app_cache_tmpfs.sh:system/bin/mocha_app_cache_tmpfs.sh
+    $(LOCAL_PATH)/initfiles/mocha_app_cache_tmpfs.sh:system/bin/mocha_cache_tmpfsd
 
 PRODUCT_PACKAGES += \
     libbt-vendor \
