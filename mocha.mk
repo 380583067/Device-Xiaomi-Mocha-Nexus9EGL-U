@@ -704,3 +704,8 @@ PRODUCT_USES_LIBRARIES += androidx.window.extensions
 PRODUCT_OPTIONAL_USES_LIBRARIES += androidx.window.extensions
 PRODUCT_PACKAGES += androidx.window.extensions
 PRODUCT_BROKEN_VERIFY_USES_LIBRARIES := true
+
+# Speed-compile SystemUI at build time: it is the most frame-time-sensitive
+# component (status bar, notifications, keyguard animations) and on this
+# software-composited 2 GB board its JIT warm-up shows as visible jank.
+PRODUCT_DEXPREOPT_SPEED_APPS += SystemUI
