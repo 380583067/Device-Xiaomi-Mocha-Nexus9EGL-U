@@ -546,7 +546,18 @@ PRODUCT_PACKAGES += \
 # system_server blocked forever in PowerStatsService waiting for the never-starting
 # IPowerStats HAL until the watchdog killed it (boot hang at the animation).
 # PowerStatsService handles a missing HAL gracefully (standard path for devices
-# without power stats reporting).
+# without power stats reporting; verified on device 2026-11-27 22:48 boot log:
+# "StartPowerStatsService took to complete: 5ms" and boot continued).
+# [2026-11-27 boot hang fix] The cleanup above accidentally dropped
+# android.hardware.power-service.mocha as well, which removed the only provider of
+# android.hardware.power.IPower/default: system_server, surfaceflinger and friends
+# then waited for the never-registered HAL forever (init: "Could not find
+# 'aidl/android.hardware.power.IPower/default' for ctl.interface_start"), the
+# watchdog killed system_server and zygote restarted in a loop - every build hung
+# at the boot animation, userdebug (permissive) included, because the HAL binary
+# was simply absent. Keep the real power HAL; only the mock is gone.
+PRODUCT_PACKAGES += \
+    android.hardware.power-service.mocha
 
 # Ramdisk
 PRODUCT_PACKAGES += \
