@@ -13,3 +13,31 @@ allow conn_wifi bluetooth_data_file:file { create write setattr open };
 # vendor_file, and init's exec of it was denied. Give it a type of its own.
 type conn_wifi_exec, exec_type, vendor_file_type, file_type;
 allow init conn_wifi_exec:file { getattr open read execute execute_no_trans };
+
+# ==== [enforcing-from-boot 2026-11-27] user-build readiness ====
+# The domain transition never completed before: init could execute the
+# binary but no domain_trans() existed, so the entrypoint/rlimitinh/siginh
+# checks failed and the service either stayed in init or died. Also: the
+# service reads back the MAC file it wrote, reads the wifi data dir, sets
+# the bluetooth properties, and needs dac_override for the chown.
+domain_trans(init, conn_wifi_exec, conn_wifi)
+allow conn_wifi bluetooth_data_file:file { getattr read };
+allow conn_wifi wifi_data_file:dir getattr;
+allow conn_wifi wifi_data_file:file { getattr open read };
+allow conn_wifi self:capability dac_override;
+set_prop(conn_wifi, bluetooth_prop)
+set_prop(conn_wifi, exported_bluetooth_prop)
+
+# ==== [enforcing-from-boot 2026-11-27] user-build readiness ====
+# The domain transition never completed before: init could execute the
+# binary but no domain_trans() existed, so the entrypoint/rlimitinh/siginh
+# checks failed and the service either stayed in init or died. Also: the
+# service reads back the MAC file it wrote, reads the wifi data dir, sets
+# the bluetooth properties, and needs dac_override for the chown.
+domain_trans(init, conn_wifi_exec, conn_wifi)
+allow conn_wifi bluetooth_data_file:file { getattr read };
+allow conn_wifi wifi_data_file:dir getattr;
+allow conn_wifi wifi_data_file:file { getattr open read };
+allow conn_wifi self:capability dac_override;
+set_prop(conn_wifi, bluetooth_prop)
+set_prop(conn_wifi, exported_bluetooth_prop)

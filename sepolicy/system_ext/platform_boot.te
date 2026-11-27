@@ -1,0 +1,86 @@
+# platform_boot.te - enforcing-from-boot grants for platform-private domains
+#
+# The board boots with the full policy from the start on user builds. While
+# the tree previously relied on a permissive cmdline plus a late setenforce 1,
+# the /cache boot log captured 1177 avc denials that permissive-mode boot
+# allowed silently; under enforcing-from-boot each of those would be a real
+# denial and the likely cause of a boot hang. This file carries the
+# platform-private-domain half of the fixes; public-domain rules on vendor
+# types live in sepolicy/mocha/user_boot.te.
+
+# ---- the legacy blob /proc/<pid>/maps walk ---------------------------------
+# Pre-treble Tegra vendor blobs map their libraries into nearly every vendor
+# process, and platform daemons walking /proc/<pid>/maps read those libraries
+# (hwcomposer.tegra.so, libnvcap_video.so, libnvgr.so, libnvomxadaptor.so,
+# libsensors.lsm6db0.so, ...). AOSP grants exactly this set to `domain` when
+# full treble is off (not_full_treble in public/domain.te), and this platform
+# predates treble.
+allow domain vendor_file:dir r_dir_perms;
+allow domain vendor_file:file { getattr map open read };
+allow domain vendor_file:lnk_file { getattr read };
+
+# init runs vendor rc helpers and vendor daemons directly.
+allow init vendor_file:file { execute execute_no_trans };
+# The NVIDIA composer shim and the software codec apex exec vendor libraries.
+allow surfaceflinger vendor_file:file execute;
+allow mediaswcodec vendor_file:file execute;
+
+# ---- odrefresh / dex2oat property-file scanning ----------------------------
+# dexopt mmaps the libc property files; every *_prop labelled file shows up.
+# The property read itself is noise (values come through the property service
+# either way), so silence it rather than granting - same choice the official
+# LineageOS nvidia sepolicy makes.
+dontaudit odrefresh property_type:file { getattr open read map };
+
+# ---- init ------------------------------------------------------------------
+allow init hwservicemanager:binder { call transfer };
+allow init hal_power_stats_hwservice:hwservice_manager { add find };
+allow init hidl_base_hwservice:hwservice_manager add;
+allow init system_file:file mounton;
+allow init shell_exec:file execute_no_trans;
+allow init sysfs:file { open write };
+allow init sysfs_devices_system_cpu:file write;
+allow init proc:file r_file_perms;
+
+# ---- vendor_init -----------------------------------------------------------
+# Legacy vendor rc files set vold/audio/bpf properties, wipe stale /cache
+# entries and create the factory mountpoint on tmpfs. vendor_init is exempt
+# from the property-set neverallows in AOSP policy.
+set_prop(vendor_init, vold_prop)
+set_prop(vendor_init, audio_prop)
+set_prop(vendor_init, bpf_progs_loaded_prop)
+allow vendor_init tmpfs:dir { create write add_name };
+allow vendor_init cache_file:dir { write remove_name };
+allow vendor_init cache_file:file unlink;
+allow vendor_init device:file getattr;
+
+# ---- system_server ---------------------------------------------------------
+# The mocha IMU pipe pair lives under /data/system: system_server recreates
+# the directory and FIFOs that the sensor HAL consumes.
+allow system_server system_data_root_file:dir { create write add_name };
+allow system_server system_data_root_file:fifo_file { create open read write getattr };
+allow system_server build_bootimage_prop:file r_file_perms;
+
+# ---- cross-domain property-file reads --------------------------------------
+# ussrd polls init's private service-status properties while waiting for phsd.
+# The type is platform-private so vendor policy cannot name it, but every
+# domain carries the public `domain` attribute: grant it here at attribute
+# scope (read-only on a status file).
+allow domain init_service_status_private_prop:file r_file_perms;
+
+# The NVIDIA composer shim creates a temp file through the AOSP
+# hal_graphics_composer_server_tmpfs transition and talks to the property
+# service; hal_graphics_composer_default is a vendor type, so these go
+# through its public hal_graphics_composer attribute.
+allow hal_graphics_composer hal_graphics_composer_server_tmpfs:file { create open };
+allow hal_graphics_composer graphics_config_prop:file r_file_perms;
+allow hal_graphics_composer graphics_config_writable_prop:file r_file_perms;
+allow hal_graphics_composer default_prop:file r_file_perms;
+allow hal_graphics_composer system_prop:file r_file_perms;
+allow hal_graphics_composer vendor_default_prop:file r_file_perms;
+allow hal_graphics_composer property_socket:sock_file write;
+allow hal_graphics_composer init:unix_stream_socket connectto;
+allow hal_graphics_composer system_prop:property_service set;
+allow hal_graphics_composer system_data_file:dir { write add_name };
+allow hal_graphics_composer system_data_file:sock_file { create rename setattr };
+allow hal_graphics_composer tmpfs:dir { write add_name };

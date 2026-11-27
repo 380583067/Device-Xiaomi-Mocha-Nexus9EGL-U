@@ -1,0 +1,49 @@
+# user_boot.te - enforcing-from-boot grants for public platform domains
+#
+# Companion to system_ext/platform_boot.te: these rules target public
+# platform domains (init, system_server, toolbox, ...) on vendor-defined
+# types, which vendor policy can see, and public-domain rules on public
+# types that are more at home next to the vendor tree. See the platform_boot
+# header for where the denial inventory comes from.
+
+# ---- system_server <-> the mocha IMU pipes ---------------------------------
+# The sensor HAL serves its FIFOs from a vendor-labelled directory;
+# system_server recreates stale entries during its sensor registration.
+allow system_server mocha_sns_pipes:dir { write search remove_name rmdir };
+allow system_server mocha_sns_pipes:fifo_file { unlink open };
+# init writes the IMU enable node while toggling sensors.
+allow init sysfs_mocha_imu:file open;
+
+# ---- toolbox: BT/WiFi MAC ownership fixups from init scripts ---------------
+# init runs toolbox chown/chmod over mocha_btmacaddr.txt and the wifi data
+# dir and sets the bluetooth props through the property service.
+allow toolbox bluetooth_data_file:file setattr;
+allow toolbox bluetooth_data_file:dir getattr;
+allow toolbox wifi_data_file:dir getattr;
+allow toolbox wifi_data_file:file { getattr setattr };
+allow toolbox init:unix_stream_socket connectto;
+allow toolbox init:fifo_file read;
+allow toolbox self:capability { dac_override chown fowner fsetid };
+set_prop(toolbox, bluetooth_prop)
+set_prop(toolbox, exported_bluetooth_prop)
+
+# ---- conn_wifi (Xiaomi vendor connectivity service) ------------------------
+# Completed in conn_wifi.te: domain transition, MAC file read, props.
+
+# ---- ussrd leftovers -------------------------------------------------------
+# sysfs_host1x file access was granted earlier; the directory traversal was
+# not. module_request: the service asks the kernel for a host1x module.
+allow ussrd sysfs_host1x:dir search;
+allow ussrd kernel:system module_request;
+
+# ---- misc single-purpose services ------------------------------------------
+allow mediacodec default_prop:file r_file_perms;
+allow hal_bluetooth_default default_prop:file r_file_perms;
+allow surfaceflinger vendor_default_prop:file r_file_perms;
+# installd renames the stale com.nvidia.cap socket left by the NV shim.
+allow installd system_data_file:sock_file { create rename setattr };
+
+# The composer writes into a categorised system_data_file directory
+# (s0:c512,c768, the NV shim's per-app scratch); MLS requires the subject to
+# dominate it.
+typeattribute hal_graphics_composer_default mlstrustedsubject;

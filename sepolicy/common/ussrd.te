@@ -112,3 +112,15 @@ get_prop(ussrd, system_prop)
 # is private to plat policy, while `ussrd` is a vendor domain that plat policy
 # is not allowed to name. It stays as the last 6 denials per boot.
 get_prop(ussrd, default_prop)
+
+# [enforcing-from-boot 2026-11-27] file grants covered the tree walk but not
+# the directory traversal on host1x (search), which the service needs before
+# every per-file access.
+allow ussrd sysfs_host1x:dir search;
+allow ussrd kernel:system module_request;
+
+# [enforcing-from-boot 2026-11-27] file grants covered the tree walk but not
+# the directory traversal on host1x (search), which the service needs before
+# every per-file access.
+allow ussrd sysfs_host1x:dir search;
+allow ussrd kernel:system module_request;
