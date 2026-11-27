@@ -466,6 +466,11 @@ PRODUCT_PACKAGES += \
 DEVICE_PACKAGE_OVERLAYS += \
     $(LOCAL_PATH)/overlay
 
+# WiFi 6 backward-compatibility: disable the framework's WPA2->WPA3 (SAE)
+# auto-upgrade, which the 2014 bcmdhd firmware cannot complete on WPA2/WPA3
+# transition-mode APs. See rro_overlays/WifiSaeCompatOverlay for details.
+PRODUCT_PACKAGES += WifiSaeCompatOverlay
+
 # Partitions
 $(call inherit-product, $(SRC_TARGET_DIR)/product/non_ab_device.mk)
 

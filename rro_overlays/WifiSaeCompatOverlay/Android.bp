@@ -1,0 +1,7 @@
+runtime_resource_overlay {
+    name: "WifiSaeCompatOverlay",
+    manifest: "AndroidManifest.xml",
+    resource_dirs: ["res"],
+    sdk_version: "current",
+    vendor: true,
+}

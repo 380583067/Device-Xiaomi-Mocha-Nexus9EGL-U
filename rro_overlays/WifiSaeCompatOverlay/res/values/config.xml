@@ -1,0 +1,11 @@
+<resources>
+    <!-- mocha's 2014-era bcmdhd firmware (BCM4350/4354, Wave 2 802.11ac) has no
+         SAE support. WiFi 6 routers commonly ship in WPA2/WPA3 transition mode,
+         and the framework's WPA2->WPA3 auto-upgrade would pass SAE auth params
+         down to wpa_supplicant, which the firmware cannot complete - showing up
+         as "WiFi 6 router connects but never associates".
+         Pin the upgrade off so every association uses the WPA2-PSK params of
+         WiFi 6 APs (backward compatibility mode). The chip is ac-only anyway;
+         WPA3 security would add nothing to a legacy radio. -->
+    <bool translatable="false" name="config_wifiSaeUpgradeEnabled">false</bool>
+</resources>
