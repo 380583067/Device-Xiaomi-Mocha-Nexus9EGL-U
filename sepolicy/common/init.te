@@ -76,3 +76,7 @@ allow init system_file:file execute_no_trans;
 # The settings tool binder-calls system_server (SettingsProvider); observed
 # denied { call } / { transfer } init -> system_server.
 allow init system_server:binder { call transfer };
+
+# [2026-11-27 boot audit 23:52] NVIDIA init.rc chmods /proc/last_kmsg during
+# early boot (observed under enforcing with the 2026-11-27 23:44 policy set).
+allow init proc:file setattr;
