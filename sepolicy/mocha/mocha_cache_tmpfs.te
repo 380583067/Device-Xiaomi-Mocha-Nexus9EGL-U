@@ -14,13 +14,44 @@
 # and only gets the narrow rule set below.
 #
 # See initfiles/mocha_app_cache_tmpfs.sh for the full crash analysis.
+#
+# KNOWN LIMITATION under enforcing (2026-11-28): the root of a tmpfs mount is
+# labelled tmpfs, not app_data_file, so an app writing into its own (overlaid)
+# cache dir is denied - untrusted_app -> tmpfs:dir write - and apps that create
+# cache files there would fail. The kernel here does not support the
+# rootcontext= mount option, so the mount cannot be labelled from the script.
+# The overlay therefore only behaves correctly while the device runs
+# permissive. Before this board can go enforcing either the mountpoint has to be
+# relabelled (needs relabelfrom tmpfs:dir / relabelto app_data_file:dir plus a
+# matching file policy for the files created inside) or the overlay has to be
+# dropped in favour of a dedicated labelled directory (the same applies to
+# /mnt/tmp/glcache used by the __GL_SHADER_DISK_CACHE_PATH redirect).
 type mocha_cache_tmpfs, domain, mlstrustedsubject;
 type mocha_cache_tmpfs_exec, exec_type, vendor_file_type, file_type;
 
 init_daemon_domain(mocha_cache_tmpfs)
 
+# mounton is what actually lets the overlay be mounted: without it on the
+# app's directory the mount of the tmpfs over <pkg>/cache is denied, and under
+# enforcing the whole anti-crash mount would silently do nothing (230 denials
+# per boot on 2026-11-28 while running permissive).
+#
 # Walk into /data/data/<pkg>/cache and stat it for the uid/gid.
-allow mocha_cache_tmpfs app_data_file:dir search;
+#
+# getattr is not optional: the watcher runs `stat -c %u` on every cache dir and
+# mounts with that uid/gid, so without it each stat fails, uid comes back empty
+# and the loop skips the directory. Under permissive that went unnoticed (the
+# mounts happened anyway, 179 of them on 2026-11-28); under enforcing the
+# whole anti-crash mount would silently do nothing.
+allow mocha_cache_tmpfs app_data_file:dir { search getattr mounton };
+# The other per-app data types reachable from /data/data: privileged apps,
+# system apps, the radio, and the shell.
+allow mocha_cache_tmpfs { privapp_data_file system_app_data_file radio_data_file shell_data_file }:dir { search getattr mounton };
+# bluetooth and nfc keep their cache outside the app data types above.
+allow mocha_cache_tmpfs { bluetooth_data_file nfc_data_file }:dir { search getattr mounton };
+
+# Enumerate /data/data itself (glob expansion) and traverse into it.
+allow mocha_cache_tmpfs system_data_file:dir { search getattr read open };
 
 # Mount / unmount the tmpfs overlay, and re-create its root as the app
 # expects it (mode 0700, app uid/gid from the mount options).
@@ -28,3 +59,9 @@ allow mocha_cache_tmpfs tmpfs:filesystem { mount remount unmount };
 allow mocha_cache_tmpfs tmpfs:dir { search mounton create getattr setattr };
 allow mocha_cache_tmpfs tmpfs:file { create getattr setattr open read write unlink };
 allow mocha_cache_tmpfs self:capability { dac_override sys_admin };
+
+# installd owns app data directories: it stats them for quota/cache cleanup and
+# chmods them (setattr) when it recreates a cache dir. Once a cache dir is a
+# tmpfs mountpoint those operations hit the tmpfs type instead of app_data_file.
+# Seen as 4 denials per boot on 2026-11-28.
+allow installd tmpfs:dir { search getattr setattr };

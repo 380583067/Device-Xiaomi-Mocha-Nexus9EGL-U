@@ -36,7 +36,11 @@
 # reinstalls.
 
 CACHE_TMPFS_SIZE=96m
-EXCLUDE_PACKAGES=""
+# com.android.se (Secure Element service) keeps a cache but has no graphics
+# work, and its domain is not an appdomain, so overlaying a tmpfs there only
+# makes secure_element reach for tmpfs types it has no rules for. Skipping it
+# keeps the enforcing boot quiet without losing anything.
+EXCLUDE_PACKAGES="com.android.se"
 
 do_mounts()
 {
