@@ -99,3 +99,19 @@ service vendor.init_renderer /vendor/bin/init.renderer.sh
     user root
     oneshot
 
+
+# [2026-11-28 WiFi auto-connect fix] Write the China-reachable captive-portal
+# probe URLs once after boot_completed. See mocha_netconfig.sh for why the
+# AOSP gstatic defaults fail validation on every boot in China and escalate
+# saved networks to NETWORK_SELECTION_DISABLED_NO_INTERNET_PERMANENT.
+# user shell deliberate: the same uid as adb shell, whose settings-write
+# permission behaviour is verified on the device (see the removed
+# mocha_provision notes in the git history for the init.exec race warning).
+service mocha_netconfig /system/bin/sh /vendor/bin/mocha_netconfig.sh
+    user shell
+    group shell
+    disabled
+    oneshot
+
+on property:sys.boot_completed=1
+    start mocha_netconfig

@@ -595,7 +595,13 @@ PRODUCT_COPY_FILES += \
 # kernel itself only throttles at 84 C, which is too late for a fanless tablet.
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/initfiles/power.mocha.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/power.mocha.rc \
-    $(LOCAL_PATH)/initfiles/mocha_thermal.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_thermal.sh
+    $(LOCAL_PATH)/initfiles/mocha_thermal.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_thermal.sh \
+    $(LOCAL_PATH)/initfiles/mocha_netconfig.sh:$(TARGET_COPY_OUT_VENDOR)/bin/mocha_netconfig.sh
+
+# [2026-11-28 WiFi auto-connect fix] the mocha_netconfig boot_completed service
+# (defined in init.tn8.rc) writes the China-reachable captive-portal probe URLs
+# at every boot; see mocha_netconfig.sh for the root cause (gstatic blocked ->
+# every validation fails -> NO_INTERNET_PERMANENT disables all saved networks).
 
 # Sensors
 PRODUCT_PACKAGES += \
