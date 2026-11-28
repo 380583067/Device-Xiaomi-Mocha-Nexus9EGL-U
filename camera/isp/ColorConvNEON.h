@@ -19,6 +19,10 @@ public:
     
     // Convert RGB to YUV420 (NV12 format)
     void rgbToNv12(const uint8_t* rgb, uint8_t* yPlane, uint8_t* uvPlane);
+    /* [2026-11-28 front portrait video] Same conversion with explicit dims:
+     * the rotated portrait RGB buffer (720x1280) is converted with the
+     * swapped dims while the converter was initialized at 1280x720. */
+    void rgbToNv12(const uint8_t* rgb, int w, int h, uint8_t* yPlane, uint8_t* uvPlane);
     
     // Convert RGB to RGBA
     void rgbToRgba(const uint8_t* rgb, uint8_t* rgba, uint32_t width, uint32_t height);

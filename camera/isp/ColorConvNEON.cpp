@@ -38,12 +38,16 @@ int ColorConvNEON::initialize(uint16_t width, uint16_t height) {
 }
 
 void ColorConvNEON::rgbToNv12(const uint8_t* rgb, uint8_t* yPlane, uint8_t* uvPlane) {
+    rgbToNv12(rgb, mWidth, mHeight, yPlane, uvPlane);
+}
+
+/* [2026-11-28 front portrait video] Explicit-dims variant: the caller rotates
+ * the RGB content 90 CCW into a portrait buffer and converts it with the
+ * swapped dims without touching the converter's initialized state. */
+void ColorConvNEON::rgbToNv12(const uint8_t* rgb, int width, int height, uint8_t* yPlane, uint8_t* uvPlane) {
     if (!mInitialized || !rgb || !yPlane || !uvPlane) {
         return;
     }
-
-    const int width = mWidth;
-    const int height = mHeight;
 
     // BT.601 coefficients as NEON vectors
     const int16x8_t C_Y_R = vdupq_n_s16(66);

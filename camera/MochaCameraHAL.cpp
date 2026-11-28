@@ -163,6 +163,10 @@ struct mocha_camera_device_t {
     uint32_t pipeline_height;
     uint32_t last_config_width;
     uint32_t last_config_height;
+    /* [2026-11-28 front portrait video] Set by configureStreams when the app
+     * configured a portrait (720x1280) YUV stream on camera 1: the pipeline
+     * captures landscape and rotates the YUV output 90 CCW. */
+    bool portrait_video;
 
     mocha::JpegEncoder* jpeg_encoder;
     uint8_t* temp_rgba;
@@ -227,6 +231,57 @@ static bool writeJpegToBlob(mocha_camera_device_t* dev,
                             const camera3_stream_buffer_t& out,
                             const uint8_t* rgba, uint32_t w, uint32_t h) {
     if (!dev || !out.buffer || !out.stream || !rgba) return false;
+    /* [2026-11-28 front photo mirror, v2] The front preview is mirrored (selfie
+     * convention) while the sensor pixels are not, so a saved photo looked
+     * flipped left-right relative to what the user framed. Mirror the DATA such
+     * that the DISPLAYED photo (pixels + EXIF rotation) ends up mirrored:
+     *
+     *   displayed = R(deg) . X(buffer)      we want  displayed = Hflip . R(deg)(buffer)
+     *   =>  X = R(deg)^-1 . Hflip . R(deg)
+     *
+     * A reflection conjugated by a rotation is a reflection about a rotated
+     * axis, so X depends on the EXIF rotation the encoder is about to write:
+     *   deg 90 / 270  ->  X = Vflip (vertical axis rotated by 90 degrees)
+     *   deg 0 / 180   ->  X = Hflip
+     * v1 applied Hflip unconditionally; on this tablet the app requests 270
+     * (device flat), so the photo came out exactly 180 degrees from the
+     * preview (verified: the subject's head and the pink ceiling beam both
+     * appeared rotated by half a turn w.r.t. the preview screenshot).
+     *
+     * Vflip is done by reversing the row order (memcpy per row, no per-pixel
+     * loop) because a full-res still is several megapixels. */
+    if (dev->camera_id == 1) {
+        const int deg = (((dev->jpeg_orientation_set ? dev->jpeg_orientation
+                           : MochaCameraHAL::kCameras[dev->camera_id].orientation) % 360) + 360) % 360;
+        uint8_t* px = const_cast<uint8_t*>(rgba);
+        if (deg == 90 || deg == 270) {
+            const size_t rowBytes = (size_t)w * 4;
+            uint8_t* tmp = (uint8_t*)malloc(rowBytes);
+            if (tmp) {
+                for (uint32_t y = 0; y < h / 2; y++) {
+                    uint8_t* a = px + (size_t)y * rowBytes;
+                    uint8_t* b = px + (size_t)(h - 1 - y) * rowBytes;
+                    memcpy(tmp, a, rowBytes);
+                    memcpy(a, b, rowBytes);
+                    memcpy(b, tmp, rowBytes);
+                }
+                free(tmp);
+            } else {
+                ALOGE("jpeg mirror: no scratch row for Vflip");
+            }
+        } else {
+            for (uint32_t y = 0; y < h; y++) {
+                uint8_t* row = px + (size_t)y * w * 4;
+                for (uint32_t x = 0; x < w / 2; x++) {
+                    for (int b = 0; b < 4; b++) {
+                        uint8_t t = row[x * 4 + b];
+                        row[x * 4 + b] = row[(w - 1 - x) * 4 + b];
+                        row[(w - 1 - x) * 4 + b] = t;
+                    }
+                }
+            }
+        }
+    }
 
     char skip[PROPERTY_VALUE_MAX] = {0};
     property_get("persist.mocha.cam.skipjpeg", skip, "0");
@@ -502,21 +557,29 @@ static camera_metadata_t* init_static_characteristics(int cameraId) {
      * scaling/binning registers must not be touched - programming a 1:1 window the
      * IMX179 way on 2026-11-22 made even 720p hit a VI timeout and was reverted).
      * Advertise 720p only; a larger request falls back here instead of a VI timeout. */
+    /* [2026-11-28 front portrait video] 720x1280 YCbCr lets the app record
+     * portrait video: the HAL captures landscape and rotates the encoder
+     * stream 90 CCW at the output stage (outRotate90CCW in the pipeline
+     * config), so the saved file is upright in portrait players. The user
+     * explicitly requested the 90-CCW-saved front recording. */
     static const int32_t front_configs[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, CAMERA3_STREAM_OUTPUT,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,           720, 1280, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, CAMERA3_STREAM_OUTPUT,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, CAMERA3_STREAM_OUTPUT,
     };
     static const int64_t front_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 33333333LL,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,           720, 1280, 33333333LL,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 33333333LL,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 33333333LL,
     };
     static const int64_t front_stall_durations[] = {
         HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, 1280, 720, 0,
         HAL_PIXEL_FORMAT_YCbCr_420_888,          1280, 720, 0,
+        HAL_PIXEL_FORMAT_YCbCr_420_888,           720, 1280, 0,
         HAL_PIXEL_FORMAT_YV12,                   1280, 720, 0,
         HAL_PIXEL_FORMAT_BLOB,                   1280, 720, 100000000LL,
     };
@@ -1153,6 +1216,13 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
     memset(&pipelineConfig, 0, sizeof(pipelineConfig));   /* new fields must not hold garbage */
     pipelineConfig.width = w;
     pipelineConfig.height = h;
+    /* [2026-11-28 front portrait video] Rotate the YUV output 90 CCW into the
+     * portrait stream buffer; capture stays landscape. */
+    pipelineConfig.outRotate90CCW = dev->portrait_video;
+    /* [2026-11-28 front video mirror] The selfie preview is mirrored; the
+     * encoder stream has to carry the same mirror or the played-back video
+     * looks flipped left-right against the preview. See the YUV branch. */
+    pipelineConfig.frontPreviewMirror = (dev->camera_id == 1);
     /* Bayer pattern must match the V4L2 format requested below:
      * camera 0 (IMX179) uses SRGGB10 -> RGGB (pat 3); camera 1 (OV5693)
      * uses SBGGR10 -> BGGR (pat 2). Sharing one value gave the front
@@ -1344,6 +1414,17 @@ static int camera_device_configure_streams(const camera3_device_t *device, camer
                                                     : (1280u * 720u);
     if (pipeW * pipeH > kMaxArea) { pipeW = 1280; pipeH = 720;
         if (dev->camera_id == 0) { pipeW = 1920; pipeH = 1080; } }
+    /* [2026-11-28 front portrait video] A portrait stream (720x1280) on the
+     * front camera means the user picked portrait recording: capture stays
+     * landscape (the sensor cannot read rotated) and the YUV output stage
+     * rotates 90 CCW into the portrait buffer (outRotate90CCW). Swap the
+     * capture dims back to landscape here and flag the pipeline. */
+    dev->portrait_video = false;
+    if (dev->camera_id == 1 && pipeH > pipeW) {
+        uint32_t t = pipeW; pipeW = pipeH; pipeH = t;
+        dev->portrait_video = true;
+        ALOGI("configureStreams: front portrait video stream - capture 1280x720, output rotated 90 CCW");
+    }
     /* [2026-11-22] Capture resolution follows the largest output stream, capped only
      * by kMaxArea. A 4:3 preview (1440x1080) is therefore captured at 1440x1080: the
      * sensor already delivers a centred 1:1 crop, so the output side need not rescale,
@@ -1816,8 +1897,21 @@ static void scaleRgbaNearest(const uint8_t* src, int srcW, int srcH,
  * gralloc decides the android_ycbcr layout: chroma_step==2 is a semi-planar
  * NV12/NV21 style buffer (interleaved Cb/Cr), ==1 is I420 with separate planes;
  * both are supported here. */
+/* [2026-11-28 front video mirror] flipV reverses the source row order, so the
+ * YUV stream comes out flipped vertically with no extra buffer copy.
+ *
+ * Why vertical: the front preview the user judges by is the mirrored selfie
+ * view, and the encoder's display matrix is 90 degrees, so a vertical flip of
+ * the landscape buffer is what lands as a horizontal mirror on screen
+ * (X = R^-1 . Hflip . R with R = 90 gives X = Vflip). Measured against a photo
+ * of the same scene (photo verified to match the preview, NCC 0.396): with no
+ * flip the recording is the 180 degree rotation of the photo, and R180 . Hflip
+ * = Vflip, i.e. Vflip is the transform that makes the recording equal the
+ * preview. Front camera only - the rear recording already matches as-is
+ * (NCC 0.770). */
 static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
-                               int dstW, int dstH, struct android_ycbcr* out) {
+                               int dstW, int dstH, struct android_ycbcr* out,
+                               bool flipV = false) {
     if (!rgba || !out || !out->y || !out->cb || !out->cr) return;
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     const int w = dstW, h = dstH;
@@ -1845,6 +1939,7 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
     for (int y = 0; y < h; y++) {
         int sy = cropY + (int)((int64_t)y * cropH / h);
         if (sy >= srcH) sy = srcH - 1;
+        if (flipV) sy = srcH - 1 - sy;
         const uint8_t* row = rgba + (size_t)sy * srcW * 4;
         uint8_t* yRow = yPlane + (size_t)y * yStride;
         for (int x = 0; x < w; x++) {
@@ -1863,6 +1958,7 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
         int sy1 = cropY + (int)((int64_t)(y + 1 < h ? y + 1 : y) * cropH / h);
         if (sy0 >= srcH) sy0 = srcH - 1;
         if (sy1 >= srcH) sy1 = srcH - 1;
+        if (flipV) { sy0 = srcH - 1 - sy0; sy1 = srcH - 1 - sy1; }
         const uint8_t* row0 = rgba + (size_t)sy0 * srcW * 4;
         const uint8_t* row1 = rgba + (size_t)sy1 * srcW * 4;
         uint8_t* uRow = uPlane + (size_t)(y / 2) * cStride;
@@ -1892,7 +1988,8 @@ static void rgbaToYuv420Scaled(const uint8_t* rgba, int srcW, int srcH,
 static void logYPlaneStats(const struct android_ycbcr* ycbcr, int w, int h, const char* how);
 
 static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
-                             const uint8_t* rgba, int sw, int sh) {
+                             const uint8_t* rgba, int sw, int sh,
+                             bool flipV = false) {
     if (!dst || !dst->buffer || !dst->stream || !rgba) return false;
     const android::Rect dstRect((int)dst->stream->width, (int)dst->stream->height);
     struct android_ycbcr ycbcr;
@@ -1901,7 +1998,8 @@ static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
                 GRALLOC_USAGE_SW_WRITE_OFTEN, dstRect, &ycbcr);
     if (ret == 0 && ycbcr.y) {
         rgbaToYuv420Scaled(rgba, sw, sh,
-                           (int)dst->stream->width, (int)dst->stream->height, &ycbcr);
+                           (int)dst->stream->width, (int)dst->stream->height, &ycbcr,
+                           flipV);
         logYPlaneStats(&ycbcr, (int)dst->stream->width, (int)dst->stream->height,
                        "writeYuvFromRgba/lockYCbCr");
         android::GraphicBufferMapper::get().unlock(*dst->buffer);
@@ -1933,7 +2031,7 @@ static bool writeYuvFromRgba(const camera3_stream_buffer_t* dst,
     /* YV12: V plane, then U plane. */
     ycbcr.cr = static_cast<uint8_t*>(vaddr) + ySize;
     ycbcr.cb = static_cast<uint8_t*>(vaddr) + ySize + cSize;
-    rgbaToYuv420Scaled(rgba, sw, sh, w, h, &ycbcr);
+    rgbaToYuv420Scaled(rgba, sw, sh, w, h, &ycbcr, flipV);
     logYPlaneStats(&ycbcr, w, h, "writeYuvFromRgba/fallback");
     android::GraphicBufferMapper::get().unlock(*dst->buffer);
     return true;
@@ -2578,7 +2676,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                 }
                 if (s->format == HAL_PIXEL_FORMAT_YCBCR_420_888 ||
                     s->format == HAL_PIXEL_FORMAT_YV12 || isEncoderStream(s)) {
-                    if (!writeYuvFromRgba(&out, dev->temp_rgba, (int)pipeW, (int)pipeH))
+                    if (!writeYuvFromRgba(&out, dev->temp_rgba, (int)pipeW, (int)pipeH,
+                                          dev->camera_id == 1))
                         allOk = false;
                 } else {
                     if (!writeRgbaToSurface(dev, out, dev->temp_rgba, pipeW, pipeH, pipeline)) {
@@ -2717,7 +2816,8 @@ static int camera_device_process_capture_request(const camera3_device_t *device,
                         dev->pipeline_width, dev->pipeline_height);
                 if (captureRet == 0) {
                     frameCaptured = writeYuvFromRgba(&buf, dev->temp_rgba,
-                            (int)dev->pipeline_width, (int)dev->pipeline_height);
+                            (int)dev->pipeline_width, (int)dev->pipeline_height,
+                            dev->camera_id == 1);
                 } else {
                     ALOGW("yuv stream: captureFrameRgba failed %d", captureRet);
                 }

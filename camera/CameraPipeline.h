@@ -52,6 +52,15 @@ struct PipelineConfig {
      * boost (rear camera, IMX179 verified R/G=B/G=1.00). */
     float awbBoostR;
     float awbBoostB;
+    /* [2026-11-28 front portrait video] Rotate the YUV (encoder) output 90 CCW
+     * into a portrait buffer (outW = height, outH = width). Capture stays at
+     * the landscape dims; only the YUV branch honours this. */
+    bool outRotate90CCW;
+    /* [2026-11-28 front video mirror] Emit the YUV stream mirrored so the
+     * played-back video matches the (mirrored) selfie preview. Implemented as
+     * a vertical flip of the landscape buffer: the app's 90 degree display
+     * matrix turns that into a horizontal mirror on screen. */
+    bool frontPreviewMirror;
     /* [2026-11-22] When the pipeline is rebuilt for a high-resolution still, carry
      * over the exposure/gain the previous instance already converged on: a fresh
      * instance starts at 800/60 and cannot converge in a dark scene from a few warm-up
@@ -143,6 +152,9 @@ private:
     int mCurrentBuffer;
 
     uint8_t* mRgbBuffer;
+    /* [2026-11-28 front portrait video] Scratch for the rotated portrait
+     * RGB frame (same byte size as mRgbBuffer). */
+    uint8_t* mRotBuffer;
     uint32_t mRgbBufferSize;
     uint8_t* mRgbaFull;       /* RGBA at pipeline resolution (full frame) */
     uint32_t mRgbaFullSize;

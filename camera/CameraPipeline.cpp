@@ -127,6 +127,7 @@ int CameraPipeline::close() {
     if (mRgbBuffer) {
         delete[] mRgbBuffer;
         mRgbBuffer = nullptr;
+        mRotBuffer = nullptr;
         mRgbBufferSize = 0;
     }
     if (mRgbaFull) {
@@ -319,6 +320,9 @@ int CameraPipeline::configure(const PipelineConfig& config) {
         }
         mRgbBufferSize = config.width * config.height * 3;
         mRgbBuffer = new uint8_t[mRgbBufferSize];
+        /* [2026-11-28 front portrait video] Scratch for the 90-CCW-rotated
+         * portrait frame (same size: H*W == W*H). */
+        mRotBuffer = new uint8_t[mRgbBufferSize];
         mRgbaFullSize = config.width * config.height * 4;
         mRgbaFull = new uint8_t[mRgbaFullSize];
         /* full frame by default */
@@ -840,6 +844,36 @@ static void applyGamma(uint8_t* rgb, int width, int height, float gamma) {
         rgb[i] = lut[rgb[i]];
 }
 
+/* [2026-11-28 video orientation] Horizontal mirror, used together with
+ * flipVertical as a 180 degree rotation of the video stream. See the YUV
+ * branch of processBayerToYuv for why. */
+static void flipHorizontal(uint8_t* buf, int width, int height, int bpp) {
+    for (int y = 0; y < height; y++) {
+        uint8_t* row = buf + y * width * bpp;
+        for (int x = 0; x < width / 2; x++) {
+            for (int b = 0; b < bpp; b++) {
+                uint8_t t = row[x * bpp + b];
+                row[x * bpp + b] = row[(width - 1 - x) * bpp + b];
+                row[(width - 1 - x) * bpp + b] = t;
+            }
+        }
+    }
+}
+
+/* [2026-11-28 front portrait video] Rotate RGB 90 degrees CCW:
+ * out(ox, oy) = in(W_src - 1 - oy, ox); output dims are H_src x W_src.
+ * Scalar reference loop - the front camera records at 720p where a
+ * per-frame pass costs a few ms; NEON transpose if it ever shows up. */
+static void rotate90CCW(const uint8_t* in, uint8_t* out, int width, int height, int bpp) {
+    for (int oy = 0; oy < width; oy++) {
+        for (int ox = 0; ox < height; ox++) {
+            const uint8_t* src = in + ((width - 1 - oy) * width + ox) * bpp;
+            uint8_t* dst = out + (ox * width + oy) * bpp;
+            for (int b = 0; b < bpp; b++) dst[b] = src[b];
+        }
+    }
+}
+
 static void flipVertical(uint8_t* buf, int width, int height, int bpp) {
     int rowSize = width * bpp;
     uint8_t* tmp = new uint8_t[rowSize];
@@ -1118,9 +1152,48 @@ int CameraPipeline::processBayerToYuv(const uint8_t* bayerData, uint8_t* output,
             }
         }
         applyGamma(mRgbBuffer, mConfig.width, mConfig.height, mConfig.gamma);
-        uint8_t* yPlane = output;
-        uint8_t* uvPlane = output + mConfig.width * mConfig.height;
-        mColorConv->rgbToNv12(mRgbBuffer, yPlane, uvPlane);
+        if (mConfig.outRotate90CCW) {
+            /* [2026-11-28 front portrait video] The app configured a portrait
+             * (720x1280) stream: rotate the landscape capture 90 CCW (user
+             * request: "front video saved rotated 90 CCW") and NV12-convert
+             * with the swapped dims directly into the portrait buffer. */
+            rotate90CCW(mRgbBuffer, mRotBuffer, mConfig.width, mConfig.height, 3);
+            /* front selfie mirror: a portrait stream is displayed as-is (no
+             * 90 degree matrix), so a plain horizontal flip of the rotated
+             * buffer is the mirror the preview shows. */
+            if (mConfig.frontPreviewMirror)
+                flipVertical(mRotBuffer, mConfig.height, mConfig.width, 3);
+            mColorConv->rgbToNv12(mRotBuffer, mConfig.height, mConfig.width,
+                                  output, output + mConfig.width * mConfig.height);
+        } else {
+            /* [2026-11-28 video orientation + mirror] The HAL cannot rewrite
+             * the display matrix MediaRecorder writes, so the content is
+             * pre-transformed such that (matrix . content) matches what the
+             * preview showed, per camera:
+             *
+             * rear  - player's -90 matrix + 180 content = +90 CW  (upright,
+             *         same framing as the preview; the rear preview is not
+             *         mirrored, so no mirror here);
+             * front - player's +90 matrix + Vflip content = Hflip(90 CW),
+             *         i.e. the same selfie mirror the preview shows.
+             *
+             * The 180 comes from OpenCamera mis-computing the rotation for a
+             * tablet lying flat (its preview and its metadata disagree by half
+             * a turn on both cameras). Applies ONLY to the YUV/encoder branch -
+             * the preview (RGBA) and JPEG (BLOB) paths have their own
+             * orientation handling and must stay untouched. */
+            /* [2026-11-28] Front camera only: mirror so the stream matches the
+             * mirrored selfie preview. The rear camera needs nothing - measured
+             * as-is NCC 0.771 vs 0.610 mirrored against its own preview. This
+             * branch serves apps that request a YUV stream as the only output;
+             * the recording path in this HAL goes through writeYuvFromRgba()
+             * and applies the same mirror its own sampling flag. */
+            if (mConfig.frontPreviewMirror)
+                flipVertical(mRgbBuffer, mConfig.width, mConfig.height, 3);
+            uint8_t* yPlane = output;
+            uint8_t* uvPlane = output + mConfig.width * mConfig.height;
+            mColorConv->rgbToNv12(mRgbBuffer, yPlane, uvPlane);
+        }
     } else if (outputFormat == HAL_PIXEL_FORMAT_RGBA_8888 || outputFormat == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
         /* Merged WB + gamma + RGB→RGBA + flip in one pass */
         mColorConv->rgbToRgbaWbGamma(mRgbBuffer, output,
