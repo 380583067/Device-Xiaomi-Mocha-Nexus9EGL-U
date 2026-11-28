@@ -56,6 +56,15 @@ do_mounts()
         [ -n "$uid" ] || continue
         mount -t tmpfs -o uid=$uid,gid=$gid,mode=0700,size=$CACHE_TMPFS_SIZE tmpfs "$dir"
     done
+    # Uninstall cleanup: a tmpfs mount whose cache dir no longer belongs to a
+    # live app (dir deleted) is orphaned - drop it so the mount table does not
+    # grow stale entries for uninstalled packages.
+    mounts=$(cat /proc/mounts)
+    echo "$mounts" | grep "tmpfs /data/data/" | while read -r _ _ mnt _; do
+        pkg=$(echo "$mnt" | sed -E 's#^/data/data/([^/]+)/cache$#\1#')
+        [ "$pkg" = "$mnt" ] && continue
+        [ -d "/data/data/$pkg/cache" ] || umount "$mnt" 2>/dev/null
+    done
 }
 
 do_mounts
