@@ -1,0 +1,61 @@
+From 686dda84e04b2fdeaddc95b470b73cf7a85834c6 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:56:08 +0800
+Subject: [PATCH 5/5] cameraservice: close acquire fence handles in passthrough
+ mode
+
+HidlCamera3Device wraps every acquire fence into a native_handle before
+calling the HAL session. For remote sessions the framework closes the
+original fd after the transaction succeeds (closeFd=true). For
+passthrough sessions it deliberately did not, assuming the HAL now owns
+the fd - but CameraDeviceSession::importRequestImpl hands the legacy
+HAL an importFence() DUP, so nobody ever closed the original.
+
+With our in-process HAL this leaked one fence fd per output buffer per
+frame into cameraserver. At preview rates the fd table hits its 32768
+limit in ~25 minutes; after that Parcel::read fails with EMFILE
+(fcntl F_DUPFD_CLOEXEC), every GraphicBuffer transfer through binder
+returns FAILED_TRANSACTION, and all camera apps die with
+'requestBuffer failed' spam. Closing the original after the synchronous
+call is safe because the wrapper already dup'd it for the HAL.
+
+Also close the handles on the pre-transaction failure path, where the
+fds never left the process.
+---
+ .../device3/hidl/HidlCamera3Device.cpp           | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/services/camera/libcameraservice/device3/hidl/HidlCamera3Device.cpp b/services/camera/libcameraservice/device3/hidl/HidlCamera3Device.cpp
+index f2e618fba4..42b7be0421 100644
+--- a/services/camera/libcameraservice/device3/hidl/HidlCamera3Device.cpp
++++ b/services/camera/libcameraservice/device3/hidl/HidlCamera3Device.cpp
+@@ -1539,7 +1539,8 @@ status_t HidlCamera3Device::HidlHalInterface::processBatchCaptureRequests(
+         }
+         if (res != OK) {
+             mBufferRecords.popInflightBuffers(inflightBuffers);
+-            cleanupNativeHandles(&handlesCreated);
++            /* HIDL 事务还没发生，这些 fence fd 从未离开本进程，必须关闭。 */
++            cleanupNativeHandles(&handlesCreated, /*closeFd*/true);
+             return res;
+         }
+     }
+@@ -1667,8 +1668,17 @@ status_t HidlCamera3Device::HidlHalInterface::processBatchCaptureRequests(
+             // sent to camera HAL processes)
+             cleanupNativeHandles(&handlesCreated, /*closeFd*/true);
+         } else {
+-            // In passthrough mode the FDs are now owned by HAL
+-            cleanupNativeHandles(&handlesCreated);
++            /* 【2026-11-23 passthrough fence 泄漏】in-process HAL 时这里原本
++             * 不关 fd，注释称 "FDs are now owned by HAL" —— 但 HAL 拿到的只是
++             * CameraDeviceSession::importRequestImpl 里 importFence() dup 出来的
++             * 副本，这里包着原版 fd 的 handle 没有任何人对它 close。结果
++             * cameraserver 的 fd 表每帧涨一个 sync_fence，约 18 分钟撞满
++             * 32768 上限，之后 binder 里 fcntl(F_DUPFD_CLOEXEC) 失败
++             * （Parcel fds[i]=-1 → EMFILE），GraphicBuffer 传不过去，
++             * requestBuffer 报 FAILED_TRANSACTION，所有相机 App 预览约
++             * 25 分钟后死亡。importRequestImpl 的 dup 让原版 fd 在 HIDL
++             * 同步调用返回后就可以安全关闭，与远端路径行为一致。 */
++            cleanupNativeHandles(&handlesCreated, /*closeFd*/true);
+         }
+     } else {
+         mBufferRecords.popInflightBuffers(inflightBuffers);

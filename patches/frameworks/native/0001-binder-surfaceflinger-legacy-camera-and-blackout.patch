@@ -1,0 +1,83 @@
+From abe51e9e8964eb36b5979e20e7a7a7c48b2b14d2 Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:31:29 +0800
+Subject: [PATCH] binder/surfaceflinger: legacy camera interfaces, blackout
+ logging, forced GPU composition
+
+Bundles the three display/binder compatibility changes mocha (Tegra K1) needs
+on Android 14:
+
+1. Add the legacy camera HIDL/AIDL interfaces to kDownstreamManualInterfaces so
+   the pre-Treble camera provider passes the stability check.
+2. Log buffer format/size/usage when SurfaceFlinger blacks a layer out, so it
+   is possible to tell whether the allocation side missed
+   GRALLOC_USAGE_HW_TEXTURE or the format is not compositable at all.
+3. Add persist.sf.force_gpu_composition to keep client (GPU) composition forced,
+   because the Tegra HWC blob crashes the composer during surface teardown and
+   init turns that into a userspace reboot loop.
+---
+ libs/binder/include/binder/IInterface.h    |  9 +++++++++
+ services/surfaceflinger/LayerFE.cpp        | 13 +++++++++++--
+ services/surfaceflinger/SurfaceFlinger.cpp |  5 +++++
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/libs/binder/include/binder/IInterface.h b/libs/binder/include/binder/IInterface.h
+index ac845bc003..1e3c376092 100644
+--- a/libs/binder/include/binder/IInterface.h
++++ b/libs/binder/include/binder/IInterface.h
+@@ -296,6 +296,15 @@ constexpr const char* const kManualInterfaces[] = {
+ 
+ constexpr const char* const kDownstreamManualInterfaces[] = {
+   // Add downstream interfaces here.
++  "android.hardware.ICamera",
++  "android.hardware.ICameraClient",
++  "android.hardware.camera2.ICameraDeviceCallbacks",
++  "android.hardware.camera2.ICameraDeviceUser",
++  "android.hardware.ICameraRecordingProxy",
++  "android.hardware.ICameraRecordingProxyListener",
++  "android.hardware.ICameraService",
++  "android.hardware.ICameraServiceListener",
++  "android.hardware.ICameraServiceProxy",
+   nullptr,
+ };
+ 
+diff --git a/services/surfaceflinger/LayerFE.cpp b/services/surfaceflinger/LayerFE.cpp
+index 115e9973cc..c258ce17b0 100644
+--- a/services/surfaceflinger/LayerFE.cpp
++++ b/services/surfaceflinger/LayerFE.cpp
+@@ -220,8 +220,17 @@ void LayerFE::prepareBufferStateClientComposition(
+     const bool bufferCanBeUsedAsHwTexture =
+             mSnapshot->externalTexture->getUsage() & GraphicBuffer::USAGE_HW_TEXTURE;
+     if (blackOutLayer || !bufferCanBeUsedAsHwTexture) {
+-        ALOGE_IF(!bufferCanBeUsedAsHwTexture, "%s is blacked out as buffer is not gpu readable",
+-                 mSnapshot->name.c_str());
++        /* [mocha 2026-11-20] Print the real format/usage so it is possible to
++         * tell whether the allocation side missed a usage bit or the format
++         * itself is not accepted by the GPU. */
++        ALOGE_IF(!bufferCanBeUsedAsHwTexture,
++                 "%s is blacked out as buffer is not gpu readable "
++                 "(fmt=%u %dx%d usage=%#" PRIx64 ")",
++                 mSnapshot->name.c_str(),
++                 mSnapshot->externalTexture->getPixelFormat(),
++                 mSnapshot->externalTexture->getWidth(),
++                 mSnapshot->externalTexture->getHeight(),
++                 mSnapshot->externalTexture->getUsage());
+         prepareClearClientComposition(layerSettings, true /* blackout */);
+         return;
+     }
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index c559a3464e..42dd991687 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -457,6 +457,11 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
+     maxGraphicsWidth = std::max(max_graphics_width(0), 0);
+     maxGraphicsHeight = std::max(max_graphics_height(0), 0);
+ 
++    // Tegra K1 legacy HWC blob double-unregisters cached layer handles during
++    // surface teardown races (SIGSEGV in NvGrUnregisterBuffer). Allow forcing
++    // client (GPU) composition from boot via property.
++    mDebugDisableHWC = property_get_bool("persist.sf.force_gpu_composition", false);
++
+     mSupportsWideColor = has_wide_color_display(false);
+     mDefaultCompositionDataspace =
+             static_cast<ui::Dataspace>(default_composition_dataspace(Dataspace::V0_SRGB));

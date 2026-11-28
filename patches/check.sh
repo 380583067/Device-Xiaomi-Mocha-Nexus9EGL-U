@@ -2,9 +2,18 @@
 # Validate the whole patch series without touching any source worktree or real
 # Git index.
 #
-# Each patch is tested against a throwaway index that already contains the
-# earlier patches of the same project, so dependent patches are checked in the
-# order install.sh will apply them.
+# Each project's patches are checked against a scratch copy of only the files
+# the series touches, built from the current worktree. Working on copies keeps
+# the check strict (git apply, no fuzz) and lets a later patch see the earlier
+# ones already applied, so dependent patches are validated in install order.
+# Cost is proportional to the patch set instead of the size of the tree: the
+# whole series checks in a couple of seconds.
+#
+# Status per patch:
+#   APPLIED   the change is already in the worktree
+#   READY     applies cleanly on top of the earlier patches
+#   COVERED   an earlier patch in the series already brings this change
+#   CONFLICT  does not apply; the git error is printed and nothing is changed
 
 set -u
 
@@ -21,13 +30,19 @@ if (( PL_LIST )); then
     exit 0
 fi
 
-TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mocha-patches-check.XXXXXX")" || exit 2
-trap 'rm -rf -- "$TEMP_DIR"' EXIT
+TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mocha-patches-check.XXXXXX")" || exit 2
+trap 'rm -rf -- "$TEMP_ROOT"' EXIT
 
-declare -A TEMP_INDEXES=()
-index_number=0
+# Repository-relative paths a patch modifies, in file order.
+pl_patch_files() {
+    sed -n 's|^diff --git a/.* b/\(.*\)$|\1|p' "$1"
+}
+
+declare -A SCRATCH=()
 errors=0
 patch_count=0
+ready=0
+applied=0
 
 for patch in "${PL_PATCHES[@]}"; do
     relative_patch="$(pl_display "$patch")"
@@ -37,38 +52,44 @@ for patch in "${PL_PATCHES[@]}"; do
 
     pl_verify_repo "$patch" || { errors=$((errors + 1)); continue; }
 
-    # One throwaway index per source project lets later patches see earlier
-    # patches while keeping the user's actual index and files untouched.
-    if [[ -z "${TEMP_INDEXES[$repo_relative]+present}" ]]; then
-        temp_index="$TEMP_DIR/index-$index_number"
-        index_number=$((index_number + 1))
-        if ! GIT_INDEX_FILE="$temp_index" git -C "$repo_path" read-tree HEAD ||
-           ! GIT_INDEX_FILE="$temp_index" git -C "$repo_path" add -A; then
-            echo "ERROR: cannot snapshot the current worktree for $repo_relative" >&2
-            errors=$((errors + 1))
-            continue
-        fi
-        TEMP_INDEXES[$repo_relative]="$temp_index"
+    # Scratch tree for this project: only the files the series touches, taken
+    # from the worktree so unrelated local edits are part of the picture. Files
+    # a patch creates are simply absent here and get created on application.
+    if [[ -z "${SCRATCH[$repo_relative]+present}" ]]; then
+        scratch="$(mktemp -d "$TEMP_ROOT/p.XXXXXX")"
+        SCRATCH[$repo_relative]="$scratch"
+        while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            [[ -e "$scratch/$file" ]] && continue
+            [[ -f "$repo_path/$file" ]] || continue
+            mkdir -p -- "$scratch/$(dirname -- "$file")"
+            cp -p -- "$repo_path/$file" "$scratch/$file"
+        done < <(
+            for sibling in "${PL_PATCHES[@]}"; do
+                [[ "$(pl_display "$sibling")" == "$repo_relative"/* ]] || continue
+                pl_patch_files "$sibling"
+            done | sort -u
+        )
     fi
-    temp_index="${TEMP_INDEXES[$repo_relative]}"
+    scratch="${SCRATCH[$repo_relative]}"
 
-    # A patch already present in the real worktree is reported as installed.
-    # Otherwise use the temporary index to check/apply it in series order.
     if pl_is_applied "$patch"; then
         printf 'APPLIED  %s\n' "$relative_patch"
-    elif GIT_INDEX_FILE="$temp_index" git -C "$repo_path" apply --cached --check "$patch" >/dev/null 2>&1; then
-        if GIT_INDEX_FILE="$temp_index" git -C "$repo_path" apply --cached "$patch"; then
+        applied=$((applied + 1))
+    elif git -C "$scratch" apply --check "$patch" >/dev/null 2>&1; then
+        if git -C "$scratch" apply "$patch"; then
             printf 'READY    %s\n' "$relative_patch"
+            ready=$((ready + 1))
         else
-            printf 'ERROR    %s (temporary application failed)\n' "$relative_patch" >&2
+            printf 'ERROR    %s (scratch application failed)\n' "$relative_patch" >&2
             errors=$((errors + 1))
         fi
-    elif GIT_INDEX_FILE="$temp_index" git -C "$repo_path" apply --cached --reverse --check "$patch" >/dev/null 2>&1; then
-        # This can happen when an earlier patch already brings the same change.
+    elif git -C "$scratch" apply --reverse --check "$patch" >/dev/null 2>&1; then
+        # Can happen when an earlier patch of the series already brings it.
         printf 'COVERED  %s (change already present in the series)\n' "$relative_patch"
     else
         printf 'CONFLICT %s\n' "$relative_patch" >&2
-        GIT_INDEX_FILE="$temp_index" git -C "$repo_path" apply --cached --check "$patch" 2>&1 | sed 's/^/         /' >&2
+        git -C "$scratch" apply --check "$patch" 2>&1 | sed 's/^/         /' >&2
         errors=$((errors + 1))
     fi
 done
@@ -78,7 +99,9 @@ if (( errors != 0 )); then
     exit 1
 fi
 
-printf '\nChecked %d patch(es) across these categories:\n' "$patch_count"
+printf '\nChecked %d patch(es): %d already applied, %d ready to apply, %d covered.\n' \
+    "$patch_count" "$applied" "$ready" "$((patch_count - applied - ready))"
+printf 'Across these categories:\n'
 pl_category_summary
 printf '\nThe source worktrees and real Git indexes were not changed.\n'
 printf 'Install them with: %s/install.sh [--category <name>]\n' "$SCRIPT_DIR"

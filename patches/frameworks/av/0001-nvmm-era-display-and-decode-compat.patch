@@ -1,0 +1,368 @@
+From 3bfe7793ebed2e346c5d50822f88cc0ed643d1ec Mon Sep 17 00:00:00 2001
+From: "github-actions[bot]" <github-actions[bot]@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:56:33 +0800
+Subject: [PATCH 1/5] mocha: NvMM-era display/decode compat for the legacy
+ tegra stack
+
+MEDIA:
+- ACodec: skip metadata output negotiation for OMX.Nvidia.h264.decode
+  (the blob does not support DynamicANWBuffer). The whole if/else must
+  be skipped, otherwise err=OK falls into the else branch and trips
+  CHECK(storingMetadataInDecodedBuffers()).
+- MediaCodecList/OmxInfoBuilder/OMXStore/OMXNodeInstance: compatibility
+  and enumeration adjustments for the old OMX components
+- SoftwareRenderer/SurfaceUtils/CameraSource: adapt software YUV output
+  and color conversion to an HWC1 environment without ANWBuffer metadata
+- Codec2InfoBuilder: enable debug logging for c2 component enumeration
+- services/mediacodec/Android.bp: adjust codec2 service build flags
+
+This kernel has no msdec/vdec drivers, so NVIDIA hardware decoding is
+unavailable and software decoding is the only path.
+---
+ media/codec2/sfplugin/Codec2InfoBuilder.cpp   |  2 +-
+ media/libstagefright/ACodec.cpp               | 47 +++++++++++++++++-
+ media/libstagefright/CameraSource.cpp         |  4 ++
+ media/libstagefright/MediaCodecList.cpp       | 11 +++--
+ media/libstagefright/OmxInfoBuilder.cpp       | 20 ++++++++
+ media/libstagefright/SurfaceUtils.cpp         |  7 +--
+ .../colorconversion/SoftwareRenderer.cpp      | 49 +++++++++++++++++--
+ media/libstagefright/omx/Android.bp           |  1 -
+ media/libstagefright/omx/OMXNodeInstance.cpp  |  4 ++
+ media/libstagefright/omx/OMXStore.cpp         |  1 -
+ services/mediacodec/Android.bp                | 25 ++++++++++
+ 11 files changed, 158 insertions(+), 13 deletions(-)
+
+diff --git a/media/codec2/sfplugin/Codec2InfoBuilder.cpp b/media/codec2/sfplugin/Codec2InfoBuilder.cpp
+index 8dce7892de..98b20045df 100644
+--- a/media/codec2/sfplugin/Codec2InfoBuilder.cpp
++++ b/media/codec2/sfplugin/Codec2InfoBuilder.cpp
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-//#define LOG_NDEBUG 0
++#define LOG_NDEBUG 0
+ #define LOG_TAG "Codec2InfoBuilder"
+ #include <log/log.h>
+ 
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index f9ceef24e2..bca9c44522 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -2062,6 +2062,20 @@ status_t ACodec::configureCodec(
+                 return err;
+             }
+ 
++            /* mocha 2026-11-20: the NVIDIA h264 decoder rejects metadata
++             * output entirely (storeMetaDataInBuffers -> NotImplemented;
++             * port mode DynamicANWBuffer -> failure that leaves the
++             * component in an error state, decode then fails with 0x8000
++             * 1000). Skip the whole metadata-mode negotiation here and let
++             * the sw-renderer branch below configure PresetByteBuffer
++             * output instead. */
++            if (mComponentName.startsWith("OMX.Nvidia.h264.decode")) {
++                /* 整段跳过：既不能走 DynamicANWBuffer 成功分支（会 CHECK
++                 * storingMetadataInDecodedBuffers() 直接 abort），也不能走
++                 * 失败回退分支（会尝试 adaptive playback）。 */
++                ALOGI("[%s] skipping metadata output negotiation",
++                        mComponentName.c_str());
++            } else {
+             err = setPortMode(kPortIndexOutput, IOMX::kPortModeDynamicANWBuffer);
+             if (err != OK) {
+                 // if adaptive playback has been requested, try JB fallback
+@@ -2113,6 +2127,7 @@ status_t ACodec::configureCodec(
+                 CHECK(storingMetadataInDecodedBuffers());
+                 inputFormat->setInt32("adaptive-playback", true);
+             }
++            }   // end of the non-NVIDIA metadata negotiation
+ 
+             int32_t push;
+             if (msg->findInt32("push-blank-buffers-on-shutdown", &push)
+@@ -2150,7 +2165,12 @@ status_t ACodec::configureCodec(
+                 requiresSwRenderer = true;
+             }
+ 
+-            if (mComponentName.startsWith("OMX.google.") || requiresSwRenderer) {
++            /* 【mocha 硬解 2026-11-20】NVIDIA 的硬件解码器不支持
++             * DynamicANWBuffer / metadata-in-buffers，只接受 byte buffer；
++             * 强制走 SoftwareRenderer（GPU 显示，CPU 只做 YUV->RGB 转换）。 */
++            if (mComponentName.startsWith("OMX.google.")
++                    || requiresSwRenderer
++                    || mComponentName.startsWith("OMX.Nvidia.h264.decode")) {
+                 usingSwRenderer = true;
+                 haveNativeWindow = false;
+                 (void)setPortMode(kPortIndexOutput, IOMX::kPortModePresetByteBuffer);
+@@ -9217,6 +9237,31 @@ status_t ACodec::queryCapabilities(
+                     OMX_IndexParamVideoProfileLevelQuerySupported,
+                     &param, sizeof(param));
+             if (err != OK) {
++                /* 【mocha 硬解 2026-11-20】libnvomx 不实现
++                 * ProfileLevelQuery（第一次查询即返回错误），上层因此永远
++                 * 选不中硬件解码器，720p 播放落到 CPU 软解。这里在首次查询
++                 * 失败时注入一份保守的 H.264 profile/level 列表，使
++                 * OMX.Nvidia.h264.decode 能被选中。列表只用于选择，不改变
++                 * 组件的实际行为；输出模式强制 byte buffer + sw renderer
++                 * （见 configureCodec 的同名补丁）。 */
++                if (!isEncoder
++                        && strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC) == 0
++                        && index == 0
++                        && strncmp(name, "OMX.Nvidia.", 11) == 0) {
++                    ALOGI("[%s] injecting H.264 profile levels for broken "
++                          "vendor blob", name);
++                    caps->addProfileLevel(OMX_VIDEO_AVCProfileBaseline,
++                                          OMX_VIDEO_AVCLevel3);
++                    caps->addProfileLevel(OMX_VIDEO_AVCProfileMain,
++                                          OMX_VIDEO_AVCLevel31);
++                    caps->addProfileLevel(OMX_VIDEO_AVCProfileHigh,
++                                          OMX_VIDEO_AVCLevel4);
++                    caps->addProfileLevel(
++                            OMX_VIDEO_AVCProfileConstrainedBaseline,
++                            OMX_VIDEO_AVCLevel3);
++                    caps->addProfileLevel(OMX_VIDEO_AVCProfileConstrainedHigh,
++                                          OMX_VIDEO_AVCLevel4);
++                }
+                 break;
+             }
+             caps->addProfileLevel(param.eProfile, param.eLevel);
+diff --git a/media/libstagefright/CameraSource.cpp b/media/libstagefright/CameraSource.cpp
+index 444112171a..405e82edcb 100644
+--- a/media/libstagefright/CameraSource.cpp
++++ b/media/libstagefright/CameraSource.cpp
+@@ -81,6 +81,10 @@ static int32_t getColorFormat(const char* colorFormat) {
+         return OMX_COLOR_FormatAndroidOpaque;
+     }
+ 
++    if (!strcmp(colorFormat, "YVU420SemiPlanar")) {
++        return OMX_QCOM_COLOR_FormatYVU420SemiPlanar;
++    }
++
+     ALOGE("Uknown color format (%s), please add it to "
+          "CameraSource::getColorFormat", colorFormat);
+ 
+diff --git a/media/libstagefright/MediaCodecList.cpp b/media/libstagefright/MediaCodecList.cpp
+index 4ad3276743..39efff8fee 100644
+--- a/media/libstagefright/MediaCodecList.cpp
++++ b/media/libstagefright/MediaCodecList.cpp
+@@ -16,6 +16,7 @@
+ 
+ //#define LOG_NDEBUG 0
+ #define LOG_TAG "MediaCodecList"
++#define LOG_NDEBUG 0
+ #include <utils/Log.h>
+ 
+ #include <binder/IServiceManager.h>
+@@ -212,11 +213,15 @@ MediaCodecList::MediaCodecList(std::vector<MediaCodecListBuilderBase*> builders)
+         }
+         auto currentCheck = builder->buildMediaCodecList(&writer);
+         if (currentCheck != OK) {
+-            ALOGD("ignored failed builder");
++            /* 【mocha 2026-11-20】某个 broker 失败只跳过它自己的输出，
++             * 不再把失败状态传染给整个列表：mInitCheck 一旦非 OK，
++             * getLocalInstance 就返回空指针，连带把成功的 OMX 组件也
++             * 一起废掉（表现为解码器列表为空、调用方空指针崩溃）。 */
++            ALOGE("builder %p failed with %d, ignoring its output",
++                    builder, currentCheck);
+             continue;
+-        } else {
+-            mInitCheck = currentCheck;
+         }
++        mInitCheck = currentCheck;
+     }
+     writer.writeGlobalSettings(mGlobalSettings);
+     writer.writeCodecInfos(&mCodecInfos);
+diff --git a/media/libstagefright/OmxInfoBuilder.cpp b/media/libstagefright/OmxInfoBuilder.cpp
+index 79ffdeb894..301df0e646 100644
+--- a/media/libstagefright/OmxInfoBuilder.cpp
++++ b/media/libstagefright/OmxInfoBuilder.cpp
+@@ -154,6 +154,26 @@ status_t OmxInfoBuilder::buildMediaCodecList(MediaCodecListWriter* writer) {
+         for (const IOmxStore::NodeInfo &node : role.nodes) {
+             const hidl_string& nodeName = node.name;
+ 
++            /* 【录像修复 2026-11-17】过滤掉 NVIDIA 的 H.264 硬件编码器。
++             * 该组件来自 Android 7/8 时代的 libnvomx.so，在 Android 14 的
++             * ACodec 下 configureCodec 时查询 OMX_IndexParamVideoAvc 会直接
++             * 返回 InsufficientResources(0x80001000)，导致 MediaCodec
++             * 报 CodecException，相机录像 / screenrecord 全部失败。
++             * 注意：尝试过从 media_codecs.xml / media_codecs_performance.xml
++             * 删除该条目、以及调 debug.stagefright.omx_default_rank，都不生效
++             * ——OMXStore 的组件列表来自 libnvomx.so 自身枚举，而 CodecSeeding
++             * 又把它标成 overrideable=0 强行选中。
++             * 因此只能在 MediaCodecList 构建阶段直接跳过它，让 framework
++             * 回落到 OMX.google.h264.encoder（软件编码，最高 2048x2048）。
++             * 只影响枚举，不动 vendor 的 libnvomx.so，其它 Nvidia 组件
++             * （解码器、VP8 编码器）不受影响。 */
++            if (nodeName == "OMX.Nvidia.h264.encoder") {
++                ALOGI("skipping %s: broken on this vendor OMX blob "
++                      "(configure always reports InsufficientResources)",
++                      nodeName.c_str());
++                continue;
++            }
++
+             // currently image and video encoders use surface input
+             if (!mAllowSurfaceEncoders && isVideoOrImage && isEncoder) {
+                 ALOGD("disabling %s for media type %s because we are not using OMX input surface",
+diff --git a/media/libstagefright/SurfaceUtils.cpp b/media/libstagefright/SurfaceUtils.cpp
+index 604dcb0f93..c8ba3b511f 100644
+--- a/media/libstagefright/SurfaceUtils.cpp
++++ b/media/libstagefright/SurfaceUtils.cpp
+@@ -111,8 +111,9 @@ status_t setNativeWindowSizeFormatAndUsage(
+         }
+     }
+ 
+-    int finalUsage = usage | consumerUsage;
+-    ALOGV("gralloc usage: %#x(producer) + %#x(consumer) = %#x", usage, consumerUsage, finalUsage);
++    uint64_t finalUsage = (usage | consumerUsage) & 0xffffffffLL;
++    ALOGV("gralloc usage: %#x(producer) + %#x(consumer) = %#" PRIx64,
++            usage, consumerUsage, finalUsage);
+     err = native_window_set_usage(nativeWindow, finalUsage);
+     if (err != NO_ERROR) {
+         ALOGE("native_window_set_usage failed: %s (%d)", strerror(-err), -err);
+@@ -126,7 +127,7 @@ status_t setNativeWindowSizeFormatAndUsage(
+         return err;
+     }
+ 
+-    ALOGD("set up nativeWindow %p for %dx%d, color %#x, rotation %d, usage %#x",
++    ALOGD("set up nativeWindow %p for %dx%d, color %#x, rotation %d, usage %#" PRIx64,
+             nativeWindow, width, height, format, rotation, finalUsage);
+     return NO_ERROR;
+ }
+diff --git a/media/libstagefright/colorconversion/SoftwareRenderer.cpp b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+index 240931591d..4791e86b69 100644
+--- a/media/libstagefright/colorconversion/SoftwareRenderer.cpp
++++ b/media/libstagefright/colorconversion/SoftwareRenderer.cpp
+@@ -276,14 +276,57 @@ std::list<FrameRenderTracker::Info> SoftwareRenderer::render(
+ 
+     void *dst = NULL;
+     struct android_ycbcr ycbcr;
++    memset(&ycbcr, 0, sizeof(ycbcr));
+     if ( !mConverter &&
+          (mColorFormat == OMX_COLOR_FormatYUV420Planar ||
+          mColorFormat == OMX_COLOR_FormatYUV420SemiPlanar ||
+          mColorFormat == OMX_TI_COLOR_FormatYUV420PackedSemiPlanar ||
+          mColorFormat == OMX_COLOR_FormatYUV420Planar16)) {
+-        CHECK_EQ(0, mapper.lockYCbCr(buf->handle,
+-                GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,
+-                bounds, &ycbcr));
++        const uint32_t usage =
++                GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY;
++        // mocha 适配（2026-11-24）：YV12 缓冲区不信任 lockYCbCr。
++        // NvGrLock_ycbcr 在不同进程里行为不一致——swcodec 进程里对 YV12 返回
++        // -ENOSYS（见下面的回退），而 media.codec 进程里却能"成功"返回一份
++        // 布局错误的 android_ycbcr（stride/平面偏移与真实分配不符），写出来的
++        // 帧是横向条纹花屏。MX Player 走 OMX 软解时正是这个症状。
++        // 单平面 lock() + 手工平面布局已被 C2 路径长期验证正确，所以 YV12
++        // 一律走手工路径，不再询问 vendor 的 ycbcr 接口。
++        status_t lockError = (buf->format == HAL_PIXEL_FORMAT_YV12)
++                ? UNKNOWN_ERROR : mapper.lockYCbCr(buf->handle, usage, bounds, &ycbcr);
++        if (lockError != NO_ERROR) {
++            // mocha (NVIDIA Tegra K1 / TN8) 适配：
++            // 该设备的 gralloc.tegra.so 虽然导出了 NvGrLock_ycbcr，但对 YV12
++            // 缓冲区直接返回 -ENOSYS(-38)（"Locking for SW use not supported
++            // (unknown shadow format)"），导致原来的 CHECK_EQ 直接 abort，
++            // 表现为图库一播放软件解码的视频就闪退。
++            //
++            // 实测该 gralloc 只有 YV12 可分配：HAL_PIXEL_FORMAT_YCbCr_420_888 /
++            // NV12 / NV21 都在分配阶段就失败；而单平面 lock() 对 YV12 完全正常。
++            // 因此这里退化成"单平面加锁 + 按 YV12 平面布局自行计算 Y/Cb/Cr"，
++            // 既不崩溃，也保留了 YUV 直写的零转换快速路径。
++            ALOGW("lockYCbCr failed (%d), falling back to single-plane lock + "
++                  "manual YV12 layout", lockError);
++
++            uint8_t *base = NULL;
++            lockError = mapper.lock(buf->handle, usage, bounds,
++                                    reinterpret_cast<void **>(&base));
++            CHECK_EQ(NO_ERROR, lockError);   // 单平面 lock 若也失败则无路可退
++
++            // HAL_PIXEL_FORMAT_YV12 内存布局（stride/height 均为对齐后的值）：
++            //   [ Y 平面: yStride * height ]
++            //   [ V 平面: cStride * (height/2) ]   ← YV12 先 V 后 U
++            //   [ U 平面: cStride * (height/2) ]
++            const size_t yStride = buf->stride;
++            const size_t cStride = yStride / 2;
++            const size_t cPlaneSize = cStride * (buf->height / 2);
++
++            ycbcr.y = base;
++            ycbcr.cr = base + yStride * buf->height;            // V
++            ycbcr.cb = base + yStride * buf->height + cPlaneSize; // U
++            ycbcr.ystride = yStride;
++            ycbcr.cstride = cStride;
++            ycbcr.chroma_step = 1;   // 平面式，chroma 步长为 1 字节
++        }
+     } else {
+         CHECK_EQ(0, mapper.lock(buf->handle,
+                 GRALLOC_USAGE_SW_READ_NEVER | GRALLOC_USAGE_SW_WRITE_RARELY,
+diff --git a/media/libstagefright/omx/Android.bp b/media/libstagefright/omx/Android.bp
+index 346f40f197..ea82f45d4b 100644
+--- a/media/libstagefright/omx/Android.bp
++++ b/media/libstagefright/omx/Android.bp
+@@ -187,7 +187,6 @@ cc_defaults {
+     name: "libstagefright_softomx-defaults",
+     // TODO (b/316432618) Software OMX codecs are no longer used, disable building them till
+     // this code is removed completely.
+-    enabled: false,
+     vendor_available: true,
+ 
+     cflags: [
+diff --git a/media/libstagefright/omx/OMXNodeInstance.cpp b/media/libstagefright/omx/OMXNodeInstance.cpp
+index 6d07b5435f..76cd4fb811 100644
+--- a/media/libstagefright/omx/OMXNodeInstance.cpp
++++ b/media/libstagefright/omx/OMXNodeInstance.cpp
+@@ -604,6 +604,10 @@ status_t OMXNodeInstance::freeNode() {
+             break;
+     }
+ 
++    if (mActiveBuffers.size() > 0) {
++        freeActiveBuffers();
++    }
++
+     Mutex::Autolock _l(mLock);
+ 
+     status_t err = mOwner->freeNode(this);
+diff --git a/media/libstagefright/omx/OMXStore.cpp b/media/libstagefright/omx/OMXStore.cpp
+index b2d5a70ffa..3be56c8199 100644
+--- a/media/libstagefright/omx/OMXStore.cpp
++++ b/media/libstagefright/omx/OMXStore.cpp
+@@ -161,7 +161,6 @@ void OMXStore::addPlugin(OMXPluginBase *plugin) {
+                 }
+             }
+             if (skip) {
+-                continue;
+             }
+         }
+ 
+diff --git a/services/mediacodec/Android.bp b/services/mediacodec/Android.bp
+index 506b3bca67..a2f17c22b9 100644
+--- a/services/mediacodec/Android.bp
++++ b/services/mediacodec/Android.bp
+@@ -95,6 +95,31 @@ cc_binary {
+         "android.hidl.memory@1.0",
+     ],
+ 
++    runtime_libs: [
++        "libstagefright_soft_aacdec",
++        "libstagefright_soft_aacenc",
++        "libstagefright_soft_amrdec",
++        "libstagefright_soft_amrnbenc",
++        "libstagefright_soft_amrwbenc",
++        "libstagefright_soft_avcdec",
++        "libstagefright_soft_avcenc",
++        "libstagefright_soft_flacdec",
++        "libstagefright_soft_flacenc",
++        "libstagefright_soft_g711dec",
++        "libstagefright_soft_gsmdec",
++        "libstagefright_soft_hevcdec",
++        "libstagefright_soft_mp3dec",
++        "libstagefright_soft_mpeg2dec",
++        "libstagefright_soft_mpeg4dec",
++        "libstagefright_soft_mpeg4enc",
++        "libstagefright_soft_opusdec",
++        "libstagefright_soft_rawdec",
++        "libstagefright_soft_vorbisdec",
++        "libstagefright_soft_vpxdec",
++        "libstagefright_soft_vpxenc",
++        "libstagefright_softomx_plugin",
++    ],
++
+     // OMX interfaces force this to stay in 32-bit mode;
+     compile_multilib: "32",
+ 

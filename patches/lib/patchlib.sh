@@ -12,6 +12,7 @@ pl_die() {
 }
 
 pl_init() {
+    export LC_ALL=C
     PL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
     PL_TOP="$(cd -- "$PL_ROOT/../../../.." && pwd)"
 

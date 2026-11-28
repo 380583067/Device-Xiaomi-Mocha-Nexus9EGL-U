@@ -1,0 +1,20 @@
+diff --git a/core/java/com/android/internal/policy/TransitionAnimation.java b/core/java/com/android/internal/policy/TransitionAnimation.java
+index 40a437f30..c17baab1d 100644
+--- a/core/java/com/android/internal/policy/TransitionAnimation.java
++++ b/core/java/com/android/internal/policy/TransitionAnimation.java
+@@ -1391,7 +1391,14 @@ public class TransitionAnimation {
+     /** Returns the luminance of the pixel in 0~255. */
+     private static int getPixelLuminance(ByteBuffer buffer, int x, int y, int pixelStride,
+             int rowStride) {
+-        final int color = buffer.getInt(y * rowStride + x * pixelStride);
++        /* mocha 2026-11-20: clamp the index inside the buffer. On TN8 the
++         * hardware screenshot buffer can be larger than the ImageReader
++         * limit reports, and the raw index here can run past the limit,
++         * throwing IndexOutOfBoundsException out of system_server during
++         * configuration changes (observed as a boot-time crash loop). */
++        final int index = Math.min(y * rowStride + x * pixelStride,
++                buffer.limit() - 4);
++        final int color = buffer.getInt(Math.max(index, 0));
+         // The buffer from ImageReader is always in native order (little-endian), so extract the
+         // color components in reversed order.
+         final int r = color & 0xff;

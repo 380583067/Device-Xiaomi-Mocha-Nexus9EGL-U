@@ -1,34 +1,39 @@
 diff --git a/transport.cpp b/transport.cpp
-index 244c253..b6c37aa 100644
+index 244c253..5812f43 100644
 --- a/transport.cpp
 +++ b/transport.cpp
-@@ -751,10 +751,26 @@ static void fdevent_register_transport(atransport* t) {
+@@ -751,10 +751,31 @@ static void fdevent_register_transport(atransport* t) {
      if (t->GetConnectionState() != kCsNoPerm) {
          t->connection()->SetTransport(t);
  
 -        if (t->type == kTransportUsb
-+        // 修复 legacy FunctionFS 设备（如 mocha）adb 一直 offline 的 bug。
++        // Fixes adb staying "offline" forever on legacy FunctionFS devices
++        // (mocha is one).
 +        //
-+        // 背景：kCsDetached 是 host 端 libusb 的 attach/detach 专用状态，
-+        // 由 `usb_devices_start_detached()`（读取 ADB_LIBUSB_START_DETACHED 环境变量）
-+        // 控制。该函数仅在有 ADB_HOST 编译时才存在，注释也明确写了
-+        // "hence n/a on-device"（设备端不适用）。
++        // Background: kCsDetached is a host-side, libusb-only attach/detach
++        // state, gated by usb_devices_start_detached() (which reads the
++        // ADB_LIBUSB_START_DETACHED environment variable). That function only
++        // exists when built with ADB_HOST and its own comment says "hence n/a
++        // on-device".
 +        //
-+        // 但在 Android 14 的代码里，#if ADB_HOST 只是把 `&& usb_devices_start_detached()`
-+        // 从条件里删掉，导致 device 端（ADB_HOST=0）的 if 条件退化为
-+        // `t->type == kTransportUsb`（对 legacy USB transport 恒为真），于是
-+        // 所有 USB transport 都被错误地设为 kCsDetached，connection()->Start()
-+        // 永远不会被调用，读/写线程不启动，host 端 adb 一直显示 offline。
++        // In the Android 14 code, #if ADB_HOST only removes the
++        // "&& usb_devices_start_detached()" term from the condition, so on the
++        // device (ADB_HOST=0) the test degenerates to
++        // "t->type == kTransportUsb", which is always true for a legacy USB
++        // transport. Every USB transport then gets kCsDetached,
++        // connection()->Start() is never called, the reader/writer threads
++        // never start, and the host always sees the device as offline.
 +        //
-+        // 修复：device 端恒走 else 分支（调用 connection()->Start()），
-+        // 只有 host 端启用 libusb detached 时才走 kCsDetached 分支。
++        // Fix: the device side always takes the else branch (and calls
++        // connection()->Start()); only a host that asked for libusb detached
++        // mode takes the kCsDetached branch.
 +        if (
  #if ADB_HOST
 -            && usb_devices_start_detached()  // -d setting propagated from the
 -                                             // host device, hence n/a on-device.
-+            t->type == kTransportUsb && usb_devices_start_detached()  // -d 选项仅 host 端有效
++            t->type == kTransportUsb && usb_devices_start_detached()  // -d is host-only
 +#else
-+            false  // device 端(adbd)永远不进入 detached 状态
++            false  // adbd never enters the detached state
  #endif
          ) {
              t->SetConnectionState(kCsDetached);

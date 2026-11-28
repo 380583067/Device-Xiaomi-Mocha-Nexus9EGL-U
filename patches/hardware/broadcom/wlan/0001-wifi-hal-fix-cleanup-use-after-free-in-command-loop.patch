@@ -1,52 +1,30 @@
-From: mocha device tree
-Subject: [PATCH] wifi-hal: fix use-after-free in the cleanup command loop
-
-Three fixes for the legacy wifi HAL crash on stop (vtable recycled to
-0x72646e61 "andr", CFI check faults in wifi_cleanup):
-
-1. wifi_get_cancel_cmd() used wifi_get_cmd() (lookup only) and then
-   releaseRef() deleted the command without removing it from info->cmd,
-   leaving a dangling pointer. Use wifi_unregister_cmd() so the command
-   is gone from the array before it is freed, matching wifi_cancel_cmd().
-
-2. wifi_stop_hal() created a throwaway HalInit and cancel()ed it. Its
-   cancel unregisters by id, but preInit and start_hal both register a
-   HalInit with the same id (HAL_START_REQUEST_ID), so the throwaway
-   command's cancel removed the wrong entry. The LOGGER_HAL_STOP side
-   effect is already sent by the real HalInit::cancel() in the cleanup
-   loop below, so just return success.
-
-3. In the cleanup loop, cancel() can fail or return early without
-   unregistering, so the unconditional releaseRef() used to delete a
-   command that was still in info->cmd. Remove it explicitly before
-   releaseRef(), and keep clean_up set after the loop so the event loop
-   thread never frees hal_info while the loop dereferences info->cmd.
-
 diff --git a/bcmdhd/wifi_hal/common.cpp b/bcmdhd/wifi_hal/common.cpp
-index 7f164ab..bc3697b 100644
+index 7f164ab..5e4c234 100755
 --- a/bcmdhd/wifi_hal/common.cpp
 +++ b/bcmdhd/wifi_hal/common.cpp
-@@ -289,7 +289,14 @@ wifi_error wifi_cancel_cmd(wifi_request_id id, wifi_interface_handle iface)
+@@ -289,7 +289,16 @@ wifi_error wifi_cancel_cmd(wifi_request_id id, wifi_interface_handle iface)
  wifi_error wifi_get_cancel_cmd(wifi_request_id id, wifi_interface_handle iface)
  {
      wifi_handle handle = getWifiHandle(iface);
 -    WifiCommand *cmd = wifi_get_cmd(handle, id);
-+    /* 【修复 2026-11-17】原实现用 wifi_get_cmd()（只查不改）拿到命令后直接
-+     * releaseRef() delete，却没有把它从 info->cmd 数组移除 —— 数组里就留下
-+     * 一个悬空指针。下次 wifi_cleanup 遍历数组时，对已 delete 的命令调
-+     * cancel()/releaseRef() 虚函数，vtable 已被复用成垃圾（0x72646e61
-+     * "andr"），CFI 检查踩空页 SIGSEGV，导致 wifi HAL 崩溃重启、开机动画
-+     * 重放。改用 wifi_unregister_cmd()（从数组移除并返回），保证 delete 前
-+     * 命令一定不在数组里，与 wifi_cancel_cmd() 的行为保持一致。 */
++    /* [fix 2026-11-17] The old code used wifi_get_cmd() (lookup only, no
++     * removal) and then releaseRef()'d the command, which deletes it, without
++     * taking it out of info->cmd - leaving a dangling pointer in the array.
++     * The next wifi_cleanup walks that array and calls cancel()/releaseRef()
++     * on the freed object, whose vtable has already been reused as garbage
++     * (0x72646e61, "andr"); the CFI check then faults on an unmapped page and
++     * the wifi HAL crashes and restarts, replaying the boot animation.
++     * Use wifi_unregister_cmd() (remove and return) so the command is always
++     * out of the array before it is deleted, matching wifi_cancel_cmd(). */
 +    WifiCommand *cmd = wifi_unregister_cmd(handle, id);
      ALOGV("Get Cancel WifiCommand = %p", cmd);
      if (cmd) {
          cmd->cancel();
 diff --git a/bcmdhd/wifi_hal/wifi_hal.cpp b/bcmdhd/wifi_hal/wifi_hal.cpp
-index af9b06c..8d0d3a4 100644
+index af9b06c..bb08e58 100644
 --- a/bcmdhd/wifi_hal/wifi_hal.cpp
 +++ b/bcmdhd/wifi_hal/wifi_hal.cpp
-@@ -710,13 +710,32 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
+@@ -710,13 +710,34 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
              ALOGI("Cancelling command %p:%s", cmd, cmd->getType());
              pthread_mutex_unlock(&info->cb_lock);
              cmd->cancel();
@@ -54,17 +32,19 @@ index af9b06c..8d0d3a4 100644
 -                ALOGI("Cancelling command %p:%s did not work", cmd, (cmd ? cmd->getType(): ""));
 -                bad_commands++;
 +            pthread_mutex_lock(&info->cb_lock);
-+            /* 【修复 2026-11-17】cancel() 可能失败或提前返回（例如
-+             * HalInit::cancel 在 LOGGER_HAL_STOP 命令 create/发送失败时
-+             * 直接 return，不执行末尾的 wifi_unregister_cmd），导致命令
-+             * 仍留在 info->cmd 数组里。原代码此时只 bad_commands++ 跳过，
-+             * 但紧接着 releaseRef() 无条件 delete 了命令对象 —— 数组里
-+             * 就留下一个悬空指针。下一次访问（或再次 cleanup）时 vtable
-+             * 已被复用成垃圾（0x72646e61 "andr"），CFI 检查踩空页崩溃。
++            /* [fix 2026-11-17] cancel() can fail or return early (for example
++             * HalInit::cancel returns immediately when the LOGGER_HAL_STOP
++             * command cannot be created or sent, skipping the
++             * wifi_unregister_cmd() at its end), leaving the command inside
++             * info->cmd. The old code only bumped bad_commands and moved on,
++             * but the releaseRef() below then deleted the object anyway -
++             * leaving a dangling pointer in the array. The next access (or the
++             * next cleanup) found a vtable reused as garbage (0x72646e61,
++             * "andr") and the CFI check faulted on an unmapped page.
 +             *
-+             * 修复：cancel 之后若命令仍在原位置（cancel 没有通过
-+             * unregister 把它移走），这里显式 memmove 移除它，保证
-+             * releaseRef(delete) 之前命令一定不在数组里。 */
++             * Fix: if cancel() left the command in place (it did not unregister
++             * itself), remove it here explicitly so it is always out of the
++             * array before releaseRef() deletes it. */
 +            if (info->num_cmd > bad_commands &&
 +                    info->cmd[bad_commands].cmd == cmd) {
 +                memmove(&info->cmd[bad_commands],
@@ -77,30 +57,31 @@ index af9b06c..8d0d3a4 100644
              cmd->releaseRef();
              pthread_mutex_lock(&info->cb_lock);
 +        } else {
-+            /* 空条目防御：跳过，避免死循环 */
++            /* Defensive: skip empty slots instead of looping forever */
 +            bad_commands++;
          }
      }
  
-@@ -731,6 +750,13 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
+@@ -731,6 +752,14 @@ void wifi_cleanup(wifi_handle handle, wifi_cleaned_up_handler cleaned_up_handler
      }
      pthread_mutex_unlock(&info->cb_lock);
  
-+    /* 【修复 2026-11-17】clean_up 必须放在 while 循环之后（cb_lock 解锁后）。
-+     * 若提前置位，event loop 线程在 while 循环期间一旦收到 nl80211 事件
-+     * 就会退出 poll 循环并执行 internal_cleaned_up_handler()，把接口和
-+     * hal_info free 掉，而这里的 while 循环还在解引用 info->cmd → use-after-free
-+     * （实测崩溃：cleanup cmd id=0，vtable 被复写成 0x72646e61 "andr"）。
-+     * 放在这里后，event loop 在 while 循环完成前一直阻塞在 poll 上，直到
-+     * 下面 write(cleanup_socks[0]) 才退出，顺序安全。 */
++    /* [fix 2026-11-17] clean_up must be set after this loop, with cb_lock
++     * released. If it were set earlier, the event loop thread could take an
++     * nl80211 event during the loop, leave poll, run
++     * internal_cleaned_up_handler() and free the interface and hal_info while
++     * this loop is still dereferencing info->cmd - a use-after-free (observed
++     * as cmd id=0 with the vtable overwritten to 0x72646e61, "andr"). With it
++     * here the event loop stays blocked in poll until the
++     * write(cleanup_socks[0]) below, so the ordering is safe. */
      info->clean_up = true;
  
      /* global func ptr be invalidated and will not call any command from legacy hal */
 diff --git a/bcmdhd/wifi_hal/wifi_logger.cpp b/bcmdhd/wifi_hal/wifi_logger.cpp
-index 694df19..c584cf0 100644
+index 694df19..d9acae6 100755
 --- a/bcmdhd/wifi_hal/wifi_logger.cpp
 +++ b/bcmdhd/wifi_hal/wifi_logger.cpp
-@@ -2058,10 +2058,18 @@ wifi_error wifi_stop_ring_dump(wifi_interface_handle iface)
+@@ -2058,10 +2058,22 @@ wifi_error wifi_stop_ring_dump(wifi_interface_handle iface)
  
  wifi_error wifi_stop_hal(wifi_interface_handle iface)
  {
@@ -108,17 +89,21 @@ index 694df19..c584cf0 100644
 -    NULL_CHECK_RETURN(cmd, "memory allocation failure", WIFI_ERROR_OUT_OF_MEMORY);
 -    cmd->cancel();
 -    cmd->releaseRef();
-+    /* 【修复 2026-11-17】原实现 new 一个临时 HalInit 再 cancel()，有两个问题：
-+     * 1) wifi_hal_preInit() 和 wifi_start_hal() 都注册了 id=HAL_START_REQUEST_ID
-+     *    的 HalInit，数组里有两个同 id 的命令。而 HalInit::cancel() 末尾按 id
-+     *    调 wifi_unregister_cmd()，只会移除第一个匹配项 —— 临时命令的 cancel
-+     *    会把数组里第一个 HalInit 移走（且不 delete，泄漏），破坏数组状态。
-+     * 2) new HalInit(iface) 会在构造函数里解引用 iface（wlan0Handle），cleanup
-+     *    阶段该 handle 可能已悬空，读到垃圾内存。
++    /* [fix 2026-11-17] The old implementation new'ed a temporary HalInit and
++     * cancelled it, which had two problems:
++     * 1) wifi_hal_preInit() and wifi_start_hal() both register a HalInit with
++     *    id=HAL_START_REQUEST_ID, so the array holds two commands with the same
++     *    id. HalInit::cancel() ends with wifi_unregister_cmd() by id, which
++     *    removes only the first match - cancelling the temporary command thus
++     *    removed the array's first HalInit (without deleting it, so it leaked)
++     *    and corrupted the array state.
++     * 2) new HalInit(iface) dereferences iface (wlan0Handle) in its
++     *    constructor, and during cleanup that handle may already be dangling.
 +     *
-+     * cancel() 的实质副作用（发送 LOGGER_HAL_STOP 给驱动）会在下面
-+     * wifi_cleanup 的 while 循环里、由数组里真正的 HalInit::cancel() 完成，
-+     * 所以这里直接返回成功即可，无需（也不应）再造临时命令。 */
++     * The real side effect of cancel() (sending LOGGER_HAL_STOP to the driver)
++     * is performed by the genuine HalInit::cancel() from the array, inside the
++     * wifi_cleanup loop below, so returning success here is enough - no
++     * temporary command should be created. */
 +    (void)iface;
      return WIFI_SUCCESS;
  }
