@@ -29,11 +29,9 @@ service watchdogd /system/bin/watchdogd 10 20
     seclabel u:r:watchdogd:s0
     oneshot
 
-# BPF
-service bpfloader /system/bin/bpfloader
-    class main
-    capabilities CHOWN SYS_ADMIN NET_ADMIN
-    disabled
+# BPF: bpfloader removed — kernel bpf() is not stable on 3.10 yet.
+# Framework falls back to legacy net path via:
+#   ro.kernel.ebpf.supported=false + bpf.progs_loaded=1 (set below)
 
 on early-init
     chmod 0775 /sys/fs/bpf
