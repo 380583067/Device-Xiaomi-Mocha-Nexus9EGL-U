@@ -19,3 +19,16 @@ allow toolbox bluetooth_data_file:file rw_file_perms;
 # Shell tooling (getprop/cat piped through adb) writes back to init's pipe
 # fds. Observed: denied { write getattr } for init:fifo_file from toolbox.
 allow toolbox init:fifo_file { write getattr };
+
+# [2026-11-28 enforcing audit 08:14] the 08:00 boot under the 23:56 policy
+# set produced ZERO system denials (boot log 56 avc lines, all toolbox).
+# Grants below are debugging conveniences so the audit workflow itself works
+# under enforcing: logcat connects to the logdr socket, dmesg reads kmsg /
+# syslog. The KernelSU log capture (/data/adb/ksu/log, adb_data_file) is
+# audited out - its failure under enforcing is cosmetic and granting
+# toolbox write access to /data/adb would widen the shell attack surface
+# into the KernelSU control area for no functional gain.
+allow toolbox logdr_socket:sock_file write;
+allow toolbox kmsg_device:chr_file read;
+allow toolbox kernel:system syslog_read;
+dontaudit toolbox adb_data_file:file write;
