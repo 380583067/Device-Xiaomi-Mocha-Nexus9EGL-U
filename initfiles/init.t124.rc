@@ -189,6 +189,23 @@ on init
     mkdir /mnt/tmp 0770 system system
     mount tmpfs tmpfs /mnt/tmp mode=0775,gid=1003
 
+    # [2026-11-28 universal GL JIT crash fix] Redirect the NVIDIA shader disk
+    # cache to the global /mnt/tmp tmpfs. libglcore JIT-compiles shaders into
+    # a .glXXXXXX file it creates in a writable app directory (strings expose
+    # the candidates TMPDIR / /tmp / HOME / /data/data/<pkg> and the desktop
+    # knobs __GL_SHADER_DISK_CACHE / __GL_SHADER_DISK_CACHE_PATH), mmaps it
+    # rw+rx and UNLINKS it: the backing pages are clean file-backed pages of a
+    # deleted file, so reclaim drops them permanently and the next
+    # _glDrawArrays jumps into a mapped-out page (SIGSEGV SEGV_ACCERR,
+    # libglcore+0x95ae37 - observed in com.phoenix.read, com.mxtech.
+    # videoplayer.ad, 2026-11-26/28). On a tmpfs the same pages are shmem:
+    # reclaim swaps them to zram instead. /mnt/tmp is global, so every app
+    # inherits the safe location through zygote without touching app data
+    # dirs (the app-cache tmpfs watcher stays as belt-and-suspenders).
+    export __GL_SHADER_DISK_CACHE_PATH /mnt/tmp/glcache
+    export __GL_SHADER_DISK_CACHE 1
+    mkdir /mnt/tmp/glcache 0777
+
 # Loads real wifi and bt mac from /dev/block/mmcblk0p15
 service conn_wifi /system/vendor/bin/conn_init -op
     class main
