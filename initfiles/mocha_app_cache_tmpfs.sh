@@ -23,7 +23,7 @@
 # once per boot from init. The uid/gid of the cache dir is taken from the
 # directory itself so it keeps matching the app even after reinstalls.
 
-PACKAGES="com.phoenix.read"
+PACKAGES="com.phoenix.read com.mxtech.videoplayer.ad"
 
 for pkg in $PACKAGES; do
     dir="/data/data/$pkg/cache"
