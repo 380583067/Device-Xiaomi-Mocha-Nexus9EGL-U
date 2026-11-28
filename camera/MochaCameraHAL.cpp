@@ -1175,9 +1175,27 @@ static int openPipelineAt(mocha_camera_device_t* dev, uint32_t w, uint32_t h,
      pipelineConfig.wbGain[1] = 1.0f;  // G gain
      pipelineConfig.wbGain[2] = 1.0f;  // B gain
      pipelineConfig.wbGain[3] = 1.0f;
-     pipelineConfig.ccm[0] = 1.0f; pipelineConfig.ccm[1] = 0.0f; pipelineConfig.ccm[2] = 0.0f;
-     pipelineConfig.ccm[3] = 0.0f; pipelineConfig.ccm[4] = 1.0f; pipelineConfig.ccm[5] = 0.0f;
-     pipelineConfig.ccm[6] = 0.0f; pipelineConfig.ccm[7] = 0.0f; pipelineConfig.ccm[8] = 1.0f;
+     /* [2026-11-28 front camera color correction] The OV5693's channel
+      * cross-talk renders everything pale/desaturated (measured: the same
+      * scene comes out visibly washed through camera 1 while the IMX179
+      * identity path is approved by the user). Apply a moderate CCM for
+      * camera 1 only; rows sum to 1.0 so the AWB gains stay authoritative.
+      * Camera 0 (IMX179) keeps the identity matrix. Values are a starting
+      * point tuned against the pink-piggy test scene; iterate from photos. */
+     if (dev->camera_id == 1) {
+         /* v2 (2026-11-28 12:12): v1 cross-talk matrix overshot on warm scenes -
+          * the R-row green suppression re-created the 11-26 green cast
+          * (measured R/G 0.84 on the ceiling scene). Switched to a pure
+          * luma-preserving saturation matrix (s=1.3, rows sum to 1.0): grey
+          * stays grey, only the chroma amplitude scales. */
+         pipelineConfig.ccm[0] = 1.210f; pipelineConfig.ccm[1] = -0.176f; pipelineConfig.ccm[2] = -0.034f;
+         pipelineConfig.ccm[3] = -0.090f; pipelineConfig.ccm[4] = 1.124f; pipelineConfig.ccm[5] = -0.034f;
+         pipelineConfig.ccm[6] = -0.090f; pipelineConfig.ccm[7] = -0.176f; pipelineConfig.ccm[8] = 1.380f;
+     } else {
+         pipelineConfig.ccm[0] = 1.0f; pipelineConfig.ccm[1] = 0.0f; pipelineConfig.ccm[2] = 0.0f;
+         pipelineConfig.ccm[3] = 0.0f; pipelineConfig.ccm[4] = 1.0f; pipelineConfig.ccm[5] = 0.0f;
+         pipelineConfig.ccm[6] = 0.0f; pipelineConfig.ccm[7] = 0.0f; pipelineConfig.ccm[8] = 1.0f;
+     }
      pipelineConfig.gamma = 0.55f;
     /* [2026-11-26 front camera anti-alias] OV5693 720p subsamples the sensor
      * window (x_inc=y_inc=2 + non-integer sensor scaler), which folds high

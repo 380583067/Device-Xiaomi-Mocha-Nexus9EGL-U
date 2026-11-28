@@ -806,6 +806,31 @@ void CameraPipeline::doAutoWhiteBalance(const uint8_t* rgbBuffer) {
     ALOGI("AWB: R/G=%.2f B/G=%.2f gains R=%.2f B=%.2f", avgR/avgG, avgB/avgG, mAwbGains[0], mAwbGains[2]);
 }
 
+/* [2026-11-28 front camera washed-out colours] Apply the sensor color
+ * correction matrix (PipelineConfig::ccm, row-major 3x3). The OV5693 has
+ * strong channel cross-talk: without a CCM its native low-saturation response
+ * reaches the user as pale/washed-out colours (measured: the same pink piggy
+ * bank renders visibly desaturated through camera 1 while camera 0 IMX179
+ * needs no correction - identity CCM). Rows are tuned to sum to 1.0 so the
+ * white balance gains applied before this stage stay authoritative. */
+static void applyCcm(uint8_t* rgb, int width, int height, const float ccm[9]) {
+    bool identity = ccm[0] == 1.0f && ccm[1] == 0.0f && ccm[2] == 0.0f &&
+                    ccm[3] == 0.0f && ccm[4] == 1.0f && ccm[5] == 0.0f &&
+                    ccm[6] == 0.0f && ccm[7] == 0.0f && ccm[8] == 1.0f;
+    if (identity) return;
+    int total = width * height;
+    for (int i = 0; i < total; i++) {
+        int off = i * 3;
+        float r = rgb[off], g = rgb[off+1], b = rgb[off+2];
+        float nr = ccm[0]*r + ccm[1]*g + ccm[2]*b;
+        float ng = ccm[3]*r + ccm[4]*g + ccm[5]*b;
+        float nb = ccm[6]*r + ccm[7]*g + ccm[8]*b;
+        rgb[off]   = nr < 0 ? 0 : (nr > 255 ? 255 : (uint8_t)nr);
+        rgb[off+1] = ng < 0 ? 0 : (ng > 255 ? 255 : (uint8_t)ng);
+        rgb[off+2] = nb < 0 ? 0 : (nb > 255 ? 255 : (uint8_t)nb);
+    }
+}
+
 static void applyGamma(uint8_t* rgb, int width, int height, float gamma) {
     uint8_t lut[256];
     for (int i = 0; i < 256; i++)
@@ -1067,6 +1092,10 @@ int CameraPipeline::processBayerToYuv(const uint8_t* bayerData, uint8_t* output,
     /* AWB update before applying gains */
     if (mConfig.enableAWB)
         doAutoWhiteBalance(mRgbBuffer);
+
+    /* [2026-11-28] Sensor CCM before the gains: the AWB statistics above were
+     * measured on the pre-CCM buffer, so the feedback loop stays stable. */
+    applyCcm(mRgbBuffer, mConfig.width, mConfig.height, mConfig.ccm);
 
     float rG = (mConfig.enableAWB ? mAwbGains[0] : mConfig.wbGain[0]) * mDigitalGain;
     float gG = (mConfig.enableAWB ? mAwbGains[1] : mConfig.wbGain[1]) * mDigitalGain;
